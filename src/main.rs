@@ -1,11 +1,40 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::collections::HashMap;
 use arboard::Clipboard;
 use serde::{Deserialize, Serialize};
+
+/// Recursively calculate directory size, sending updates progressively
+fn calculate_dir_size_progressive(
+    path: &Path,
+    root_path: &Path,
+    cancel_token: &Arc<AtomicBool>,
+    tx: &std::sync::mpsc::Sender<(PathBuf, u64)>,
+    accumulated: &mut u64,
+) {
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            // Check cancellation every iteration
+            if cancel_token.load(Ordering::Relaxed) {
+                return;
+            }
+            
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                calculate_dir_size_progressive(&entry_path, root_path, cancel_token, tx, accumulated);
+            } else if let Ok(metadata) = entry.metadata() {
+                *accumulated += metadata.len();
+                // Send update every time we add file size
+                let _ = tx.send((root_path.to_path_buf(), *accumulated));
+            }
+        }
+    }
+}
 
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions::default();
@@ -72,12 +101,15 @@ struct RusplorerApp {
     available_drives: Vec<String>,
     file_sizes: HashMap<PathBuf, u64>,
     size_receiver: Option<Receiver<(PathBuf, u64)>>,
+    cancel_token: Arc<AtomicBool>,
+    pause_token: Arc<AtomicBool>,
     dragged_files: Vec<PathBuf>,
     show_drop_menu: bool,
     drop_menu_position: egui::Pos2,
     is_right_click_drag: bool,
     config: Config,
     max_file_size: u64,
+    is_focused: bool,
 }
 
 #[derive(Clone)]
@@ -113,12 +145,15 @@ impl Default for RusplorerApp {
             available_drives,
             file_sizes: HashMap::new(),
             size_receiver: None,
+            cancel_token: Arc::new(AtomicBool::new(false)),
+            pause_token: Arc::new(AtomicBool::new(false)),
             dragged_files: Vec::new(),
             show_drop_menu: false,
             drop_menu_position: egui::Pos2::ZERO,
             is_right_click_drag: false,
             config,
             max_file_size: 0,
+            is_focused: true,
         };
         app.refresh_contents();
         app
@@ -141,6 +176,10 @@ impl RusplorerApp {
     }
 
     fn refresh_contents(&mut self) {
+        // Cancel any running background computation
+        self.cancel_token.store(true, Ordering::SeqCst);
+        self.cancel_token = Arc::new(AtomicBool::new(false));
+        
         self.contents.clear();
         self.file_sizes.clear();
         self.max_file_size = 0;
@@ -179,15 +218,33 @@ impl RusplorerApp {
             self.contents.extend(items);
         }
 
-        // Start background thread to load file sizes
+        // Start background thread to load file and folder sizes
         let current_path = self.current_path.clone();
+        let cancel_token = self.cancel_token.clone();
+        let pause_token = self.pause_token.clone();
         let (tx, rx) = channel();
         
         std::thread::spawn(move || {
             if let Ok(entries) = std::fs::read_dir(&current_path) {
                 for entry in entries.filter_map(|e| e.ok()) {
+                    // Check if cancelled or paused
+                    if cancel_token.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    // While paused, sleep briefly and check again
+                    while pause_token.load(Ordering::SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        if cancel_token.load(Ordering::SeqCst) {
+                            return;
+                        }
+                    }
+                    
                     let path = entry.path();
-                    if !path.is_dir() {
+                    if path.is_dir() {
+                        // Calculate folder size progressively
+                        let mut accumulated = 0u64;
+                        calculate_dir_size_progressive(&path, &path, &cancel_token, &tx, &mut accumulated);
+                    } else {
                         if let Ok(metadata) = entry.metadata() {
                             let _ = tx.send((path, metadata.len()));
                         }
@@ -323,6 +380,13 @@ fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf) -> Result<(), Box<dyn std::e
 
 impl eframe::App for RusplorerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Track window focus and pause/resume background work
+        let is_focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        if is_focused != self.is_focused {
+            self.is_focused = is_focused;
+            self.pause_token.store(!is_focused, Ordering::SeqCst);
+        }
+        
         // Handle drag and drop
         ctx.input(|i| {
             let dropped_files = &i.raw.dropped_files;
@@ -502,7 +566,7 @@ impl eframe::App for RusplorerApp {
                         let icon = if entry.is_dir { "📁" } else { "📄" };
                         let name_label = format!("{} {}", icon, entry.name);
                         
-                        let size_label = if entry.is_dir {
+                        let size_label = if entry.name.starts_with("[..]") {
                             String::new()
                         } else {
                             // Try to get size from cache, show loading if not ready
@@ -535,8 +599,8 @@ impl eframe::App for RusplorerApp {
                             button_response.clicked()
                         }).inner;
 
-                        // Draw size bar underneath if file has a size
-                        if !entry.is_dir && !size_label.is_empty() && size_label != "..." {
+                        // Draw size bar underneath if entry has a size
+                        if !entry.name.starts_with("[..]") && !size_label.is_empty() && size_label != "..." {
                             let full_path = self.current_path.join(&entry.name);
                             if let Some(size) = self.file_sizes.get(&full_path) {
                                 let bar_width = if self.max_file_size > 0 {
