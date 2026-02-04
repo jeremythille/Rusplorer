@@ -2,7 +2,7 @@
 
 use eframe::egui;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -40,7 +40,8 @@ fn calculate_dir_size_progressive(
 }
 
 fn main() -> Result<(), eframe::Error> {
-    let options = eframe::NativeOptions::default();
+    let mut options = eframe::NativeOptions::default();
+    options.viewport.inner_size = Some(egui::vec2(400.0, 600.0));
     eframe::run_native(
         "Rusplorer",
         options,
@@ -119,6 +120,7 @@ struct RusplorerApp {
     file_watcher: Option<notify::RecommendedWatcher>,
     watch_receiver: Option<Receiver<PathBuf>>,
     files_to_recalculate: HashSet<PathBuf>,
+    stop_watcher: Option<Sender<()>>,
 }
 
 #[derive(Clone)]
@@ -168,6 +170,7 @@ impl Default for RusplorerApp {
             file_watcher: None,
             watch_receiver: None,
             files_to_recalculate: HashSet::new(),
+            stop_watcher: None,
         };
         app.refresh_contents();
         app.start_file_watcher();
@@ -397,7 +400,13 @@ fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf) -> Result<(), Box<dyn std::e
 
 impl RusplorerApp {
     fn start_file_watcher(&mut self) {
+        // Signal old watcher to stop
+        if let Some(stop_tx) = self.stop_watcher.take() {
+            let _ = stop_tx.send(());
+        }
+        
         let (tx, rx) = channel();
+        let (stop_tx, stop_rx) = channel();
         let current_path = self.current_path.clone();
         
         // Create watcher in a separate thread
@@ -429,10 +438,8 @@ impl RusplorerApp {
                 // Watch the directory recursively
                 match watcher.watch(&current_path, RecursiveMode::Recursive) {
                     Ok(_) => {
-                        // Keep watcher alive
-                        loop {
-                            std::thread::sleep(std::time::Duration::from_secs(1));
-                        }
+                        // Keep watcher alive until stop signal arrives
+                        let _ = stop_rx.recv();
                     }
                     Err(_) => {
                         return;
@@ -442,6 +449,7 @@ impl RusplorerApp {
         });
         
         self.watch_receiver = Some(rx);
+        self.stop_watcher = Some(stop_tx);
     }
     
     fn process_file_changes(&mut self) {
@@ -582,7 +590,9 @@ impl eframe::App for RusplorerApp {
                 
                 // Filter in the middle
                 ui.label("Filter:");
-                ui.text_edit_singleline(&mut self.filter);
+                ui.allocate_ui(egui::vec2(70.0, 20.0), |ui| {
+                    ui.text_edit_singleline(&mut self.filter);
+                });
                 
                 // Add space and push navigation buttons to the right
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -629,7 +639,7 @@ impl eframe::App for RusplorerApp {
                     if is_last {
                         // Current directory - not clickable, just plain text
                         ui.vertical(|ui| {
-                            ui.add_space(5.0);
+                            ui.add_space(3.0);
                             ui.label(name);
                         });
                     } else {
