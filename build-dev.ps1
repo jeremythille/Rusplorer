@@ -13,7 +13,7 @@ cargo build
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "`nBuild successful!`nLaunching Rusplorer...`n"
-    & ".\target\debug\rusplorer.exe"
+    Start-Process ".\target\debug\rusplorer.exe"
 } else {
     Write-Host "Build failed!"
 }

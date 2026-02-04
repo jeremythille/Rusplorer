@@ -8,6 +8,9 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use arboard::Clipboard;
 use serde::{Deserialize, Serialize};
+use notify::{Watcher, RecursiveMode};
+use notify::recommended_watcher;
+use std::collections::HashSet;
 
 /// Recursively calculate directory size, sending updates progressively
 fn calculate_dir_size_progressive(
@@ -105,11 +108,17 @@ struct RusplorerApp {
     pause_token: Arc<AtomicBool>,
     dragged_files: Vec<PathBuf>,
     show_drop_menu: bool,
+    #[allow(dead_code)]
     drop_menu_position: egui::Pos2,
     is_right_click_drag: bool,
     config: Config,
     max_file_size: u64,
     is_focused: bool,
+    filter: String,
+    #[allow(dead_code)]
+    file_watcher: Option<notify::RecommendedWatcher>,
+    watch_receiver: Option<Receiver<PathBuf>>,
+    files_to_recalculate: HashSet<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -122,6 +131,7 @@ enum FileAction {
 struct FileEntry {
     name: String,
     is_dir: bool,
+    #[allow(dead_code)]
     size: u64,
 }
 
@@ -154,8 +164,13 @@ impl Default for RusplorerApp {
             config,
             max_file_size: 0,
             is_focused: true,
+            filter: String::new(),
+            file_watcher: None,
+            watch_receiver: None,
+            files_to_recalculate: HashSet::new(),
         };
         app.refresh_contents();
+        app.start_file_watcher();
         app
     }
 }
@@ -270,6 +285,8 @@ impl RusplorerApp {
             self.config.save();
             
             self.refresh_contents();
+            // Restart watcher for the new directory
+            self.start_file_watcher();
         }
     }
 
@@ -378,8 +395,89 @@ fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+impl RusplorerApp {
+    fn start_file_watcher(&mut self) {
+        let (tx, rx) = channel();
+        let current_path = self.current_path.clone();
+        
+        // Create watcher in a separate thread
+        let tx = std::sync::Arc::new(std::sync::Mutex::new(tx));
+        
+        std::thread::spawn(move || {
+            let tx = tx.clone();
+            if let Ok(mut watcher) = recommended_watcher(
+                move |res| {
+                    match res {
+                        Ok(notify::event::Event {
+                            kind: notify::event::EventKind::Modify(_) 
+                                | notify::event::EventKind::Create(_) 
+                                | notify::event::EventKind::Remove(_),
+                            paths,
+                            ..
+                        }) => {
+                            // Send the actual changed paths to invalidate cache
+                            for path in paths {
+                                if let Ok(tx) = tx.lock() {
+                                    let _ = tx.send(path);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                },
+            ) {
+                // Watch the directory recursively
+                match watcher.watch(&current_path, RecursiveMode::Recursive) {
+                    Ok(_) => {
+                        // Keep watcher alive
+                        loop {
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                        }
+                    }
+                    Err(_) => {
+                        return;
+                    }
+                }
+            }
+        });
+        
+        self.watch_receiver = Some(rx);
+    }
+    
+    fn process_file_changes(&mut self) {
+        if let Some(ref rx) = self.watch_receiver {
+            // Collect all changed paths and add to recalculation queue
+            while let Ok(path) = rx.try_recv() {
+                self.file_sizes.remove(&path);
+                self.files_to_recalculate.insert(path);
+            }
+        }
+        
+        // Recalculate sizes for files that changed
+        for path in self.files_to_recalculate.iter() {
+            if path.exists() {
+                if path.is_dir() {
+                    let mut accumulated = 0u64;
+                    let cancel_token = Arc::new(AtomicBool::new(false));
+                    let (tx, rx) = channel();
+                    calculate_dir_size_progressive(&path, &path, &cancel_token, &tx, &mut accumulated);
+                    if let Ok((p, size)) = rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                        self.file_sizes.insert(p, size);
+                    }
+                } else if let Ok(metadata) = path.metadata() {
+                    self.file_sizes.insert(path.clone(), metadata.len());
+                }
+            }
+        }
+        self.files_to_recalculate.clear();
+    }
+}
+
 impl eframe::App for RusplorerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Process any file system changes detected by watcher
+        self.process_file_changes();
+        
         // Track window focus and pause/resume background work
         let is_focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         if is_focused != self.is_focused {
@@ -469,7 +567,7 @@ impl eframe::App for RusplorerApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Drive selector
+            // Drive selector with filter and navigation buttons
             let mut selected_drive: Option<PathBuf> = None;
             ui.horizontal(|ui| {
                 ui.label("Drive:");
@@ -481,6 +579,27 @@ impl eframe::App for RusplorerApp {
                         selected_drive = Some(PathBuf::from(drive));
                     }
                 }
+                
+                // Filter in the middle
+                ui.label("Filter:");
+                ui.text_edit_singleline(&mut self.filter);
+                
+                // Add space and push navigation buttons to the right
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("🔄").on_hover_text("Refresh").clicked() {
+                        self.refresh_contents();
+                    }
+                    
+                    let forward_enabled = !self.forward_history.is_empty();
+                    if ui.add_enabled(forward_enabled, egui::Button::new("▶")).clicked() {
+                        self.go_forward();
+                    }
+                    
+                    let back_enabled = !self.back_history.is_empty();
+                    if ui.add_enabled(back_enabled, egui::Button::new("◀")).clicked() {
+                        self.go_back();
+                    }
+                });
             });
             
             // Handle drive selection
@@ -539,30 +658,18 @@ impl eframe::App for RusplorerApp {
 
             ui.separator();
 
-            // Navigation buttons
-            ui.horizontal(|ui| {
-                let back_enabled = !self.back_history.is_empty();
-                if ui.add_enabled(back_enabled, egui::Button::new("◀ Back")).clicked() {
-                    self.go_back();
-                }
-
-                let forward_enabled = !self.forward_history.is_empty();
-                if ui.add_enabled(forward_enabled, egui::Button::new("Forward ▶")).clicked() {
-                    self.go_forward();
-                }
-
-                if ui.button("🔄 Refresh").clicked() {
-                    self.refresh_contents();
-                }
-            });
-
-            ui.separator();
-
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing = [0.0, -1.0].into();
                     for entry in self.contents.clone() {
+                        // Skip entries that don't match the filter (but always show parent directory)
+                        if !entry.name.starts_with("[..]") && !self.filter.is_empty() {
+                            if !entry.name.to_lowercase().contains(&self.filter.to_lowercase()) {
+                                continue;
+                            }
+                        }
+                        
                         let icon = if entry.is_dir { "📁" } else { "📄" };
                         let name_label = format!("{} {}", icon, entry.name);
                         
@@ -573,7 +680,7 @@ impl eframe::App for RusplorerApp {
                             let full_path = self.current_path.join(&entry.name);
                             match self.file_sizes.get(&full_path) {
                                 Some(size) => Self::format_file_size(*size),
-                                None => "...".to_string(),
+                                None => if entry.is_dir { "0 B".to_string() } else { "...".to_string() },
                             }
                         };
 
@@ -586,17 +693,25 @@ impl eframe::App for RusplorerApp {
                             egui::Button::new(&name_label)
                         };
 
-                        let clicked = ui.horizontal(|ui| {
+                        let (_clicked, double_clicked) = ui.horizontal(|ui| {
                             let button_response = ui.add(button);
+                            let is_hovered = button_response.hovered();
+                            let clicked = button_response.clicked();
+                            let double_clicked = button_response.double_clicked();
                             
                             // Add space to push size to the right
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if !size_label.is_empty() {
-                                    ui.label(egui::RichText::new(&size_label).weak());
+                                    let size_text = if is_hovered {
+                                        egui::RichText::new(&size_label).color(egui::Color32::BLACK)
+                                    } else {
+                                        egui::RichText::new(&size_label).weak()
+                                    };
+                                    ui.label(size_text);
                                 }
                             });
                             
-                            button_response.clicked()
+                            (clicked, double_clicked)
                         }).inner;
 
                         // Draw size bar underneath if entry has a size
@@ -622,12 +737,18 @@ impl eframe::App for RusplorerApp {
                             }
                         }
 
-                        if clicked {
+                        if double_clicked {
                             if entry.name.starts_with("[..]") {
                                 self.selected_action = Some(FileAction::GoToParent);
                             } else if entry.is_dir {
                                 let new_path = self.current_path.join(&entry.name);
                                 self.selected_action = Some(FileAction::OpenDir(new_path));
+                            } else {
+                                // Execute file with its associated application
+                                let full_path = self.current_path.join(&entry.name);
+                                let _ = std::process::Command::new("explorer")
+                                    .arg(&full_path)
+                                    .spawn();
                             }
                         }
                     }

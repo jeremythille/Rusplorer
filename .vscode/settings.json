@@ -1,5 +1,6 @@
 {
 	"chat.tools.terminal.autoApprove": {
-		".\\build.ps1": true
+		".\\build.ps1": true,
+		".\\build-dev.ps1": true
 	}
 }
