@@ -24,6 +24,6 @@ codegen-units = 256
 
 [profile.release]
 opt-level = 3
-lto = "full"
+lto = true
 codegen-units = 1
 strip = true

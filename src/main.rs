@@ -121,6 +121,21 @@ struct RusplorerApp {
     watch_receiver: Option<Receiver<PathBuf>>,
     files_to_recalculate: HashSet<PathBuf>,
     stop_watcher: Option<Sender<()>>,
+    show_context_menu: bool,
+    context_menu_entry: Option<FileEntry>,
+    context_menu_position: egui::Pos2,
+    show_rename_dialog: bool,
+    rename_buffer: String,
+    selected_entries: HashSet<String>,
+    show_archive_dialog: bool,
+    archive_type: usize,       // 0 = 7z, 1 = zip
+    compression_level: usize,  // 0 = store, 1 = medium, 2 = high
+    archive_name_buffer: String,
+    files_to_archive: Vec<PathBuf>,
+    archive_done_receiver: Option<Receiver<String>>,
+    show_extract_dialog: bool,
+    extract_archive_path: PathBuf,
+    extract_done_receiver: Option<Receiver<()>>,
 }
 
 #[derive(Clone)]
@@ -171,6 +186,21 @@ impl Default for RusplorerApp {
             watch_receiver: None,
             files_to_recalculate: HashSet::new(),
             stop_watcher: None,
+            show_context_menu: false,
+            context_menu_entry: None,
+            context_menu_position: egui::Pos2::ZERO,
+            show_rename_dialog: false,
+            rename_buffer: String::new(),
+            selected_entries: HashSet::new(),
+            show_archive_dialog: false,
+            archive_type: 0,
+            compression_level: 2,
+            archive_name_buffer: String::new(),
+            files_to_archive: Vec::new(),
+            archive_done_receiver: None,
+            show_extract_dialog: false,
+            extract_archive_path: PathBuf::new(),
+            extract_done_receiver: None,
         };
         app.refresh_contents();
         app.start_file_watcher();
@@ -343,6 +373,30 @@ impl RusplorerApp {
         path.to_string_lossy().replace("\\", "/")
     }
 
+    fn is_code_file(path: &PathBuf) -> bool {
+        if let Some(ext) = path.extension() {
+            let ext_str = ext.to_string_lossy().to_lowercase();
+            matches!(ext_str.as_str(), 
+                "rs" | "js" | "ts" | "jsx" | "tsx" | "py" | "java" | "c" | "cpp" | "h" | "hpp" | 
+                "cs" | "go" | "rb" | "php" | "html" | "css" | "scss" | "json" | "xml" | "yaml" | 
+                "yml" | "toml" | "md" | "txt" | "sh" | "bat" | "ps1" | "sql" | "vue" | "svelte"
+            )
+        } else {
+            false
+        }
+    }
+
+    fn is_archive(path: &PathBuf) -> bool {
+        if let Some(ext) = path.extension() {
+            let ext_str = ext.to_string_lossy().to_lowercase();
+            matches!(ext_str.as_str(), 
+                "7z" | "zip" | "rar" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "iso"
+            )
+        } else {
+            false
+        }
+    }
+
     fn format_file_size(bytes: u64) -> String {
         const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
         let mut size = bytes as f64;
@@ -453,12 +507,35 @@ impl RusplorerApp {
     }
     
     fn process_file_changes(&mut self) {
+        let mut needs_refresh = false;
+        
         if let Some(ref rx) = self.watch_receiver {
             // Collect all changed paths and add to recalculation queue
             while let Ok(path) = rx.try_recv() {
+                // If a direct child of current directory was created or removed, refresh the list
+                if let Some(parent) = path.parent() {
+                    if parent == self.current_path {
+                        let file_name = path.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
+                        let exists_in_list = self.contents.iter().any(|e| e.name == file_name);
+                        let exists_on_disk = path.exists();
+                        
+                        if (exists_on_disk && !exists_in_list) || (!exists_on_disk && exists_in_list) {
+                            needs_refresh = true;
+                        }
+                    }
+                }
+                
                 self.file_sizes.remove(&path);
                 self.files_to_recalculate.insert(path);
             }
+        }
+        
+        if needs_refresh {
+            self.refresh_contents();
+            return;
         }
         
         // Recalculate sizes for files that changed
@@ -483,6 +560,25 @@ impl RusplorerApp {
 
 impl eframe::App for RusplorerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Check if archive compression finished
+        if let Some(ref rx) = self.archive_done_receiver {
+            if let Ok(archive_name) = rx.try_recv() {
+                self.refresh_contents();
+                self.selected_entries.clear();
+                self.selected_entries.insert(archive_name);
+                self.archive_done_receiver = None;
+            }
+        }
+
+        // Check if extraction finished
+        if let Some(ref rx) = self.extract_done_receiver {
+            if rx.try_recv().is_ok() {
+                self.refresh_contents();
+                self.show_extract_dialog = false;
+                self.extract_done_receiver = None;
+            }
+        }
+
         // Process any file system changes detected by watcher
         self.process_file_changes();
         
@@ -558,6 +654,21 @@ impl eframe::App for RusplorerApp {
         }
         if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) && ctx.input(|i| i.modifiers.alt) {
             self.go_forward();
+        }
+
+        // Handle Ctrl+A to select all
+        if ctx.input(|i| i.key_pressed(egui::Key::A) && i.modifiers.ctrl) {
+            self.selected_entries.clear();
+            for entry in &self.contents {
+                if !entry.name.starts_with("[..]") {
+                    self.selected_entries.insert(entry.name.clone());
+                }
+            }
+        }
+
+        // Handle Escape to deselect all
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.selected_entries.clear();
         }
 
         // Handle pending actions
@@ -680,6 +791,7 @@ impl eframe::App for RusplorerApp {
                             }
                         }
                         
+                        let is_selected = self.selected_entries.contains(&entry.name);
                         let icon = if entry.is_dir { "📁" } else { "📄" };
                         let name_label = format!("{} {}", icon, entry.name);
                         
@@ -694,7 +806,11 @@ impl eframe::App for RusplorerApp {
                             }
                         };
 
-                        let button = if entry.is_dir {
+                        let button = if is_selected {
+                            // Selected - dark blue background
+                            egui::Button::new(egui::RichText::new(&name_label).color(egui::Color32::WHITE))
+                                .fill(egui::Color32::from_rgb(100, 150, 255))
+                        } else if entry.is_dir {
                             // Light yellow background for folders
                             egui::Button::new(&name_label)
                                 .fill(egui::Color32::from_rgb(255, 245, 150))
@@ -708,6 +824,30 @@ impl eframe::App for RusplorerApp {
                             let is_hovered = button_response.hovered();
                             let clicked = button_response.clicked();
                             let double_clicked = button_response.double_clicked();
+                            let right_clicked = button_response.secondary_clicked();
+                            
+                            // Handle selection and right-click
+                            if clicked {
+                                let is_ctrl = ui.input(|i| i.modifiers.ctrl);
+                                if is_ctrl {
+                                    // Ctrl+Click: toggle selection
+                                    if self.selected_entries.contains(&entry.name) {
+                                        self.selected_entries.remove(&entry.name);
+                                    } else {
+                                        self.selected_entries.insert(entry.name.clone());
+                                    }
+                                } else {
+                                    // Single click: select only this
+                                    self.selected_entries.clear();
+                                    self.selected_entries.insert(entry.name.clone());
+                                }
+                            }
+                            
+                            if right_clicked {
+                                self.show_context_menu = true;
+                                self.context_menu_entry = Some(entry.clone());
+                                self.context_menu_position = ui.input(|i| i.pointer.hover_pos().unwrap_or_default());
+                            }
                             
                             // Add space to push size to the right
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -725,7 +865,7 @@ impl eframe::App for RusplorerApp {
                         }).inner;
 
                         // Draw size bar underneath if entry has a size
-                        if !entry.name.starts_with("[..]") && !size_label.is_empty() && size_label != "..." {
+                        if !entry.name.starts_with("[..]") {
                             let full_path = self.current_path.join(&entry.name);
                             if let Some(size) = self.file_sizes.get(&full_path) {
                                 let bar_width = if self.max_file_size > 0 {
@@ -743,8 +883,9 @@ impl eframe::App for RusplorerApp {
                                     0.0,
                                     egui::Color32::from_rgb(100, 150, 255),
                                 );
-                                ui.allocate_space(egui::vec2(ui.available_width(), 2.0));
                             }
+                            // Always allocate space for the bar to prevent layout shift
+                            ui.allocate_space(egui::vec2(ui.available_width(), 2.0));
                         }
 
                         if double_clicked {
@@ -808,6 +949,297 @@ impl eframe::App for RusplorerApp {
         // Refresh contents periodically to catch updates from background threads
         if self.dragged_files.is_empty() && !self.show_drop_menu {
             // Let the file watcher pick up changes
+        }
+
+        // Context menu
+        if self.show_context_menu {
+            if let Some(ref entry) = self.context_menu_entry {
+                let full_path = self.current_path.join(&entry.name);
+                
+                egui::Window::new("Context Menu")
+                    .collapsible(false)
+                    .resizable(false)
+                    .title_bar(false)
+                    .fixed_pos(self.context_menu_position)
+                    .default_width(0.0)
+                    .frame(egui::Frame {
+                        fill: egui::Color32::from_rgb(200, 220, 255),
+                        stroke: egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
+                        ..Default::default()
+                    })
+                    .show(ctx, |ui| {
+                        ui.style_mut().spacing.button_padding = egui::vec2(4.0, 2.0);
+                        
+                        // Open with VS Code
+                        if (entry.is_dir || Self::is_code_file(&full_path)) && ui.button("Open with Code").clicked() {
+                            let _ = std::process::Command::new("code")
+                                .arg(&full_path)
+                                .spawn();
+                            self.show_context_menu = false;
+                        }
+                        
+                        // Extract here
+                        if Self::is_archive(&full_path) && ui.button("Extract here").clicked() {
+                            self.extract_archive_path = full_path.clone();
+                            self.show_extract_dialog = true;
+                            self.show_context_menu = false;
+                        }
+                        
+                        // Add to archive
+                        if ui.button("Add to archive").clicked() {
+                            self.files_to_archive.clear();
+                            if !self.selected_entries.is_empty() {
+                                for name in &self.selected_entries {
+                                    self.files_to_archive.push(self.current_path.join(name));
+                                }
+                            } else {
+                                self.files_to_archive.push(full_path.clone());
+                            }
+                            
+                            // Default archive name based on first item
+                            let stem = if let Some(first) = self.files_to_archive.first() {
+                                first.file_stem()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .to_string()
+                            } else {
+                                "archive".to_string()
+                            };
+                            self.archive_name_buffer = stem;
+                            self.show_archive_dialog = true;
+                            self.show_context_menu = false;
+                        }
+                        
+                        ui.separator();
+                        
+                        // Copy full path
+                        if ui.button("📋 Copy full path").clicked() {
+                            if let Ok(mut clipboard) = Clipboard::new() {
+                                let _ = clipboard.set_text(full_path.to_string_lossy().to_string());
+                            }
+                            self.show_context_menu = false;
+                        }
+                        
+                        // Rename
+                        if !entry.name.starts_with("[..]") && ui.button("Rename").clicked() {
+                            self.rename_buffer = entry.name.clone();
+                            self.show_rename_dialog = true;
+                            self.show_context_menu = false;
+                        }
+                        
+                        // Properties
+                        if ui.button("Properties").clicked() {
+                            let _ = std::process::Command::new("explorer")
+                                .args(&["/select,", &full_path.to_string_lossy()])
+                                .spawn();
+                            self.show_context_menu = false;
+                        }
+                        
+                        ui.separator();
+                        
+                        if ui.button("Cancel").clicked() {
+                            self.show_context_menu = false;
+                        }
+                    });
+            }
+            
+            // Close context menu if clicked elsewhere
+            if ctx.input(|i| i.pointer.primary_clicked() || i.key_pressed(egui::Key::Escape)) {
+                self.show_context_menu = false;
+            }
+        }
+
+        // Archive dialog
+        if self.show_archive_dialog {
+            // Draw semi-transparent backdrop
+            let screen_rect = ctx.screen_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::PanelResizeLine, egui::Id::new("archive_backdrop")));
+            painter.rect_filled(screen_rect, 0.0, egui::Color32::from_black_alpha(128));
+
+            egui::Window::new("Add to archive")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Archive name:");
+                        ui.text_edit_singleline(&mut self.archive_name_buffer);
+                    });
+                    
+                    ui.add_space(4.0);
+                    
+                    ui.horizontal(|ui| {
+                        ui.label("Format:");
+                        ui.selectable_value(&mut self.archive_type, 0, "7z");
+                        ui.selectable_value(&mut self.archive_type, 1, "zip");
+                    });
+                    
+                    ui.horizontal(|ui| {
+                        ui.label("Compression:");
+                        ui.selectable_value(&mut self.compression_level, 0, "Store");
+                        ui.selectable_value(&mut self.compression_level, 1, "Medium");
+                        ui.selectable_value(&mut self.compression_level, 2, "High");
+                    });
+                    
+                    ui.add_space(4.0);
+                    
+                    ui.label(format!("{} item(s) to archive", self.files_to_archive.len()));
+                    
+                    ui.add_space(4.0);
+                    
+                    ui.horizontal(|ui| {
+                        if ui.button("Compress").clicked() {
+                            let ext = match self.archive_type {
+                                0 => "7z",
+                                _ => "zip",
+                            };
+                            let format_flag = match self.archive_type {
+                                0 => "-t7z",
+                                _ => "-tzip",
+                            };
+                            let level_flag = match self.compression_level {
+                                0 => "-mx0",
+                                1 => "-mx5",
+                                _ => "-mx9",
+                            };
+                            
+                            let archive_path = self.current_path.join(
+                                format!("{}.{}", self.archive_name_buffer, ext)
+                            );
+                            let archive_str = archive_path.to_string_lossy().to_string();
+                            
+                            let archive_filename = format!("{}.{}", self.archive_name_buffer, ext);
+                            let files_clone = self.files_to_archive.clone();
+                            let (done_tx, done_rx) = channel();
+                            let archive_str_clone = archive_str.clone();
+                            let format_flag = format_flag.to_string();
+                            let level_flag = level_flag.to_string();
+                            
+                            std::thread::spawn(move || {
+                                let mut cmd = std::process::Command::new("C:\\Program Files\\7-Zip\\7z.exe");
+                                cmd.args(&["a", &format_flag, &level_flag, &archive_str_clone]);
+                                for f in &files_clone {
+                                    cmd.arg(f);
+                                }
+                                let result = cmd.spawn().or_else(|_| {
+                                    let mut cmd2 = std::process::Command::new("7z.exe");
+                                    cmd2.args(&["a", &format_flag, &level_flag, &archive_str_clone]);
+                                    for f in &files_clone {
+                                        cmd2.arg(f);
+                                    }
+                                    cmd2.spawn()
+                                });
+                                if let Ok(mut child) = result {
+                                    let _ = child.wait();
+                                }
+                                let _ = done_tx.send(archive_filename);
+                            });
+                            
+                            self.archive_done_receiver = Some(done_rx);
+                            self.show_archive_dialog = false;
+                            self.files_to_archive.clear();
+                        }
+                        
+                        if ui.button("Cancel").clicked() {
+                            self.show_archive_dialog = false;
+                            self.files_to_archive.clear();
+                        }
+                    });
+                });
+        }
+
+        // Start extraction if dialog was shown (one-time trigger)
+        if self.show_extract_dialog && self.extract_done_receiver.is_none() {
+            let archive_path = self.extract_archive_path.clone();
+            let dest = self.current_path.clone();
+            let (done_tx, done_rx) = channel();
+            
+            std::thread::spawn(move || {
+                let dest_str = dest.to_string_lossy().to_string();
+                let archive_str = archive_path.to_string_lossy().to_string();
+                
+                let result = std::process::Command::new("C:\\Program Files\\7-Zip\\7z.exe")
+                    .args(&["x", &archive_str, &format!("-o{}", dest_str)])
+                    .spawn()
+                    .or_else(|_| {
+                        std::process::Command::new("7z.exe")
+                            .args(&["x", &archive_str, &format!("-o{}", dest_str)])
+                            .spawn()
+                    });
+                
+                if let Ok(mut child) = result {
+                    let _ = child.wait();
+                }
+                let _ = done_tx.send(());
+            });
+            
+            self.extract_done_receiver = Some(done_rx);
+        }
+
+        // Rename dialog
+        if self.show_rename_dialog {
+            if let Some(entry) = self.context_menu_entry.clone() {
+                let entry_name = entry.name.clone();
+                egui::Window::new("Rename")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        ui.label("New name:");
+                        let response = ui.text_edit_singleline(&mut self.rename_buffer);
+                        
+                        // Auto-focus the text field
+                        if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            // Perform rename
+                            let old_path = self.current_path.join(&entry_name);
+                            let new_path = self.current_path.join(&self.rename_buffer);
+                            if let Err(_) = std::fs::rename(&old_path, &new_path) {
+                                // Error handling could be improved
+                            }
+                            self.show_rename_dialog = false;
+                            self.refresh_contents();
+                        }
+                        
+                        ui.horizontal(|ui| {
+                            if ui.button("OK").clicked() {
+                                let old_path = self.current_path.join(&entry_name);
+                                let new_path = self.current_path.join(&self.rename_buffer);
+                                if let Err(_) = std::fs::rename(&old_path, &new_path) {
+                                    // Error handling could be improved
+                                }
+                                self.show_rename_dialog = false;
+                                self.refresh_contents();
+                            }
+                            
+                            if ui.button("Cancel").clicked() {
+                                self.show_rename_dialog = false;
+                            }
+                        });
+                    });
+            }
+        }
+
+        // Extract dialog
+        if self.show_extract_dialog {
+            // Draw semi-transparent backdrop
+            let screen_rect = ctx.screen_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::PanelResizeLine, egui::Id::new("extract_backdrop")));
+            painter.rect_filled(screen_rect, 0.0, egui::Color32::from_black_alpha(128));
+
+            let archive_name = self.extract_archive_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            egui::Window::new("Extracting...")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label(format!("Extracting: {}", archive_name));
+                    ui.label("Please wait...");
+                });
         }
 
         // Only repaint if sizes are still being loaded or user is interacting
