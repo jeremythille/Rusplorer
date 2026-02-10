@@ -12,6 +12,99 @@ use notify::{Watcher, RecursiveMode};
 use notify::recommended_watcher;
 use std::collections::HashSet;
 
+#[cfg(windows)]
+use winapi::um::winuser::{OpenClipboard, CloseClipboard, SetClipboardData, EmptyClipboard};
+#[cfg(windows)]
+use std::ffi::OsStr;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+
+/// Copy files to Windows clipboard in HDROP format so they can be pasted in Explorer
+#[cfg(windows)]
+fn copy_files_to_clipboard(files: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
+    use winapi::um::winuser::CF_HDROP;
+    
+    // DROPFILES structure: 20 bytes total
+    // offset 0:  pFiles (DWORD) - offset to file list = 20
+    // offset 4:  pt.x (LONG)
+    // offset 8:  pt.y (LONG)
+    // offset 12: fNC (BOOL)
+    // offset 16: fWide (BOOL) - must be 1 for Unicode
+    
+    // Build the wide-char file list: each path null-terminated, double-null at end
+    let mut wide_chars: Vec<u16> = Vec::new();
+    for file in files {
+        let path_str = file.to_string_lossy();
+        let wide: Vec<u16> = OsStr::new(path_str.as_ref())
+            .encode_wide()
+            .chain(std::iter::once(0u16))
+            .collect();
+        wide_chars.extend_from_slice(&wide);
+    }
+    wide_chars.push(0u16); // Final double-null terminator
+    
+    let dropfiles_size: usize = 20; // sizeof(DROPFILES)
+    let file_data_size = wide_chars.len() * 2; // bytes for wide chars
+    let total_size = dropfiles_size + file_data_size;
+    
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return Err("Failed to open clipboard".into());
+        }
+        
+        if EmptyClipboard() == 0 {
+            CloseClipboard();
+            return Err("Failed to empty clipboard".into());
+        }
+        
+        let hglobal = winapi::um::winbase::GlobalAlloc(
+            winapi::um::winbase::GMEM_MOVEABLE | winapi::um::winbase::GMEM_ZEROINIT,
+            total_size,
+        );
+        if hglobal.is_null() {
+            CloseClipboard();
+            return Err("Failed to allocate global memory".into());
+        }
+        
+        let ptr = winapi::um::winbase::GlobalLock(hglobal) as *mut u8;
+        if ptr.is_null() {
+            winapi::um::winbase::GlobalFree(hglobal);
+            CloseClipboard();
+            return Err("Failed to lock global memory".into());
+        }
+        
+        // Write DROPFILES structure
+        // pFiles = 20 (offset to file data)
+        let pfiles: u32 = 20;
+        std::ptr::copy_nonoverlapping(&pfiles as *const u32 as *const u8, ptr, 4);
+        // pt.x = 0 (offset 4, already zeroed)
+        // pt.y = 0 (offset 8, already zeroed)
+        // fNC = 0  (offset 12, already zeroed)
+        // fWide = 1 (offset 16)
+        let fwide: u32 = 1;
+        std::ptr::copy_nonoverlapping(&fwide as *const u32 as *const u8, ptr.add(16), 4);
+        
+        // Write file paths after DROPFILES structure
+        std::ptr::copy_nonoverlapping(
+            wide_chars.as_ptr() as *const u8,
+            ptr.add(dropfiles_size),
+            file_data_size,
+        );
+        
+        winapi::um::winbase::GlobalUnlock(hglobal);
+        
+        if SetClipboardData(CF_HDROP, hglobal as *mut winapi::ctypes::c_void).is_null() {
+            winapi::um::winbase::GlobalFree(hglobal);
+            CloseClipboard();
+            return Err("Failed to set clipboard data".into());
+        }
+        
+        CloseClipboard();
+    }
+    
+    Ok(())
+}
+
 /// Recursively calculate directory size, sending updates progressively
 fn calculate_dir_size_progressive(
     path: &Path,
@@ -136,12 +229,20 @@ struct RusplorerApp {
     show_extract_dialog: bool,
     extract_archive_path: PathBuf,
     extract_done_receiver: Option<Receiver<()>>,
+    clipboard_files: Vec<PathBuf>,
+    clipboard_mode: Option<ClipboardMode>,
 }
 
 #[derive(Clone)]
 enum FileAction {
     OpenDir(PathBuf),
     GoToParent,
+}
+
+#[derive(Clone, Debug, Copy, PartialEq)]
+enum ClipboardMode {
+    Copy,
+    Cut,
 }
 
 #[derive(Clone)]
@@ -201,6 +302,8 @@ impl Default for RusplorerApp {
             show_extract_dialog: false,
             extract_archive_path: PathBuf::new(),
             extract_done_receiver: None,
+            clipboard_files: Vec::new(),
+            clipboard_mode: None,
         };
         app.refresh_contents();
         app.start_file_watcher();
@@ -670,6 +773,74 @@ impl eframe::App for RusplorerApp {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.selected_entries.clear();
         }
+
+        // Handle Ctrl+C / Ctrl+X / Ctrl+V (egui translates these to Copy/Cut/Paste events)
+        let (got_copy, got_cut, got_paste) = ctx.input(|i| {
+            let mut copy = false;
+            let mut cut = false;
+            let mut paste = false;
+            for event in &i.events {
+                match event {
+                    egui::Event::Copy => copy = true,
+                    egui::Event::Cut => cut = true,
+                    egui::Event::Paste(_) => paste = true,
+                    _ => {}
+                }
+            }
+            (copy, cut, paste)
+        });
+
+        if got_copy && !self.selected_entries.is_empty() {
+            self.clipboard_files = self.selected_entries.iter()
+                .map(|name| self.current_path.join(name))
+                .collect();
+            self.clipboard_mode = Some(ClipboardMode::Copy);
+            #[cfg(windows)]
+            let _ = copy_files_to_clipboard(&self.clipboard_files);
+        }
+
+        if got_cut && !self.selected_entries.is_empty() {
+            self.clipboard_files = self.selected_entries.iter()
+                .map(|name| self.current_path.join(name))
+                .collect();
+            self.clipboard_mode = Some(ClipboardMode::Cut);
+            #[cfg(windows)]
+            let _ = copy_files_to_clipboard(&self.clipboard_files);
+        }
+
+        if got_paste {
+            if let Some(mode) = self.clipboard_mode {
+                if !self.clipboard_files.is_empty() {
+                    let files = self.clipboard_files.clone();
+                    let dest = self.current_path.clone();
+                    
+                    std::thread::spawn(move || {
+                        match mode {
+                            ClipboardMode::Copy => {
+                                let _ = RusplorerApp::copy_files(&files, &dest);
+                            }
+                            ClipboardMode::Cut => {
+                                let _ = RusplorerApp::move_files(&files, &dest);
+                            }
+                        }
+                    });
+                    
+                    if mode == ClipboardMode::Cut {
+                        self.clipboard_files.clear();
+                        self.clipboard_mode = None;
+                    }
+                }
+            }
+        }
+
+        // Debug: show clipboard state in title
+        let clip_info = format!(
+            "Rusplorer  |  sel: {}  clip: {} ({:?})",
+            self.selected_entries.len(),
+            self.clipboard_files.len(),
+            self.clipboard_mode
+        );
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(clip_info));
 
         // Handle pending actions
         if let Some(action) = self.selected_action.take() {
