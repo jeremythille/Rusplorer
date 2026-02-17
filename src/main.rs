@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
+use egui_extras::{TableBuilder, Column};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -219,10 +221,25 @@ fn main() -> Result<(), eframe::Error> {
     )
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+enum SortColumn {
+    Name,
+    Size,
+    Date,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Config {
     last_path: String,
+    show_date_columns: HashMap<String, bool>,
+    #[serde(default = "default_sort_column")]
+    sort_column: SortColumn,
+    #[serde(default = "default_sort_ascending")]
+    sort_ascending: bool,
 }
+
+fn default_sort_column() -> SortColumn { SortColumn::Name }
+fn default_sort_ascending() -> bool { true }
 
 impl Config {
     fn path() -> PathBuf {
@@ -241,6 +258,9 @@ impl Config {
         }
         Config {
             last_path: "C:\\".to_string(),
+            show_date_columns: HashMap::new(),
+            sort_column: SortColumn::Name,
+            sort_ascending: true,
         }
     }
 
@@ -303,6 +323,9 @@ struct RusplorerApp {
     any_button_hovered: bool,
     dirs_done: HashSet<PathBuf>,
     dirs_done_receiver: Option<Receiver<PathBuf>>,
+    show_date_columns: HashMap<PathBuf, bool>,
+    sort_column: SortColumn,
+    sort_ascending: bool,
 }
 
 #[derive(Clone)]
@@ -323,6 +346,7 @@ struct FileEntry {
     is_dir: bool,
     #[allow(dead_code)]
     size: u64,
+    modified: Option<SystemTime>,
 }
 
 impl Default for RusplorerApp {
@@ -335,6 +359,11 @@ impl Default for RusplorerApp {
         } else {
             PathBuf::from("C:\\")
         };
+        let show_date_columns: HashMap<PathBuf, bool> = config.show_date_columns.iter()
+            .map(|(k, v)| (PathBuf::from(k), *v))
+            .collect();
+        let sort_column = config.sort_column.clone();
+        let sort_ascending = config.sort_ascending;
 
         let mut app = Self {
             current_path,
@@ -386,6 +415,9 @@ impl Default for RusplorerApp {
             any_button_hovered: false,
             dirs_done: HashSet::new(),
             dirs_done_receiver: None,
+            show_date_columns,
+            sort_column,
+            sort_ascending,
         };
         app.refresh_contents();
         app.start_file_watcher();
@@ -425,6 +457,7 @@ impl RusplorerApp {
                     name: "[..] Parent Directory".to_string(),
                     is_dir: true,
                     size: 0,
+                    modified: None,
                 });
             }
         }
@@ -437,7 +470,8 @@ impl RusplorerApp {
                     let path = e.path();
                     let name = e.file_name().to_string_lossy().to_string();
                     let is_dir = path.is_dir();
-                    FileEntry { name, is_dir, size: 0 }
+                    let modified = e.metadata().ok().and_then(|m| m.modified().ok());
+                    FileEntry { name, is_dir, size: 0, modified }
                 })
                 .collect();
 
@@ -445,7 +479,14 @@ impl RusplorerApp {
                 match (a.is_dir, b.is_dir) {
                     (true, false) => std::cmp::Ordering::Less,
                     (false, true) => std::cmp::Ordering::Greater,
-                    _ => a.name.cmp(&b.name),
+                    _ => {
+                        let ord = match self.sort_column {
+                            SortColumn::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                            SortColumn::Date => a.modified.cmp(&b.modified),
+                            SortColumn::Size => std::cmp::Ordering::Equal, // will be re-sorted when sizes arrive
+                        };
+                        if self.sort_ascending { ord } else { ord.reverse() }
+                    }
                 }
             });
 
@@ -545,6 +586,37 @@ impl RusplorerApp {
         self.size_receiver = Some(rx);
     }
 
+    fn sort_contents(&mut self) {
+        let sort_column = &self.sort_column;
+        let sort_ascending = self.sort_ascending;
+        let file_sizes = &self.file_sizes;
+        let current_path = &self.current_path;
+
+        self.contents.sort_by(|a, b| {
+            // Parent directory always first
+            if a.name.starts_with("[..]") { return std::cmp::Ordering::Less; }
+            if b.name.starts_with("[..]") { return std::cmp::Ordering::Greater; }
+
+            // Dirs always before files
+            match (a.is_dir, b.is_dir) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => {
+                    let ord = match sort_column {
+                        SortColumn::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                        SortColumn::Size => {
+                            let sa = file_sizes.get(&current_path.join(&a.name)).copied().unwrap_or(0);
+                            let sb = file_sizes.get(&current_path.join(&b.name)).copied().unwrap_or(0);
+                            sa.cmp(&sb)
+                        }
+                        SortColumn::Date => a.modified.cmp(&b.modified),
+                    };
+                    if sort_ascending { ord } else { ord.reverse() }
+                }
+            }
+        });
+    }
+
     fn navigate_to(&mut self, path: PathBuf) {
         if path.exists() && path.is_dir() {
             // Only add to history if it's different from current path
@@ -556,6 +628,9 @@ impl RusplorerApp {
             
             // Save the current path to config
             self.config.last_path = self.current_path.to_string_lossy().to_string();
+            self.config.show_date_columns = self.show_date_columns.iter()
+                .map(|(k, v)| (k.to_string_lossy().to_string(), *v))
+                .collect();
             self.config.save();
             
             self.refresh_contents();
@@ -652,6 +727,60 @@ impl RusplorerApp {
             format!("{} {}", bytes, UNITS[0])
         } else {
             format!("{:.1} {}", size, UNITS[unit_index])
+        }
+    }
+
+    fn format_modified_time(time: SystemTime) -> String {
+        use std::time::UNIX_EPOCH;
+        if let Ok(duration) = time.duration_since(UNIX_EPOCH) {
+            let secs = duration.as_secs();
+            let days = secs / 86400;
+            let epoch_start = 719163; // Days from year 0 to 1970-01-01
+            let total_days = epoch_start + days as i64;
+            
+            // Simple date calculation
+            let mut remaining_days = total_days;
+            
+            // Find the year
+            let mut year = (remaining_days / 365) as i32;
+            let mut days_in_years = 0i64;
+            for y in 0..=year {
+                let is_leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+                days_in_years += if is_leap { 366 } else { 365 };
+            }
+            while days_in_years > total_days {
+                year -= 1;
+                let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+                days_in_years -= if is_leap { 366 } else { 365 };
+            }
+            remaining_days = total_days - days_in_years;
+            
+            // Find month and day
+            let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+            let days_in_months = if is_leap {
+                [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+            } else {
+                [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+            };
+            
+            let mut month = 1;
+            for (i, &days_in_month) in days_in_months.iter().enumerate() {
+                if remaining_days < days_in_month as i64 {
+                    month = i + 1;
+                    break;
+                }
+                remaining_days -= days_in_month as i64;
+            }
+            let day = remaining_days + 1;
+            
+            // Time calculation
+            let time_secs = secs % 86400;
+            let hour = time_secs / 3600;
+            let minute = (time_secs % 3600) / 60;
+            
+            format!("{:04}-{:02}-{:02} {:02}:{:02}", year, month, day, hour, minute)
+        } else {
+            String::new()
         }
     }
 
@@ -846,12 +975,14 @@ impl eframe::App for RusplorerApp {
         });
 
         // Receive file sizes from background thread
+        let mut sizes_updated = false;
         if let Some(ref rx) = self.size_receiver {
             while let Ok((path, size)) = rx.try_recv() {
                 self.file_sizes.insert(path, size);
                 if size > self.max_file_size {
                     self.max_file_size = size;
                 }
+                sizes_updated = true;
             }
         }
 
@@ -860,6 +991,11 @@ impl eframe::App for RusplorerApp {
             while let Ok(path) = rx.try_recv() {
                 self.dirs_done.insert(path);
             }
+        }
+
+        // Re-sort when sizes arrive and we're sorting by size
+        if sizes_updated && self.sort_column == SortColumn::Size {
+            self.sort_contents();
         }
 
         // Handle mouse buttons 4 and 5 (back/forward)
@@ -1179,248 +1315,314 @@ impl eframe::App for RusplorerApp {
 
             ui.separator();
 
+            // Table with proper column alignment
+            let show_dates = self.show_date_columns.get(&self.current_path).copied().unwrap_or(false);
+            let mut sort_changed = false;
+
             // Clear entry rects for this frame
             self.entry_rects.clear();
             self.any_button_hovered = false;
 
-            egui::ScrollArea::vertical()
-                .auto_shrink([false; 2])
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing = [0.0, -1.0].into();
-                    
+            let row_height = 18.0;
+            let mut table_builder = TableBuilder::new(ui)
+                .striped(true)
+                .vscroll(true)
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::remainder().clip(true))   // Name
+                .column(Column::auto().at_least(60.0));    // Size
+
+            if show_dates {
+                table_builder = table_builder.column(Column::auto().at_least(120.0));
+            } else {
+                table_builder = table_builder.column(Column::exact(28.0));
+            }
+
+            table_builder
+                .header(row_height, |mut header| {
+                    // Name header
+                    header.col(|ui| {
+                        let arrow = if self.sort_column == SortColumn::Name {
+                            if self.sort_ascending { " \u{25B2}" } else { " \u{25BC}" }
+                        } else { "" };
+                        let text = format!("Name{}", arrow);
+                        if ui.add_sized(
+                            ui.available_size(),
+                            egui::Button::new(egui::RichText::new(&text).strong())
+                        ).clicked() {
+                            if self.sort_column == SortColumn::Name {
+                                self.sort_ascending = !self.sort_ascending;
+                            } else {
+                                self.sort_column = SortColumn::Name;
+                                self.sort_ascending = true;
+                            }
+                            sort_changed = true;
+                        }
+                    });
+
+                    // Size header
+                    header.col(|ui| {
+                        let arrow = if self.sort_column == SortColumn::Size {
+                            if self.sort_ascending { " \u{25B2}" } else { " \u{25BC}" }
+                        } else { "" };
+                        let text = format!("Size{}", arrow);
+                        if ui.add_sized(
+                            ui.available_size(),
+                            egui::Button::new(egui::RichText::new(&text).strong())
+                        ).clicked() {
+                            if self.sort_column == SortColumn::Size {
+                                self.sort_ascending = !self.sort_ascending;
+                            } else {
+                                self.sort_column = SortColumn::Size;
+                                self.sort_ascending = false;
+                            }
+                            sort_changed = true;
+                        }
+                    });
+
+                    // Date header
+                    header.col(|ui| {
+                        if show_dates {
+                            ui.horizontal(|ui| {
+                                if ui.small_button("\u{2715}").on_hover_text("Hide date column").clicked() {
+                                    self.show_date_columns.insert(self.current_path.clone(), false);
+                                    if self.sort_column == SortColumn::Date {
+                                        self.sort_column = SortColumn::Name;
+                                        self.sort_ascending = true;
+                                    }
+                                    sort_changed = true;
+                                }
+                                let arrow = if self.sort_column == SortColumn::Date {
+                                    if self.sort_ascending { " \u{25B2}" } else { " \u{25BC}" }
+                                } else { "" };
+                                let text = format!("Modified{}", arrow);
+                                if ui.button(egui::RichText::new(&text).strong()).clicked() {
+                                    if self.sort_column == SortColumn::Date {
+                                        self.sort_ascending = !self.sort_ascending;
+                                    } else {
+                                        self.sort_column = SortColumn::Date;
+                                        self.sort_ascending = false;
+                                    }
+                                    sort_changed = true;
+                                }
+                            });
+                        } else {
+                            if ui.button("\u{1F4C5}").on_hover_text("Show modification date").clicked() {
+                                self.show_date_columns.insert(self.current_path.clone(), true);
+                                self.sort_column = SortColumn::Date;
+                                self.sort_ascending = false;
+                                sort_changed = true;
+                            }
+                        }
+                    });
+                })
+                .body(|mut body| {
                     for entry in self.contents.clone() {
-                        // Skip entries that don't match the filter (but always show parent directory)
+                        // Filter
                         if !entry.name.starts_with("[..]") && !self.filter.is_empty() {
                             if !entry.name.to_lowercase().contains(&self.filter.to_lowercase()) {
                                 continue;
                             }
                         }
-                        
+
                         let is_selected = self.selected_entries.contains(&entry.name);
                         let is_in_clipboard = self.clipboard_files.contains(&self.current_path.join(&entry.name));
-                        let icon = if entry.is_dir { "📁" } else { "📄" };
+                        let icon = if entry.is_dir { "\u{1F4C1}" } else { "\u{1F4C4}" };
                         let name_label = format!("{} {}", icon, entry.name);
-                        
                         let full_path = self.current_path.join(&entry.name);
-                        let is_computing = entry.is_dir && !entry.name.starts_with("[..]") 
+                        let is_computing = entry.is_dir && !entry.name.starts_with("[..]")
                             && !self.dirs_done.contains(&full_path);
-                        
+
                         let size_label = if entry.name.starts_with("[..]") {
                             String::new()
                         } else {
-                            // Try to get size from cache
                             match self.file_sizes.get(&full_path) {
                                 Some(size) => Self::format_file_size(*size),
-                                None => {
-                                    // Not in cache yet - show "..." for files, "0 B" for dirs
-                                    if entry.is_dir {
-                                        "0 B".to_string()
-                                    } else {
-                                        "...".to_string()
-                                    }
-                                }
+                                None => if entry.is_dir { "0 B".to_string() } else { "...".to_string() },
                             }
                         };
 
-                        let button = if is_selected && is_in_clipboard {
-                            // Selected AND in clipboard - dark blue background + italic + white text
-                            egui::Button::new(egui::RichText::new(&name_label).color(egui::Color32::WHITE).italics())
-                                .fill(egui::Color32::from_rgb(100, 150, 255))
-                        } else if is_selected {
-                            // Selected only - dark blue background
-                            egui::Button::new(egui::RichText::new(&name_label).color(egui::Color32::WHITE))
-                                .fill(egui::Color32::from_rgb(100, 150, 255))
-                        } else if is_in_clipboard && entry.is_dir {
-                            // In clipboard - italic yellow for folders
-                            egui::Button::new(egui::RichText::new(&name_label).italics())
-                                .fill(egui::Color32::from_rgb(255, 245, 150))
-                        } else if is_in_clipboard {
-                            // In clipboard - italic for files
-                            egui::Button::new(egui::RichText::new(&name_label).italics())
-                        } else if entry.name.starts_with("[..]") {
-                            // Parent directory - transparent background
-                            egui::Button::new(&name_label)
-                                .fill(egui::Color32::TRANSPARENT)
-                        } else if entry.is_dir {
-                            // Light yellow background for folders
-                            egui::Button::new(&name_label)
-                                .fill(egui::Color32::from_rgb(255, 245, 150))
-                        } else {
-                            // Default styling for files
-                            egui::Button::new(&name_label)
-                        };
-
-                        let (_clicked, double_clicked) = ui.horizontal(|ui| {
-                            let button_response = ui.add(button);
-                            
-                            // Store the button's rect for rectangular selection
-                            self.entry_rects.insert(entry.name.clone(), button_response.rect);
-                            
-                            let is_hovered = button_response.hovered();
-                            if is_hovered {
-                                self.any_button_hovered = true;
-                            }
-                            
-                            let clicked = button_response.clicked();
-                            let double_clicked = button_response.double_clicked();
-                            let right_clicked = button_response.secondary_clicked();
-                            
-                            // Handle selection and right-click
-                            if clicked {
-                                let is_ctrl = ui.input(|i| i.modifiers.ctrl);
-                                if is_ctrl {
-                                    // Ctrl+Click: toggle selection
-                                    if self.selected_entries.contains(&entry.name) {
-                                        self.selected_entries.remove(&entry.name);
-                                    } else {
-                                        self.selected_entries.insert(entry.name.clone());
-                                    }
+                        body.row(row_height, |mut row| {
+                            // Name column
+                            row.col(|ui| {
+                                let button = if is_selected && is_in_clipboard {
+                                    egui::Button::new(egui::RichText::new(&name_label).color(egui::Color32::WHITE).italics())
+                                        .fill(egui::Color32::from_rgb(100, 150, 255))
+                                } else if is_selected {
+                                    egui::Button::new(egui::RichText::new(&name_label).color(egui::Color32::WHITE))
+                                        .fill(egui::Color32::from_rgb(100, 150, 255))
+                                } else if is_in_clipboard && entry.is_dir {
+                                    egui::Button::new(egui::RichText::new(&name_label).italics())
+                                        .fill(egui::Color32::from_rgb(255, 245, 150))
+                                } else if is_in_clipboard {
+                                    egui::Button::new(egui::RichText::new(&name_label).italics())
+                                } else if entry.name.starts_with("[..]") {
+                                    egui::Button::new(&name_label).fill(egui::Color32::TRANSPARENT)
+                                } else if entry.is_dir {
+                                    egui::Button::new(&name_label).fill(egui::Color32::from_rgb(255, 245, 150))
                                 } else {
-                                    // Single click: select only this
-                                    self.selected_entries.clear();
-                                    self.selected_entries.insert(entry.name.clone());
-                                }
-                            }
-                            
-                            if right_clicked {
-                                self.show_context_menu = true;
-                                self.context_menu_entry = Some(entry.clone());
-                                self.context_menu_position = ui.input(|i| i.pointer.hover_pos().unwrap_or_default());
-                            }
-                            
-                            // Add space to push size to the right
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if !size_label.is_empty() {
-                                    let size_text = if is_in_clipboard {
-                                        egui::RichText::new(&size_label).weak().italics()
-                                    } else if is_hovered {
-                                        egui::RichText::new(&size_label).color(egui::Color32::BLACK)
-                                    } else {
-                                        egui::RichText::new(&size_label).weak()
-                                    };
-                                    ui.label(size_text);
-                                }
-                                
-                                // Show spinning indicator if computing size (shown to the left of size since layout is RTL)
-                                if is_computing {
-                                    let spinner_chars = ['⏳', '⌛'];
-                                    let time = ui.input(|i| i.time);
-                                    let spinner_idx = ((time * 2.0) as usize) % spinner_chars.len();
-                                    let spinner = spinner_chars[spinner_idx].to_string();
-                                    ui.label(spinner);
-                                    ctx.request_repaint();
-                                }
-                            });
-                            
-                            (clicked, double_clicked)
-                        }).inner;
-
-                        // Draw size bar underneath if entry has a size
-                        if !entry.name.starts_with("[..]") {
-                            let full_path = self.current_path.join(&entry.name);
-                            if let Some(size) = self.file_sizes.get(&full_path) {
-                                let bar_width = if self.max_file_size > 0 {
-                                    (*size as f32 / self.max_file_size as f32) * ui.available_width()
-                                } else {
-                                    0.0
+                                    egui::Button::new(&name_label)
                                 };
 
-                                let bar_rect = egui::Rect::from_min_size(
-                                    ui.cursor().min + egui::vec2(0.0, -2.0),
-                                    egui::vec2(bar_width, 1.0),
+                                let response = ui.add_sized(
+                                    egui::vec2(ui.available_width(), ui.available_height()),
+                                    button,
                                 );
-                                ui.painter().rect_filled(
-                                    bar_rect,
-                                    0.0,
-                                    egui::Color32::from_rgb(100, 150, 255),
-                                );
-                            }
-                            // Always allocate space for the bar to prevent layout shift
-                            ui.allocate_space(egui::vec2(ui.available_width(), 2.0));
-                        }
 
-                        if double_clicked {
-                            if entry.name.starts_with("[..]") {
-                                self.selected_action = Some(FileAction::GoToParent);
-                            } else if entry.is_dir {
-                                let new_path = self.current_path.join(&entry.name);
-                                self.selected_action = Some(FileAction::OpenDir(new_path));
-                            } else {
-                                // Execute file with its associated application
-                                let full_path = self.current_path.join(&entry.name);
-                                let _ = std::process::Command::new("explorer")
-                                    .arg(&full_path)
-                                    .spawn();
-                            }
-                        }
-                    }
-                    
-                    // Handle rectangular selection
-                    ctx.input(|i| {
-                        if let Some(pointer_pos) = i.pointer.hover_pos() {
-                            // Start drag if primary button pressed on empty space
-                            if i.pointer.primary_pressed() && !self.any_button_hovered {
-                                self.is_dragging_selection = true;
-                                self.selection_drag_start = Some(pointer_pos);
-                                self.selection_drag_current = Some(pointer_pos);
-                            }
-                            
-                            // Update drag position while dragging
-                            if self.is_dragging_selection && i.pointer.primary_down() {
-                                self.selection_drag_current = Some(pointer_pos);
-                            }
-                            
-                            // End drag selection
-                            if self.is_dragging_selection && !i.pointer.primary_down() {
-                                if let (Some(start), Some(end)) = (self.selection_drag_start, self.selection_drag_current) {
-                                    let sel_rect = egui::Rect::from_two_pos(start, end);
-                                    
-                                    // Clear selection if not holding Ctrl
-                                    if !i.modifiers.ctrl {
-                                        self.selected_entries.clear();
-                                    }
-                                    
-                                    // Select all entries whose rects intersect with selection rect
-                                    for (name, rect) in &self.entry_rects {
-                                        if sel_rect.intersects(*rect) && !name.starts_with("[..]") {
-                                            self.selected_entries.insert(name.clone());
+                                self.entry_rects.insert(entry.name.clone(), response.rect);
+                                if response.hovered() {
+                                    self.any_button_hovered = true;
+                                }
+
+                                if response.clicked() {
+                                    let is_ctrl = ui.input(|i| i.modifiers.ctrl);
+                                    if is_ctrl {
+                                        if self.selected_entries.contains(&entry.name) {
+                                            self.selected_entries.remove(&entry.name);
+                                        } else {
+                                            self.selected_entries.insert(entry.name.clone());
                                         }
+                                    } else {
+                                        self.selected_entries.clear();
+                                        self.selected_entries.insert(entry.name.clone());
                                     }
                                 }
-                                self.is_dragging_selection = false;
-                                self.selection_drag_start = None;
-                                self.selection_drag_current = None;
-                            }
-                        }
-                        
-                        // Click on empty space to deselect
-                        if i.pointer.primary_clicked() && !self.any_button_hovered && !self.is_dragging_selection {
-                            self.selected_entries.clear();
-                        }
-                    });
-                    
-                    // Allocate remaining space
-                    let remaining_height = ui.available_height();
-                    if remaining_height > 0.0 {
-                        ui.allocate_space(egui::vec2(ui.available_width(), remaining_height));
+
+                                if response.secondary_clicked() {
+                                    self.show_context_menu = true;
+                                    self.context_menu_entry = Some(entry.clone());
+                                    self.context_menu_position = ui.input(|i| i.pointer.hover_pos().unwrap_or_default());
+                                }
+
+                                if response.double_clicked() {
+                                    if entry.name.starts_with("[..]") {
+                                        self.selected_action = Some(FileAction::GoToParent);
+                                    } else if entry.is_dir {
+                                        let new_path = self.current_path.join(&entry.name);
+                                        self.selected_action = Some(FileAction::OpenDir(new_path));
+                                    } else {
+                                        let full_path = self.current_path.join(&entry.name);
+                                        let _ = std::process::Command::new("explorer")
+                                            .arg(&full_path)
+                                            .spawn();
+                                    }
+                                }
+
+                                // Draw size bar at bottom of cell
+                                if !entry.name.starts_with("[..]") {
+                                    if let Some(size) = self.file_sizes.get(&full_path) {
+                                        let bar_width = if self.max_file_size > 0 {
+                                            (*size as f32 / self.max_file_size as f32) * response.rect.width()
+                                        } else {
+                                            0.0
+                                        };
+                                        let bar_rect = egui::Rect::from_min_size(
+                                            egui::pos2(response.rect.left(), response.rect.bottom() - 2.0),
+                                            egui::vec2(bar_width, 1.0),
+                                        );
+                                        ui.painter().rect_filled(
+                                            bar_rect,
+                                            0.0,
+                                            egui::Color32::from_rgb(100, 150, 255),
+                                        );
+                                    }
+                                }
+                            });
+
+                            // Size column
+                            row.col(|ui| {
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if !size_label.is_empty() {
+                                        let size_text = if is_in_clipboard {
+                                            egui::RichText::new(&size_label).weak().italics()
+                                        } else {
+                                            egui::RichText::new(&size_label).weak()
+                                        };
+                                        ui.label(size_text);
+                                    }
+                                    if is_computing {
+                                        let spinner_chars = ['\u{23F3}', '\u{231B}'];
+                                        let time = ui.input(|i| i.time);
+                                        let idx = ((time * 2.0) as usize) % spinner_chars.len();
+                                        ui.label(spinner_chars[idx].to_string());
+                                        ctx.request_repaint();
+                                    }
+                                });
+                            });
+
+                            // Date column
+                            row.col(|ui| {
+                                if show_dates && !entry.name.starts_with("[..]") {
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        let date_text = if let Some(modified) = entry.modified {
+                                            Self::format_modified_time(modified)
+                                        } else {
+                                            String::new()
+                                        };
+                                        if !date_text.is_empty() {
+                                            let label = if is_in_clipboard {
+                                                egui::RichText::new(&date_text).weak().italics()
+                                            } else {
+                                                egui::RichText::new(&date_text).weak()
+                                            };
+                                            ui.label(label);
+                                        }
+                                    });
+                                }
+                            });
+                        });
                     }
                 });
-            
+
+            // Handle rectangular selection
+            ctx.input(|i| {
+                if let Some(pointer_pos) = i.pointer.hover_pos() {
+                    if i.pointer.primary_pressed() && !self.any_button_hovered {
+                        self.is_dragging_selection = true;
+                        self.selection_drag_start = Some(pointer_pos);
+                        self.selection_drag_current = Some(pointer_pos);
+                    }
+                    if self.is_dragging_selection && i.pointer.primary_down() {
+                        self.selection_drag_current = Some(pointer_pos);
+                    }
+                    if self.is_dragging_selection && !i.pointer.primary_down() {
+                        if let (Some(start), Some(end)) = (self.selection_drag_start, self.selection_drag_current) {
+                            let sel_rect = egui::Rect::from_two_pos(start, end);
+                            if !i.modifiers.ctrl {
+                                self.selected_entries.clear();
+                            }
+                            for (name, rect) in &self.entry_rects {
+                                if sel_rect.intersects(*rect) && !name.starts_with("[..]") {
+                                    self.selected_entries.insert(name.clone());
+                                }
+                            }
+                        }
+                        self.is_dragging_selection = false;
+                        self.selection_drag_start = None;
+                        self.selection_drag_current = None;
+                    }
+                }
+                if i.pointer.primary_clicked() && !self.any_button_hovered && !self.is_dragging_selection {
+                    self.selected_entries.clear();
+                }
+            });
+
+            if sort_changed {
+                self.sort_contents();
+                self.config.sort_column = self.sort_column.clone();
+                self.config.sort_ascending = self.sort_ascending;
+                self.config.show_date_columns = self.show_date_columns.iter()
+                    .map(|(k, v)| (k.to_string_lossy().to_string(), *v))
+                    .collect();
+                self.config.save();
+            }
+
             // Draw selection rectangle if dragging
             if let (Some(start), Some(current)) = (self.selection_drag_start, self.selection_drag_current) {
                 let sel_rect = egui::Rect::from_two_pos(start, current);
                 ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("selection_rect")))
-                    .rect_stroke(
-                        sel_rect,
-                        0.0,
-                        egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 150, 255)),
-                    );
+                    .rect_stroke(sel_rect, 0.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 150, 255)));
                 ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("selection_rect")))
-                    .rect_filled(
-                        sel_rect,
-                        0.0,
-                        egui::Color32::from_rgba_unmultiplied(100, 150, 255, 30),
-                    );
+                    .rect_filled(sel_rect, 0.0, egui::Color32::from_rgba_unmultiplied(100, 150, 255, 30));
             }
         });
 
