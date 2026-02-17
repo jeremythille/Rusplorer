@@ -1324,25 +1324,37 @@ impl eframe::App for RusplorerApp {
             self.any_button_hovered = false;
 
             let row_height = 18.0;
-            let mut table_builder = TableBuilder::new(ui)
+            
+            // Measure actual text widths for tight columns
+            let font_id = egui::TextStyle::Body.resolve(ui.style());
+            let size_text_width = ui.fonts(|f| f.layout_no_wrap("999.9 TB".to_string(), font_id.clone(), egui::Color32::WHITE).size().x);
+            let date_text_width = if show_dates {
+                ui.fonts(|f| f.layout_no_wrap("2026-02-17 14:30".to_string(), font_id.clone(), egui::Color32::WHITE).size().x)
+            } else {
+                0.0
+            };
+            
+            // Calculate exact column widths from available space
+            let available = ui.available_width();
+            let size_col_w = size_text_width + 8.0;  // small padding
+            let date_col_w = if show_dates { date_text_width + 20.0 } else { 18.0 }; // +20 for X button + padding
+            let name_col_w = (available - size_col_w - date_col_w - 15.0).max(50.0);
+            
+            let table_builder = TableBuilder::new(ui)
                 .striped(true)
+                .resizable(false)
                 .vscroll(true)
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                .column(Column::remainder().clip(true))   // Name
-                .column(Column::auto().at_least(60.0));    // Size
-
-            if show_dates {
-                table_builder = table_builder.column(Column::auto().at_least(120.0));
-            } else {
-                table_builder = table_builder.column(Column::exact(28.0));
-            }
+                .column(Column::exact(name_col_w).clip(true))
+                .column(Column::exact(size_col_w))
+                .column(Column::exact(date_col_w));
 
             table_builder
                 .header(row_height, |mut header| {
                     // Name header
                     header.col(|ui| {
                         let arrow = if self.sort_column == SortColumn::Name {
-                            if self.sort_ascending { " \u{25B2}" } else { " \u{25BC}" }
+                            if self.sort_ascending { " ^" } else { " v" }
                         } else { "" };
                         let text = format!("Name{}", arrow);
                         if ui.add_sized(
@@ -1362,7 +1374,7 @@ impl eframe::App for RusplorerApp {
                     // Size header
                     header.col(|ui| {
                         let arrow = if self.sort_column == SortColumn::Size {
-                            if self.sort_ascending { " \u{25B2}" } else { " \u{25BC}" }
+                            if self.sort_ascending { " ^" } else { " v" }
                         } else { "" };
                         let text = format!("Size{}", arrow);
                         if ui.add_sized(
@@ -1383,7 +1395,7 @@ impl eframe::App for RusplorerApp {
                     header.col(|ui| {
                         if show_dates {
                             ui.horizontal(|ui| {
-                                if ui.small_button("\u{2715}").on_hover_text("Hide date column").clicked() {
+                                if ui.small_button("X").on_hover_text("Hide date column").clicked() {
                                     self.show_date_columns.insert(self.current_path.clone(), false);
                                     if self.sort_column == SortColumn::Date {
                                         self.sort_column = SortColumn::Name;
@@ -1392,10 +1404,13 @@ impl eframe::App for RusplorerApp {
                                     sort_changed = true;
                                 }
                                 let arrow = if self.sort_column == SortColumn::Date {
-                                    if self.sort_ascending { " \u{25B2}" } else { " \u{25BC}" }
+                                    if self.sort_ascending { " ^" } else { " v" }
                                 } else { "" };
                                 let text = format!("Modified{}", arrow);
-                                if ui.button(egui::RichText::new(&text).strong()).clicked() {
+                                if ui.add_sized(
+                                    egui::vec2(ui.available_width(), ui.available_height()),
+                                    egui::Button::new(egui::RichText::new(&text).strong())
+                                ).clicked() {
                                     if self.sort_column == SortColumn::Date {
                                         self.sort_ascending = !self.sort_ascending;
                                     } else {
@@ -1406,7 +1421,7 @@ impl eframe::App for RusplorerApp {
                                 }
                             });
                         } else {
-                            if ui.button("\u{1F4C5}").on_hover_text("Show modification date").clicked() {
+                            if ui.small_button("📅").on_hover_text("Show modification date").clicked() {
                                 self.show_date_columns.insert(self.current_path.clone(), true);
                                 self.sort_column = SortColumn::Date;
                                 self.sort_ascending = false;
@@ -1426,8 +1441,6 @@ impl eframe::App for RusplorerApp {
 
                         let is_selected = self.selected_entries.contains(&entry.name);
                         let is_in_clipboard = self.clipboard_files.contains(&self.current_path.join(&entry.name));
-                        let icon = if entry.is_dir { "\u{1F4C1}" } else { "\u{1F4C4}" };
-                        let name_label = format!("{} {}", icon, entry.name);
                         let full_path = self.current_path.join(&entry.name);
                         let is_computing = entry.is_dir && !entry.name.starts_with("[..]")
                             && !self.dirs_done.contains(&full_path);
@@ -1445,22 +1458,31 @@ impl eframe::App for RusplorerApp {
                             // Name column
                             row.col(|ui| {
                                 let button = if is_selected && is_in_clipboard {
-                                    egui::Button::new(egui::RichText::new(&name_label).color(egui::Color32::WHITE).italics())
+                                    egui::Button::new(egui::RichText::new(&entry.name).color(egui::Color32::WHITE).italics())
                                         .fill(egui::Color32::from_rgb(100, 150, 255))
+                                        .frame(false)
                                 } else if is_selected {
-                                    egui::Button::new(egui::RichText::new(&name_label).color(egui::Color32::WHITE))
+                                    egui::Button::new(egui::RichText::new(&entry.name).color(egui::Color32::WHITE))
                                         .fill(egui::Color32::from_rgb(100, 150, 255))
+                                        .frame(false)
                                 } else if is_in_clipboard && entry.is_dir {
-                                    egui::Button::new(egui::RichText::new(&name_label).italics())
+                                    egui::Button::new(egui::RichText::new(&entry.name).italics())
                                         .fill(egui::Color32::from_rgb(255, 245, 150))
+                                        .frame(false)
                                 } else if is_in_clipboard {
-                                    egui::Button::new(egui::RichText::new(&name_label).italics())
+                                    egui::Button::new(egui::RichText::new(&entry.name).italics())
+                                        .frame(false)
                                 } else if entry.name.starts_with("[..]") {
-                                    egui::Button::new(&name_label).fill(egui::Color32::TRANSPARENT)
+                                    egui::Button::new(&entry.name)
+                                        .fill(egui::Color32::TRANSPARENT)
+                                        .frame(false)
                                 } else if entry.is_dir {
-                                    egui::Button::new(&name_label).fill(egui::Color32::from_rgb(255, 245, 150))
+                                    egui::Button::new(&entry.name)
+                                        .fill(egui::Color32::from_rgb(255, 245, 150))
+                                        .frame(false)
                                 } else {
-                                    egui::Button::new(&name_label)
+                                    egui::Button::new(&entry.name)
+                                        .frame(false)
                                 };
 
                                 let response = ui.add_sized(
@@ -1528,7 +1550,7 @@ impl eframe::App for RusplorerApp {
                                 }
                             });
 
-                            // Size column
+                            // Size column - right aligned, no extra padding
                             row.col(|ui| {
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     if !size_label.is_empty() {
@@ -1540,7 +1562,7 @@ impl eframe::App for RusplorerApp {
                                         ui.label(size_text);
                                     }
                                     if is_computing {
-                                        let spinner_chars = ['\u{23F3}', '\u{231B}'];
+                                        let spinner_chars = ['⏳', '⌛'];
                                         let time = ui.input(|i| i.time);
                                         let idx = ((time * 2.0) as usize) % spinner_chars.len();
                                         ui.label(spinner_chars[idx].to_string());
@@ -1549,24 +1571,24 @@ impl eframe::App for RusplorerApp {
                                 });
                             });
 
-                            // Date column
+                            // Date column - right aligned, tight
                             row.col(|ui| {
                                 if show_dates && !entry.name.starts_with("[..]") {
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        let date_text = if let Some(modified) = entry.modified {
-                                            Self::format_modified_time(modified)
-                                        } else {
-                                            String::new()
-                                        };
-                                        if !date_text.is_empty() {
+                                    let date_text = if let Some(modified) = entry.modified {
+                                        Self::format_modified_time(modified)
+                                    } else {
+                                        String::new()
+                                    };
+                                    if !date_text.is_empty() {
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                             let label = if is_in_clipboard {
                                                 egui::RichText::new(&date_text).weak().italics()
                                             } else {
                                                 egui::RichText::new(&date_text).weak()
                                             };
                                             ui.label(label);
-                                        }
-                                    });
+                                        });
+                                    }
                                 }
                             });
                         });
