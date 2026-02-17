@@ -13,7 +13,9 @@ use notify::recommended_watcher;
 use std::collections::HashSet;
 
 #[cfg(windows)]
-use winapi::um::winuser::{OpenClipboard, CloseClipboard, SetClipboardData, EmptyClipboard};
+use winapi::um::winuser::{OpenClipboard, CloseClipboard, SetClipboardData, EmptyClipboard, GetAsyncKeyState};
+#[cfg(windows)]
+use winapi::um::shellapi::{SHFileOperationW, SHFILEOPSTRUCTW, FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION};
 #[cfg(windows)]
 use std::ffi::OsStr;
 #[cfg(windows)]
@@ -21,6 +23,7 @@ use std::os::windows::ffi::OsStrExt;
 
 /// Copy files to Windows clipboard in HDROP format so they can be pasted in Explorer
 #[cfg(windows)]
+#[allow(dead_code)]
 fn copy_files_to_clipboard(files: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
     use winapi::um::winuser::CF_HDROP;
     
@@ -110,6 +113,7 @@ fn calculate_dir_size_progressive(
     path: &Path,
     root_path: &Path,
     cancel_token: &Arc<AtomicBool>,
+    pause_token: &Arc<AtomicBool>,
     tx: &std::sync::mpsc::Sender<(PathBuf, u64)>,
     accumulated: &mut u64,
 ) {
@@ -119,10 +123,17 @@ fn calculate_dir_size_progressive(
             if cancel_token.load(Ordering::Relaxed) {
                 return;
             }
+            // Check pause and sleep if paused
+            while pause_token.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if cancel_token.load(Ordering::Relaxed) {
+                    return;
+                }
+            }
             
             let entry_path = entry.path();
             if entry_path.is_dir() {
-                calculate_dir_size_progressive(&entry_path, root_path, cancel_token, tx, accumulated);
+                calculate_dir_size_progressive(&entry_path, root_path, cancel_token, pause_token, tx, accumulated);
             } else if let Ok(metadata) = entry.metadata() {
                 *accumulated += metadata.len();
                 // Send update every time we add file size
@@ -231,6 +242,10 @@ struct RusplorerApp {
     extract_done_receiver: Option<Receiver<()>>,
     clipboard_files: Vec<PathBuf>,
     clipboard_mode: Option<ClipboardMode>,
+    prev_ctrl_c_down: bool,
+    prev_ctrl_v_down: bool,
+    prev_ctrl_x_down: bool,
+    prev_del_down: bool,
 }
 
 #[derive(Clone)]
@@ -304,6 +319,10 @@ impl Default for RusplorerApp {
             extract_done_receiver: None,
             clipboard_files: Vec::new(),
             clipboard_mode: None,
+            prev_ctrl_c_down: false,
+            prev_ctrl_v_down: false,
+            prev_ctrl_x_down: false,
+            prev_del_down: false,
         };
         app.refresh_contents();
         app.start_file_watcher();
@@ -394,7 +413,7 @@ impl RusplorerApp {
                     if path.is_dir() {
                         // Calculate folder size progressively
                         let mut accumulated = 0u64;
-                        calculate_dir_size_progressive(&path, &path, &cancel_token, &tx, &mut accumulated);
+                        calculate_dir_size_progressive(&path, &path, &cancel_token, &pause_token, &tx, &mut accumulated);
                     } else {
                         if let Ok(metadata) = entry.metadata() {
                             let _ = tx.send((path, metadata.len()));
@@ -641,23 +660,30 @@ impl RusplorerApp {
             return;
         }
         
-        // Recalculate sizes for files that changed
-        for path in self.files_to_recalculate.iter() {
-            if path.exists() {
-                if path.is_dir() {
-                    let mut accumulated = 0u64;
-                    let cancel_token = Arc::new(AtomicBool::new(false));
-                    let (tx, rx) = channel();
-                    calculate_dir_size_progressive(&path, &path, &cancel_token, &tx, &mut accumulated);
-                    if let Ok((p, size)) = rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                        self.file_sizes.insert(p, size);
+        // Recalculate sizes for files that changed (async in background thread)
+        if !self.files_to_recalculate.is_empty() {
+            let paths_to_recalculate: Vec<_> = self.files_to_recalculate.iter().cloned().collect();
+            let cancel_token = Arc::new(AtomicBool::new(false));
+            let pause_token = Arc::new(AtomicBool::new(false));
+            let (tx, rx) = channel();
+            
+            std::thread::spawn(move || {
+                for path in paths_to_recalculate {
+                    if path.exists() && path.is_dir() {
+                        let mut accumulated = 0u64;
+                        calculate_dir_size_progressive(&path, &path, &cancel_token, &pause_token, &tx, &mut accumulated);
+                    } else if path.exists() {
+                        if let Ok(metadata) = path.metadata() {
+                            let _ = tx.send((path, metadata.len()));
+                        }
                     }
-                } else if let Ok(metadata) = path.metadata() {
-                    self.file_sizes.insert(path.clone(), metadata.len());
                 }
-            }
+            });
+            
+            // Store receiver to collect results in update()
+            self.size_receiver = Some(rx);
+            self.files_to_recalculate.clear();
         }
-        self.files_to_recalculate.clear();
     }
 }
 
@@ -774,29 +800,50 @@ impl eframe::App for RusplorerApp {
             self.selected_entries.clear();
         }
 
-        // Handle Ctrl+C / Ctrl+X / Ctrl+V (egui translates these to Copy/Cut/Paste events)
-        let (got_copy, got_cut, got_paste) = ctx.input(|i| {
-            let mut copy = false;
-            let mut cut = false;
-            let mut paste = false;
-            for event in &i.events {
-                match event {
-                    egui::Event::Copy => copy = true,
-                    egui::Event::Cut => cut = true,
-                    egui::Event::Paste(_) => paste = true,
-                    _ => {}
-                }
+        // Handle Ctrl+C / Ctrl+X / Ctrl+V / DEL using Windows API directly (bypass egui)
+        let (got_copy, got_cut, got_paste, got_delete) = {
+            #[cfg(windows)]
+            {
+                const VK_CONTROL: i32 = 0x11;
+                const VK_C: i32 = 0x43;
+                const VK_V: i32 = 0x56;
+                const VK_X: i32 = 0x58;
+                const VK_DELETE: i32 = 0x2E;
+                
+                let ctrl_down = unsafe { GetAsyncKeyState(VK_CONTROL) } as u16 & 0x8000 != 0;
+                let c_down = ctrl_down && (unsafe { GetAsyncKeyState(VK_C) } as u16 & 0x8000 != 0);
+                let v_down = ctrl_down && (unsafe { GetAsyncKeyState(VK_V) } as u16 & 0x8000 != 0);
+                let x_down = ctrl_down && (unsafe { GetAsyncKeyState(VK_X) } as u16 & 0x8000 != 0);
+                let del_down = unsafe { GetAsyncKeyState(VK_DELETE) } as u16 & 0x8000 != 0;
+                
+                // Edge detection: only trigger on press (transition from not-pressed to pressed)
+                let copy_pressed = c_down && !self.prev_ctrl_c_down;
+                let paste_pressed = v_down && !self.prev_ctrl_v_down;
+                let cut_pressed = x_down && !self.prev_ctrl_x_down;
+                let delete_pressed = del_down && !self.prev_del_down;
+                
+                self.prev_ctrl_c_down = c_down;
+                self.prev_ctrl_v_down = v_down;
+                self.prev_ctrl_x_down = x_down;
+                self.prev_del_down = del_down;
+                
+                (copy_pressed, cut_pressed, paste_pressed, delete_pressed)
             }
-            (copy, cut, paste)
-        });
+            #[cfg(not(windows))]
+            {
+                let c = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::C));
+                let x = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::X));
+                let v = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::V));
+                let d = ctx.input(|i| i.key_pressed(egui::Key::Delete));
+                (c, x, v, d)
+            }
+        };
 
         if got_copy && !self.selected_entries.is_empty() {
             self.clipboard_files = self.selected_entries.iter()
                 .map(|name| self.current_path.join(name))
                 .collect();
             self.clipboard_mode = Some(ClipboardMode::Copy);
-            #[cfg(windows)]
-            let _ = copy_files_to_clipboard(&self.clipboard_files);
         }
 
         if got_cut && !self.selected_entries.is_empty() {
@@ -804,8 +851,6 @@ impl eframe::App for RusplorerApp {
                 .map(|name| self.current_path.join(name))
                 .collect();
             self.clipboard_mode = Some(ClipboardMode::Cut);
-            #[cfg(windows)]
-            let _ = copy_files_to_clipboard(&self.clipboard_files);
         }
 
         if got_paste {
@@ -814,33 +859,61 @@ impl eframe::App for RusplorerApp {
                     let files = self.clipboard_files.clone();
                     let dest = self.current_path.clone();
                     
-                    std::thread::spawn(move || {
-                        match mode {
-                            ClipboardMode::Copy => {
-                                let _ = RusplorerApp::copy_files(&files, &dest);
-                            }
-                            ClipboardMode::Cut => {
-                                let _ = RusplorerApp::move_files(&files, &dest);
-                            }
+                    match mode {
+                        ClipboardMode::Copy => {
+                            let _ = RusplorerApp::copy_files(&files, &dest);
                         }
-                    });
-                    
-                    if mode == ClipboardMode::Cut {
-                        self.clipboard_files.clear();
-                        self.clipboard_mode = None;
+                        ClipboardMode::Cut => {
+                            let _ = RusplorerApp::move_files(&files, &dest);
+                            self.clipboard_files.clear();
+                            self.clipboard_mode = None;
+                        }
                     }
+                    
+                    self.refresh_contents();
                 }
             }
         }
 
-        // Debug: show clipboard state in title
-        let clip_info = format!(
-            "Rusplorer  |  sel: {}  clip: {} ({:?})",
-            self.selected_entries.len(),
-            self.clipboard_files.len(),
-            self.clipboard_mode
-        );
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(clip_info));
+        // Handle DEL key - send to recycle bin
+        if got_delete && !self.selected_entries.is_empty() {
+            let files_to_delete: Vec<PathBuf> = self.selected_entries.iter()
+                .map(|name| self.current_path.join(name))
+                .collect();
+            
+            #[cfg(windows)]
+            {
+                // Build double-null-terminated wide string list
+                let mut path_buffer: Vec<u16> = Vec::new();
+                for path in &files_to_delete {
+                    let wide: Vec<u16> = OsStr::new(path.to_str().unwrap())
+                        .encode_wide()
+                        .chain(std::iter::once(0u16))
+                        .collect();
+                    path_buffer.extend_from_slice(&wide);
+                }
+                path_buffer.push(0u16); // Final null terminator
+                
+                unsafe {
+                    let mut file_op = SHFILEOPSTRUCTW {
+                        hwnd: std::ptr::null_mut(),
+                        wFunc: FO_DELETE as u32,
+                        pFrom: path_buffer.as_ptr(),
+                        pTo: std::ptr::null(),
+                        fFlags: FOF_ALLOWUNDO | FOF_NOCONFIRMATION,
+                        fAnyOperationsAborted: 0,
+                        hNameMappings: std::ptr::null_mut(),
+                        lpszProgressTitle: std::ptr::null(),
+                    };
+                    
+                    let result = SHFileOperationW(&mut file_op);
+                    if result == 0 {
+                        self.selected_entries.clear();
+                        self.refresh_contents();
+                    }
+                }
+            }
+        }
 
         // Handle pending actions
         if let Some(action) = self.selected_action.take() {
@@ -963,6 +1036,7 @@ impl eframe::App for RusplorerApp {
                         }
                         
                         let is_selected = self.selected_entries.contains(&entry.name);
+                        let is_in_clipboard = self.clipboard_files.contains(&self.current_path.join(&entry.name));
                         let icon = if entry.is_dir { "📁" } else { "📄" };
                         let name_label = format!("{} {}", icon, entry.name);
                         
@@ -977,10 +1051,21 @@ impl eframe::App for RusplorerApp {
                             }
                         };
 
-                        let button = if is_selected {
-                            // Selected - dark blue background
+                        let button = if is_selected && is_in_clipboard {
+                            // Selected AND in clipboard - dark blue background + italic + white text
+                            egui::Button::new(egui::RichText::new(&name_label).color(egui::Color32::WHITE).italics())
+                                .fill(egui::Color32::from_rgb(100, 150, 255))
+                        } else if is_selected {
+                            // Selected only - dark blue background
                             egui::Button::new(egui::RichText::new(&name_label).color(egui::Color32::WHITE))
                                 .fill(egui::Color32::from_rgb(100, 150, 255))
+                        } else if is_in_clipboard && entry.is_dir {
+                            // In clipboard - italic yellow for folders
+                            egui::Button::new(egui::RichText::new(&name_label).italics())
+                                .fill(egui::Color32::from_rgb(255, 245, 150))
+                        } else if is_in_clipboard {
+                            // In clipboard - italic for files
+                            egui::Button::new(egui::RichText::new(&name_label).italics())
                         } else if entry.is_dir {
                             // Light yellow background for folders
                             egui::Button::new(&name_label)
@@ -1023,7 +1108,9 @@ impl eframe::App for RusplorerApp {
                             // Add space to push size to the right
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if !size_label.is_empty() {
-                                    let size_text = if is_hovered {
+                                    let size_text = if is_in_clipboard {
+                                        egui::RichText::new(&size_label).weak().italics()
+                                    } else if is_hovered {
                                         egui::RichText::new(&size_label).color(egui::Color32::BLACK)
                                     } else {
                                         egui::RichText::new(&size_label).weak()
@@ -1072,6 +1159,18 @@ impl eframe::App for RusplorerApp {
                                     .arg(&full_path)
                                     .spawn();
                             }
+                        }
+                    }
+                    
+                    // Fill remaining space with an invisible clickable area to detect background clicks
+                    let remaining_height = ui.available_height();
+                    if remaining_height > 0.0 {
+                        let bg_response = ui.allocate_response(
+                            egui::vec2(ui.available_width(), remaining_height),
+                            egui::Sense::click()
+                        );
+                        if bg_response.clicked() {
+                            self.selected_entries.clear();
                         }
                     }
                 });
