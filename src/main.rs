@@ -246,6 +246,11 @@ struct RusplorerApp {
     prev_ctrl_v_down: bool,
     prev_ctrl_x_down: bool,
     prev_del_down: bool,
+    selection_drag_start: Option<egui::Pos2>,
+    selection_drag_current: Option<egui::Pos2>,
+    entry_rects: HashMap<String, egui::Rect>,
+    is_dragging_selection: bool,
+    any_button_hovered: bool,
 }
 
 #[derive(Clone)]
@@ -323,6 +328,11 @@ impl Default for RusplorerApp {
             prev_ctrl_v_down: false,
             prev_ctrl_x_down: false,
             prev_del_down: false,
+            selection_drag_start: None,
+            selection_drag_current: None,
+            entry_rects: HashMap::new(),
+            is_dragging_selection: false,
+            any_button_hovered: false,
         };
         app.refresh_contents();
         app.start_file_watcher();
@@ -1023,10 +1033,15 @@ impl eframe::App for RusplorerApp {
 
             ui.separator();
 
+            // Clear entry rects for this frame
+            self.entry_rects.clear();
+            self.any_button_hovered = false;
+
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing = [0.0, -1.0].into();
+                    
                     for entry in self.contents.clone() {
                         // Skip entries that don't match the filter (but always show parent directory)
                         if !entry.name.starts_with("[..]") && !self.filter.is_empty() {
@@ -1066,6 +1081,10 @@ impl eframe::App for RusplorerApp {
                         } else if is_in_clipboard {
                             // In clipboard - italic for files
                             egui::Button::new(egui::RichText::new(&name_label).italics())
+                        } else if entry.name.starts_with("[..]") {
+                            // Parent directory - transparent background
+                            egui::Button::new(&name_label)
+                                .fill(egui::Color32::TRANSPARENT)
                         } else if entry.is_dir {
                             // Light yellow background for folders
                             egui::Button::new(&name_label)
@@ -1077,7 +1096,15 @@ impl eframe::App for RusplorerApp {
 
                         let (_clicked, double_clicked) = ui.horizontal(|ui| {
                             let button_response = ui.add(button);
+                            
+                            // Store the button's rect for rectangular selection
+                            self.entry_rects.insert(entry.name.clone(), button_response.rect);
+                            
                             let is_hovered = button_response.hovered();
+                            if is_hovered {
+                                self.any_button_hovered = true;
+                            }
+                            
                             let clicked = button_response.clicked();
                             let double_clicked = button_response.double_clicked();
                             let right_clicked = button_response.secondary_clicked();
@@ -1162,18 +1189,73 @@ impl eframe::App for RusplorerApp {
                         }
                     }
                     
-                    // Fill remaining space with an invisible clickable area to detect background clicks
-                    let remaining_height = ui.available_height();
-                    if remaining_height > 0.0 {
-                        let bg_response = ui.allocate_response(
-                            egui::vec2(ui.available_width(), remaining_height),
-                            egui::Sense::click()
-                        );
-                        if bg_response.clicked() {
+                    // Handle rectangular selection
+                    ctx.input(|i| {
+                        if let Some(pointer_pos) = i.pointer.hover_pos() {
+                            // Start drag if primary button pressed on empty space
+                            if i.pointer.primary_pressed() && !self.any_button_hovered {
+                                self.is_dragging_selection = true;
+                                self.selection_drag_start = Some(pointer_pos);
+                                self.selection_drag_current = Some(pointer_pos);
+                            }
+                            
+                            // Update drag position while dragging
+                            if self.is_dragging_selection && i.pointer.primary_down() {
+                                self.selection_drag_current = Some(pointer_pos);
+                            }
+                            
+                            // End drag selection
+                            if self.is_dragging_selection && !i.pointer.primary_down() {
+                                if let (Some(start), Some(end)) = (self.selection_drag_start, self.selection_drag_current) {
+                                    let sel_rect = egui::Rect::from_two_pos(start, end);
+                                    
+                                    // Clear selection if not holding Ctrl
+                                    if !i.modifiers.ctrl {
+                                        self.selected_entries.clear();
+                                    }
+                                    
+                                    // Select all entries whose rects intersect with selection rect
+                                    for (name, rect) in &self.entry_rects {
+                                        if sel_rect.intersects(*rect) && !name.starts_with("[..]") {
+                                            self.selected_entries.insert(name.clone());
+                                        }
+                                    }
+                                }
+                                self.is_dragging_selection = false;
+                                self.selection_drag_start = None;
+                                self.selection_drag_current = None;
+                            }
+                        }
+                        
+                        // Click on empty space to deselect
+                        if i.pointer.primary_clicked() && !self.any_button_hovered && !self.is_dragging_selection {
                             self.selected_entries.clear();
                         }
+                    });
+                    
+                    // Allocate remaining space
+                    let remaining_height = ui.available_height();
+                    if remaining_height > 0.0 {
+                        ui.allocate_space(egui::vec2(ui.available_width(), remaining_height));
                     }
                 });
+            
+            // Draw selection rectangle if dragging
+            if let (Some(start), Some(current)) = (self.selection_drag_start, self.selection_drag_current) {
+                let sel_rect = egui::Rect::from_two_pos(start, current);
+                ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("selection_rect")))
+                    .rect_stroke(
+                        sel_rect,
+                        0.0,
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 150, 255)),
+                    );
+                ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("selection_rect")))
+                    .rect_filled(
+                        sel_rect,
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(100, 150, 255, 30),
+                    );
+            }
         });
 
         // Drop menu context window
