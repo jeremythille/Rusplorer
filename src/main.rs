@@ -1327,7 +1327,40 @@ impl eframe::App for RusplorerApp {
             
             // Measure actual text widths for tight columns
             let font_id = egui::TextStyle::Body.resolve(ui.style());
-            let size_text_width = ui.fonts(|f| f.layout_no_wrap("999.9 TB".to_string(), font_id.clone(), egui::Color32::WHITE).size().x);
+            
+            // Find the widest size label in current contents
+            let max_size_str = self.contents.iter()
+                .filter_map(|entry| {
+                    if entry.name.starts_with("[..]") {
+                        None
+                    } else {
+                        let full_path = self.current_path.join(&entry.name);
+                        self.file_sizes.get(&full_path)
+                            .map(|size| Self::format_file_size(*size))
+                            .or(Some(if entry.is_dir { "0 B".to_string() } else { "...".to_string() }))
+                    }
+                })
+                .max_by_key(|s| s.len())
+                .unwrap_or_else(|| "0 B".to_string());
+            
+            let size_text_width = ui.fonts(|f| f.layout_no_wrap(max_size_str, font_id.clone(), egui::Color32::WHITE).size().x);
+            
+            // Check if any directories are still computing
+            let has_computing = self.contents.iter().any(|entry| {
+                if entry.is_dir && !entry.name.starts_with("[..]") {
+                    let full_path = self.current_path.join(&entry.name);
+                    !self.dirs_done.contains(&full_path)
+                } else {
+                    false
+                }
+            });
+            
+            let hourglass_width = if has_computing {
+                ui.fonts(|f| f.layout_no_wrap("⏳".to_string(), font_id.clone(), egui::Color32::WHITE).size().x)
+            } else {
+                0.0
+            };
+            
             let date_text_width = if show_dates {
                 ui.fonts(|f| f.layout_no_wrap("2026-02-17 14:30".to_string(), font_id.clone(), egui::Color32::WHITE).size().x)
             } else {
@@ -1336,7 +1369,7 @@ impl eframe::App for RusplorerApp {
             
             // Calculate exact column widths from available space
             let available = ui.available_width();
-            let size_col_w = size_text_width + 8.0;  // small padding
+            let size_col_w = size_text_width + hourglass_width + 7.0;  // text + spinner (if any) + padding
             let date_col_w = if show_dates { date_text_width + 20.0 } else { 18.0 }; // +20 for X button + padding
             let name_col_w = (available - size_col_w - date_col_w - 15.0).max(50.0);
             
@@ -1354,7 +1387,7 @@ impl eframe::App for RusplorerApp {
                     // Name header
                     header.col(|ui| {
                         let arrow = if self.sort_column == SortColumn::Name {
-                            if self.sort_ascending { " ^" } else { " v" }
+                            if self.sort_ascending { "↑" } else { "↓" }
                         } else { "" };
                         let text = format!("Name{}", arrow);
                         if ui.add_sized(
@@ -1374,7 +1407,7 @@ impl eframe::App for RusplorerApp {
                     // Size header
                     header.col(|ui| {
                         let arrow = if self.sort_column == SortColumn::Size {
-                            if self.sort_ascending { " ^" } else { " v" }
+                            if self.sort_ascending { "↑" } else { "↓" }
                         } else { "" };
                         let text = format!("Size{}", arrow);
                         if ui.add_sized(
@@ -1404,7 +1437,7 @@ impl eframe::App for RusplorerApp {
                                     sort_changed = true;
                                 }
                                 let arrow = if self.sort_column == SortColumn::Date {
-                                    if self.sort_ascending { " ^" } else { " v" }
+                                    if self.sort_ascending { "↑" } else { "↓" }
                                 } else { "" };
                                 let text = format!("Modified{}", arrow);
                                 if ui.add_sized(
@@ -1562,11 +1595,17 @@ impl eframe::App for RusplorerApp {
                                         ui.label(size_text);
                                     }
                                     if is_computing {
-                                        let spinner_chars = ['⏳', '⌛'];
-                                        let time = ui.input(|i| i.time);
-                                        let idx = ((time * 2.0) as usize) % spinner_chars.len();
-                                        ui.label(spinner_chars[idx].to_string());
-                                        ctx.request_repaint();
+                                        if self.is_focused {
+                                            // Animated hourglass while computing
+                                            let spinner_chars = ['⏳', '⌛'];
+                                            let time = ui.input(|i| i.time);
+                                            let idx = ((time * 2.0) as usize) % spinner_chars.len();
+                                            ui.label(spinner_chars[idx].to_string());
+                                            ctx.request_repaint();
+                                        } else {
+                                            // Static hourglass when paused (window unfocused)
+                                            ui.label("⏳");
+                                        }
                                     }
                                 });
                             });
