@@ -13,9 +13,9 @@ use notify::recommended_watcher;
 use std::collections::HashSet;
 
 #[cfg(windows)]
-use winapi::um::winuser::{OpenClipboard, CloseClipboard, SetClipboardData, EmptyClipboard, GetAsyncKeyState};
+use winapi::um::winuser::{OpenClipboard, CloseClipboard, SetClipboardData, EmptyClipboard, GetAsyncKeyState, GetClipboardData, IsClipboardFormatAvailable};
 #[cfg(windows)]
-use winapi::um::shellapi::{SHFileOperationW, SHFILEOPSTRUCTW, FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION};
+use winapi::um::shellapi::{SHFileOperationW, SHFILEOPSTRUCTW, FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, DragQueryFileW};
 #[cfg(windows)]
 use std::ffi::OsStr;
 #[cfg(windows)]
@@ -23,7 +23,6 @@ use std::os::windows::ffi::OsStrExt;
 
 /// Copy files to Windows clipboard in HDROP format so they can be pasted in Explorer
 #[cfg(windows)]
-#[allow(dead_code)]
 fn copy_files_to_clipboard(files: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
     use winapi::um::winuser::CF_HDROP;
     
@@ -108,6 +107,50 @@ fn copy_files_to_clipboard(files: &[PathBuf]) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+/// Read files from Windows clipboard in HDROP format
+#[cfg(windows)]
+fn read_files_from_clipboard() -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    use winapi::um::winuser::CF_HDROP;
+    
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return Err("Failed to open clipboard".into());
+        }
+        
+        // Check if clipboard has HDROP format
+        if IsClipboardFormatAvailable(CF_HDROP) == 0 {
+            CloseClipboard();
+            return Ok(Vec::new()); // No files in clipboard
+        }
+        
+        let hglobal = GetClipboardData(CF_HDROP);
+        if hglobal.is_null() {
+            CloseClipboard();
+            return Err("Failed to get clipboard data".into());
+        }
+        
+        // Query the number of files
+        let file_count = DragQueryFileW(hglobal as *mut _, 0xFFFFFFFF, std::ptr::null_mut(), 0);
+        
+        let mut files = Vec::new();
+        for i in 0..file_count {
+            // Get the length of the file path
+            let path_len = DragQueryFileW(hglobal as *mut _, i, std::ptr::null_mut(), 0);
+            
+            // Allocate buffer and get the file path
+            let mut buffer: Vec<u16> = vec![0; (path_len + 1) as usize];
+            DragQueryFileW(hglobal as *mut _, i, buffer.as_mut_ptr(), buffer.len() as u32);
+            
+            // Convert to PathBuf
+            let path_str = String::from_utf16_lossy(&buffer[..path_len as usize]);
+            files.push(PathBuf::from(path_str));
+        }
+        
+        CloseClipboard();
+        Ok(files)
+    }
+}
+
 /// Recursively calculate directory size, sending updates progressively
 fn calculate_dir_size_progressive(
     path: &Path,
@@ -116,31 +159,39 @@ fn calculate_dir_size_progressive(
     pause_token: &Arc<AtomicBool>,
     tx: &std::sync::mpsc::Sender<(PathBuf, u64)>,
     accumulated: &mut u64,
-) {
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            // Check cancellation every iteration
+) -> bool {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(_) => {
+            // Permission denied or other error - send accumulated size so far
+            let _ = tx.send((root_path.to_path_buf(), *accumulated));
+            return false;
+        }
+    };
+    
+    for entry in entries.filter_map(|e| e.ok()) {
+        // Check cancellation every iteration
+        if cancel_token.load(Ordering::Relaxed) {
+            return false;
+        }
+        // Check pause and sleep if paused
+        while pause_token.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
             if cancel_token.load(Ordering::Relaxed) {
-                return;
-            }
-            // Check pause and sleep if paused
-            while pause_token.load(Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                if cancel_token.load(Ordering::Relaxed) {
-                    return;
-                }
-            }
-            
-            let entry_path = entry.path();
-            if entry_path.is_dir() {
-                calculate_dir_size_progressive(&entry_path, root_path, cancel_token, pause_token, tx, accumulated);
-            } else if let Ok(metadata) = entry.metadata() {
-                *accumulated += metadata.len();
-                // Send update every time we add file size
-                let _ = tx.send((root_path.to_path_buf(), *accumulated));
+                return false;
             }
         }
+        
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            calculate_dir_size_progressive(&entry_path, root_path, cancel_token, pause_token, tx, accumulated);
+        } else if let Ok(metadata) = entry.metadata() {
+            *accumulated += metadata.len();
+            // Send update every time we add file size
+            let _ = tx.send((root_path.to_path_buf(), *accumulated));
+        }
     }
+    true
 }
 
 fn main() -> Result<(), eframe::Error> {
@@ -223,7 +274,6 @@ struct RusplorerApp {
     #[allow(dead_code)]
     file_watcher: Option<notify::RecommendedWatcher>,
     watch_receiver: Option<Receiver<PathBuf>>,
-    files_to_recalculate: HashSet<PathBuf>,
     stop_watcher: Option<Sender<()>>,
     show_context_menu: bool,
     context_menu_entry: Option<FileEntry>,
@@ -251,6 +301,8 @@ struct RusplorerApp {
     entry_rects: HashMap<String, egui::Rect>,
     is_dragging_selection: bool,
     any_button_hovered: bool,
+    dirs_done: HashSet<PathBuf>,
+    dirs_done_receiver: Option<Receiver<PathBuf>>,
 }
 
 #[derive(Clone)]
@@ -305,7 +357,6 @@ impl Default for RusplorerApp {
             filter: String::new(),
             file_watcher: None,
             watch_receiver: None,
-            files_to_recalculate: HashSet::new(),
             stop_watcher: None,
             show_context_menu: false,
             context_menu_entry: None,
@@ -333,6 +384,8 @@ impl Default for RusplorerApp {
             entry_rects: HashMap::new(),
             is_dragging_selection: false,
             any_button_hovered: false,
+            dirs_done: HashSet::new(),
+            dirs_done_receiver: None,
         };
         app.refresh_contents();
         app.start_file_watcher();
@@ -363,6 +416,7 @@ impl RusplorerApp {
         self.contents.clear();
         self.file_sizes.clear();
         self.max_file_size = 0;
+        self.dirs_done.clear();
 
         // Add parent directory option
         if let Some(parent) = self.current_path.parent() {
@@ -398,40 +452,95 @@ impl RusplorerApp {
             self.contents.extend(items);
         }
 
+        // Collect paths for background processing
+        let mut file_paths: Vec<PathBuf> = Vec::new();
+        let mut dir_paths: Vec<PathBuf> = Vec::new();
+        for entry in &self.contents {
+            if entry.name.starts_with("[..]") {
+                continue;
+            }
+            let full_path = self.current_path.join(&entry.name);
+            if entry.is_dir {
+                dir_paths.push(full_path);
+            } else {
+                file_paths.push(full_path);
+            }
+        }
+
         // Start background thread to load file and folder sizes
-        let current_path = self.current_path.clone();
         let cancel_token = self.cancel_token.clone();
         let pause_token = self.pause_token.clone();
         let (tx, rx) = channel();
+        let (done_tx, done_rx) = channel::<PathBuf>();
         
         std::thread::spawn(move || {
-            if let Ok(entries) = std::fs::read_dir(&current_path) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    // Check if cancelled or paused
-                    if cancel_token.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    // While paused, sleep briefly and check again
-                    while pause_token.load(Ordering::SeqCst) {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        if cancel_token.load(Ordering::SeqCst) {
-                            return;
-                        }
-                    }
+            // First: send all file sizes immediately (fast)
+            for path in file_paths {
+                if cancel_token.load(Ordering::SeqCst) {
+                    return;
+                }
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let _ = tx.send((path, size));
+            }
+            
+            // Then: compute directory sizes in parallel
+            let num_threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(dir_paths.len().max(1));
+            
+            if !dir_paths.is_empty() {
+                let work_queue = std::sync::Arc::new(std::sync::Mutex::new(dir_paths));
+                let mut handles = Vec::new();
+                
+                for _ in 0..num_threads {
+                    let queue = work_queue.clone();
+                    let cancel = cancel_token.clone();
+                    let pause = pause_token.clone();
+                    let tx = tx.clone();
+                    let done_tx = done_tx.clone();
                     
-                    let path = entry.path();
-                    if path.is_dir() {
-                        // Calculate folder size progressively
-                        let mut accumulated = 0u64;
-                        calculate_dir_size_progressive(&path, &path, &cancel_token, &pause_token, &tx, &mut accumulated);
-                    } else {
-                        if let Ok(metadata) = entry.metadata() {
-                            let _ = tx.send((path, metadata.len()));
+                    handles.push(std::thread::spawn(move || {
+                        loop {
+                            let dir_path = {
+                                match queue.lock() {
+                                    Ok(mut dirs) => dirs.pop(),
+                                    Err(_) => break,
+                                }
+                            };
+                            
+                            let dir_path = match dir_path {
+                                Some(p) => p,
+                                None => break,
+                            };
+                            
+                            if cancel.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            while pause.load(Ordering::SeqCst) {
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                                if cancel.load(Ordering::SeqCst) {
+                                    return;
+                                }
+                            }
+                            
+                            let mut accumulated = 0u64;
+                            calculate_dir_size_progressive(&dir_path, &dir_path, &cancel, &pause, &tx, &mut accumulated);
+                            // Always send final size (handles empty dirs and permission errors)
+                            let _ = tx.send((dir_path.clone(), accumulated));
+                            // Signal this directory is done computing
+                            let _ = done_tx.send(dir_path);
                         }
-                    }
+                    }));
+                }
+                
+                for handle in handles {
+                    let _ = handle.join();
                 }
             }
         });
+
+        self.dirs_done_receiver = Some(done_rx);
 
         self.size_receiver = Some(rx);
     }
@@ -621,8 +730,8 @@ impl RusplorerApp {
                     }
                 },
             ) {
-                // Watch the directory recursively
-                match watcher.watch(&current_path, RecursiveMode::Recursive) {
+                // Watch the directory (non-recursive to avoid flood of deep events)
+                match watcher.watch(&current_path, RecursiveMode::NonRecursive) {
                     Ok(_) => {
                         // Keep watcher alive until stop signal arrives
                         let _ = stop_rx.recv();
@@ -642,9 +751,8 @@ impl RusplorerApp {
         let mut needs_refresh = false;
         
         if let Some(ref rx) = self.watch_receiver {
-            // Collect all changed paths and add to recalculation queue
             while let Ok(path) = rx.try_recv() {
-                // If a direct child of current directory was created or removed, refresh the list
+                // Only care about direct children of current directory
                 if let Some(parent) = path.parent() {
                     if parent == self.current_path {
                         let file_name = path.file_name()
@@ -655,44 +763,25 @@ impl RusplorerApp {
                         let exists_on_disk = path.exists();
                         
                         if (exists_on_disk && !exists_in_list) || (!exists_on_disk && exists_in_list) {
+                            // Direct child created or removed - full refresh needed
                             needs_refresh = true;
+                        } else if exists_on_disk && !path.is_dir() {
+                            // Direct child file was modified - update its size inline
+                            if let Ok(metadata) = path.metadata() {
+                                let size = metadata.len();
+                                self.file_sizes.insert(path, size);
+                                if size > self.max_file_size {
+                                    self.max_file_size = size;
+                                }
+                            }
                         }
                     }
                 }
-                
-                self.file_sizes.remove(&path);
-                self.files_to_recalculate.insert(path);
             }
         }
         
         if needs_refresh {
             self.refresh_contents();
-            return;
-        }
-        
-        // Recalculate sizes for files that changed (async in background thread)
-        if !self.files_to_recalculate.is_empty() {
-            let paths_to_recalculate: Vec<_> = self.files_to_recalculate.iter().cloned().collect();
-            let cancel_token = Arc::new(AtomicBool::new(false));
-            let pause_token = Arc::new(AtomicBool::new(false));
-            let (tx, rx) = channel();
-            
-            std::thread::spawn(move || {
-                for path in paths_to_recalculate {
-                    if path.exists() && path.is_dir() {
-                        let mut accumulated = 0u64;
-                        calculate_dir_size_progressive(&path, &path, &cancel_token, &pause_token, &tx, &mut accumulated);
-                    } else if path.exists() {
-                        if let Ok(metadata) = path.metadata() {
-                            let _ = tx.send((path, metadata.len()));
-                        }
-                    }
-                }
-            });
-            
-            // Store receiver to collect results in update()
-            self.size_receiver = Some(rx);
-            self.files_to_recalculate.clear();
         }
     }
 }
@@ -763,6 +852,13 @@ impl eframe::App for RusplorerApp {
                 if size > self.max_file_size {
                     self.max_file_size = size;
                 }
+            }
+        }
+
+        // Receive directory completion signals
+        if let Some(ref rx) = self.dirs_done_receiver {
+            while let Ok(path) = rx.try_recv() {
+                self.dirs_done.insert(path);
             }
         }
 
@@ -850,37 +946,87 @@ impl eframe::App for RusplorerApp {
         };
 
         if got_copy && !self.selected_entries.is_empty() {
-            self.clipboard_files = self.selected_entries.iter()
+            let files: Vec<PathBuf> = self.selected_entries.iter()
                 .map(|name| self.current_path.join(name))
                 .collect();
-            self.clipboard_mode = Some(ClipboardMode::Copy);
+            
+            #[cfg(windows)]
+            {
+                if let Ok(_) = copy_files_to_clipboard(&files) {
+                    self.clipboard_files = files;
+                    self.clipboard_mode = Some(ClipboardMode::Copy);
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                self.clipboard_files = files;
+                self.clipboard_mode = Some(ClipboardMode::Copy);
+            }
         }
 
         if got_cut && !self.selected_entries.is_empty() {
-            self.clipboard_files = self.selected_entries.iter()
+            let files: Vec<PathBuf> = self.selected_entries.iter()
                 .map(|name| self.current_path.join(name))
                 .collect();
-            self.clipboard_mode = Some(ClipboardMode::Cut);
+            
+            #[cfg(windows)]
+            {
+                if let Ok(_) = copy_files_to_clipboard(&files) {
+                    self.clipboard_files = files;
+                    self.clipboard_mode = Some(ClipboardMode::Cut);
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                self.clipboard_files = files;
+                self.clipboard_mode = Some(ClipboardMode::Cut);
+            }
         }
 
         if got_paste {
-            if let Some(mode) = self.clipboard_mode {
-                if !self.clipboard_files.is_empty() {
-                    let files = self.clipboard_files.clone();
-                    let dest = self.current_path.clone();
-                    
-                    match mode {
-                        ClipboardMode::Copy => {
-                            let _ = RusplorerApp::copy_files(&files, &dest);
-                        }
-                        ClipboardMode::Cut => {
-                            let _ = RusplorerApp::move_files(&files, &dest);
+            #[cfg(windows)]
+            {
+                // Try to read from Windows clipboard
+                if let Ok(clipboard_files) = read_files_from_clipboard() {
+                    if !clipboard_files.is_empty() {
+                        let dest = self.current_path.clone();
+                        
+                        // Check if these are our internal cut files
+                        let is_cut = self.clipboard_mode == Some(ClipboardMode::Cut) 
+                            && clipboard_files == self.clipboard_files;
+                        
+                        if is_cut {
+                            let _ = RusplorerApp::move_files(&clipboard_files, &dest);
                             self.clipboard_files.clear();
                             self.clipboard_mode = None;
+                        } else {
+                            let _ = RusplorerApp::copy_files(&clipboard_files, &dest);
                         }
+                        
+                        self.refresh_contents();
                     }
-                    
-                    self.refresh_contents();
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                if let Some(mode) = self.clipboard_mode {
+                    if !self.clipboard_files.is_empty() {
+                        let files = self.clipboard_files.clone();
+                        let dest = self.current_path.clone();
+                        
+                        match mode {
+                            ClipboardMode::Copy => {
+                                let _ = RusplorerApp::copy_files(&files, &dest);
+                            }
+                            ClipboardMode::Cut => {
+                                let _ = RusplorerApp::move_files(&files, &dest);
+                                self.clipboard_files.clear();
+                                self.clipboard_mode = None;
+                            }
+                        }
+                        
+                        self.refresh_contents();
+                    }
                 }
             }
         }
@@ -1055,14 +1201,24 @@ impl eframe::App for RusplorerApp {
                         let icon = if entry.is_dir { "📁" } else { "📄" };
                         let name_label = format!("{} {}", icon, entry.name);
                         
+                        let full_path = self.current_path.join(&entry.name);
+                        let is_computing = entry.is_dir && !entry.name.starts_with("[..]") 
+                            && !self.dirs_done.contains(&full_path);
+                        
                         let size_label = if entry.name.starts_with("[..]") {
                             String::new()
                         } else {
-                            // Try to get size from cache, show loading if not ready
-                            let full_path = self.current_path.join(&entry.name);
+                            // Try to get size from cache
                             match self.file_sizes.get(&full_path) {
                                 Some(size) => Self::format_file_size(*size),
-                                None => if entry.is_dir { "0 B".to_string() } else { "...".to_string() },
+                                None => {
+                                    // Not in cache yet - show "..." for files, "0 B" for dirs
+                                    if entry.is_dir {
+                                        "0 B".to_string()
+                                    } else {
+                                        "...".to_string()
+                                    }
+                                }
                             }
                         };
 
@@ -1143,6 +1299,16 @@ impl eframe::App for RusplorerApp {
                                         egui::RichText::new(&size_label).weak()
                                     };
                                     ui.label(size_text);
+                                }
+                                
+                                // Show spinning indicator if computing size (shown to the left of size since layout is RTL)
+                                if is_computing {
+                                    let spinner_chars = ['⏳', '⌛'];
+                                    let time = ui.input(|i| i.time);
+                                    let spinner_idx = ((time * 2.0) as usize) % spinner_chars.len();
+                                    let spinner = spinner_chars[spinner_idx].to_string();
+                                    ui.label(spinner);
+                                    ctx.request_repaint();
                                 }
                             });
                             
