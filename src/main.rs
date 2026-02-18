@@ -1664,16 +1664,18 @@ impl eframe::App for RusplorerApp {
                                 let col_width = ui.available_width();
 
                                 let button = if is_selected && is_in_clipboard {
-                                    egui::Button::new(
-                                        egui::RichText::new(&entry.name)
-                                            .color(egui::Color32::WHITE)
-                                            .italics(),
-                                    )
-                                    .fill(egui::Color32::from_rgb(100, 150, 255))
-                                    .frame(false)
-                                } else if is_selected {
-                                    egui::Button::new(
-                                        egui::RichText::new(&entry.name)
+                                      egui::Button::new(
+                                          egui::RichText::new(&entry.name)
+                                              .color(egui::Color32::WHITE)
+                                              .italics(),
+                                      )
+                                      .fill(egui::Color32::from_rgb(100, 150, 255))
+                                      .frame(false)
+                                  } else if is_selected {
+                                      egui::Button::new(
+                                          egui::RichText::new(&entry.name)
+
+
                                             .color(egui::Color32::WHITE),
                                     )
                                     .fill(egui::Color32::from_rgb(100, 150, 255))
@@ -1850,12 +1852,6 @@ impl eframe::App for RusplorerApp {
                         self.selection_drag_start = None;
                         self.selection_drag_current = None;
                     }
-                }
-                if i.pointer.primary_clicked()
-                    && !self.any_button_hovered
-                    && !self.is_dragging_selection
-                {
-                    self.selected_entries.clear();
                 }
             });
 
