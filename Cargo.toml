@@ -16,6 +16,9 @@ notify = "6.1"
 winapi = { version = "0.3", features = ["winuser", "shellapi", "winbase"] }
 wchar = "0.11"
 
+[build-dependencies]
+winres = "0.1"
+
 [[bin]]
 name = "rusplorer"
 path = "src/main.rs"
