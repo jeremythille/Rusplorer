@@ -1,40 +1,45 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use eframe::egui;
-use egui_extras::{TableBuilder, Column};
-use std::path::{Path, PathBuf};
-use std::time::SystemTime;
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::collections::HashMap;
 use arboard::Clipboard;
-use serde::{Deserialize, Serialize};
-use notify::{Watcher, RecursiveMode};
+use eframe::egui;
+use egui_extras::{Column, TableBuilder};
 use notify::recommended_watcher;
+use notify::{RecursiveMode, Watcher};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::SystemTime;
 
-#[cfg(windows)]
-use winapi::um::winuser::{OpenClipboard, CloseClipboard, SetClipboardData, EmptyClipboard, GetAsyncKeyState, GetClipboardData, IsClipboardFormatAvailable};
-#[cfg(windows)]
-use winapi::um::shellapi::{SHFileOperationW, SHFILEOPSTRUCTW, FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, DragQueryFileW};
 #[cfg(windows)]
 use std::ffi::OsStr;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use winapi::um::shellapi::{
+    DragQueryFileW, FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, SHFILEOPSTRUCTW, SHFileOperationW,
+};
+#[cfg(windows)]
+use winapi::um::winuser::{
+    CloseClipboard, EmptyClipboard, GetAsyncKeyState, GetClipboardData, IsClipboardFormatAvailable,
+    OpenClipboard, SetClipboardData,
+};
 
 /// Copy files to Windows clipboard in HDROP format so they can be pasted in Explorer
 #[cfg(windows)]
 fn copy_files_to_clipboard(files: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
     use winapi::um::winuser::CF_HDROP;
-    
+
     // DROPFILES structure: 20 bytes total
     // offset 0:  pFiles (DWORD) - offset to file list = 20
     // offset 4:  pt.x (LONG)
     // offset 8:  pt.y (LONG)
     // offset 12: fNC (BOOL)
     // offset 16: fWide (BOOL) - must be 1 for Unicode
-    
+
     // Build the wide-char file list: each path null-terminated, double-null at end
     let mut wide_chars: Vec<u16> = Vec::new();
     for file in files {
@@ -46,21 +51,21 @@ fn copy_files_to_clipboard(files: &[PathBuf]) -> Result<(), Box<dyn std::error::
         wide_chars.extend_from_slice(&wide);
     }
     wide_chars.push(0u16); // Final double-null terminator
-    
+
     let dropfiles_size: usize = 20; // sizeof(DROPFILES)
     let file_data_size = wide_chars.len() * 2; // bytes for wide chars
     let total_size = dropfiles_size + file_data_size;
-    
+
     unsafe {
         if OpenClipboard(std::ptr::null_mut()) == 0 {
             return Err("Failed to open clipboard".into());
         }
-        
+
         if EmptyClipboard() == 0 {
             CloseClipboard();
             return Err("Failed to empty clipboard".into());
         }
-        
+
         let hglobal = winapi::um::winbase::GlobalAlloc(
             winapi::um::winbase::GMEM_MOVEABLE | winapi::um::winbase::GMEM_ZEROINIT,
             total_size,
@@ -69,14 +74,14 @@ fn copy_files_to_clipboard(files: &[PathBuf]) -> Result<(), Box<dyn std::error::
             CloseClipboard();
             return Err("Failed to allocate global memory".into());
         }
-        
+
         let ptr = winapi::um::winbase::GlobalLock(hglobal) as *mut u8;
         if ptr.is_null() {
             winapi::um::winbase::GlobalFree(hglobal);
             CloseClipboard();
             return Err("Failed to lock global memory".into());
         }
-        
+
         // Write DROPFILES structure
         // pFiles = 20 (offset to file data)
         let pfiles: u32 = 20;
@@ -87,25 +92,25 @@ fn copy_files_to_clipboard(files: &[PathBuf]) -> Result<(), Box<dyn std::error::
         // fWide = 1 (offset 16)
         let fwide: u32 = 1;
         std::ptr::copy_nonoverlapping(&fwide as *const u32 as *const u8, ptr.add(16), 4);
-        
+
         // Write file paths after DROPFILES structure
         std::ptr::copy_nonoverlapping(
             wide_chars.as_ptr() as *const u8,
             ptr.add(dropfiles_size),
             file_data_size,
         );
-        
+
         winapi::um::winbase::GlobalUnlock(hglobal);
-        
+
         if SetClipboardData(CF_HDROP, hglobal as *mut winapi::ctypes::c_void).is_null() {
             winapi::um::winbase::GlobalFree(hglobal);
             CloseClipboard();
             return Err("Failed to set clipboard data".into());
         }
-        
+
         CloseClipboard();
     }
-    
+
     Ok(())
 }
 
@@ -113,41 +118,46 @@ fn copy_files_to_clipboard(files: &[PathBuf]) -> Result<(), Box<dyn std::error::
 #[cfg(windows)]
 fn read_files_from_clipboard() -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     use winapi::um::winuser::CF_HDROP;
-    
+
     unsafe {
         if OpenClipboard(std::ptr::null_mut()) == 0 {
             return Err("Failed to open clipboard".into());
         }
-        
+
         // Check if clipboard has HDROP format
         if IsClipboardFormatAvailable(CF_HDROP) == 0 {
             CloseClipboard();
             return Ok(Vec::new()); // No files in clipboard
         }
-        
+
         let hglobal = GetClipboardData(CF_HDROP);
         if hglobal.is_null() {
             CloseClipboard();
             return Err("Failed to get clipboard data".into());
         }
-        
+
         // Query the number of files
         let file_count = DragQueryFileW(hglobal as *mut _, 0xFFFFFFFF, std::ptr::null_mut(), 0);
-        
+
         let mut files = Vec::new();
         for i in 0..file_count {
             // Get the length of the file path
             let path_len = DragQueryFileW(hglobal as *mut _, i, std::ptr::null_mut(), 0);
-            
+
             // Allocate buffer and get the file path
             let mut buffer: Vec<u16> = vec![0; (path_len + 1) as usize];
-            DragQueryFileW(hglobal as *mut _, i, buffer.as_mut_ptr(), buffer.len() as u32);
-            
+            DragQueryFileW(
+                hglobal as *mut _,
+                i,
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+            );
+
             // Convert to PathBuf
             let path_str = String::from_utf16_lossy(&buffer[..path_len as usize]);
             files.push(PathBuf::from(path_str));
         }
-        
+
         CloseClipboard();
         Ok(files)
     }
@@ -170,7 +180,7 @@ fn calculate_dir_size_progressive(
             return false;
         }
     };
-    
+
     for entry in entries.filter_map(|e| e.ok()) {
         // Check cancellation every iteration
         if cancel_token.load(Ordering::Relaxed) {
@@ -183,10 +193,17 @@ fn calculate_dir_size_progressive(
                 return false;
             }
         }
-        
+
         let entry_path = entry.path();
         if entry_path.is_dir() {
-            calculate_dir_size_progressive(&entry_path, root_path, cancel_token, pause_token, tx, accumulated);
+            calculate_dir_size_progressive(
+                &entry_path,
+                root_path,
+                cancel_token,
+                pause_token,
+                tx,
+                accumulated,
+            );
         } else if let Ok(metadata) = entry.metadata() {
             *accumulated += metadata.len();
             // Send update every time we add file size
@@ -209,9 +226,12 @@ fn main() -> Result<(), eframe::Error> {
                 font_id.size = 11.0;
             }
             style.spacing.button_padding = egui::vec2(2.0, 0.0);
-            style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::DARK_GRAY);
-            style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10);
-            style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, egui::Color32::DARK_GRAY);
+            style.visuals.widgets.hovered.bg_stroke =
+                egui::Stroke::new(1.0, egui::Color32::DARK_GRAY);
+            style.visuals.widgets.hovered.bg_fill =
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10);
+            style.visuals.widgets.active.bg_stroke =
+                egui::Stroke::new(1.0, egui::Color32::DARK_GRAY);
             style.visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, egui::Color32::DARK_GRAY);
             style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
             style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
@@ -238,14 +258,20 @@ struct Config {
     sort_ascending: bool,
 }
 
-fn default_sort_column() -> SortColumn { SortColumn::Name }
-fn default_sort_ascending() -> bool { true }
+fn default_sort_column() -> SortColumn {
+    SortColumn::Name
+}
+fn default_sort_ascending() -> bool {
+    true
+}
 
 impl Config {
     fn path() -> PathBuf {
-        let exe_path = std::env::current_exe()
-            .unwrap_or_else(|_| PathBuf::from("rusplorer.exe"));
-        let mut config_path = exe_path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf();
+        let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rusplorer.exe"));
+        let mut config_path = exe_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
         config_path.push("rusplorer.config.json");
         config_path
     }
@@ -302,8 +328,8 @@ struct RusplorerApp {
     rename_buffer: String,
     selected_entries: HashSet<String>,
     show_archive_dialog: bool,
-    archive_type: usize,       // 0 = 7z, 1 = zip
-    compression_level: usize,  // 0 = store, 1 = medium, 2 = high
+    archive_type: usize,      // 0 = 7z, 1 = zip
+    compression_level: usize, // 0 = store, 1 = medium, 2 = high
     archive_name_buffer: String,
     files_to_archive: Vec<PathBuf>,
     archive_done_receiver: Option<Receiver<String>>,
@@ -359,7 +385,9 @@ impl Default for RusplorerApp {
         } else {
             PathBuf::from("C:\\")
         };
-        let show_date_columns: HashMap<PathBuf, bool> = config.show_date_columns.iter()
+        let show_date_columns: HashMap<PathBuf, bool> = config
+            .show_date_columns
+            .iter()
             .map(|(k, v)| (PathBuf::from(k), *v))
             .collect();
         let sort_column = config.sort_column.clone();
@@ -428,7 +456,7 @@ impl Default for RusplorerApp {
 impl RusplorerApp {
     fn list_drives() -> Vec<String> {
         let mut drives = Vec::new();
-        
+
         // Check drives A through Z
         for letter in b'A'..=b'Z' {
             let drive = format!("{}:\\", letter as char);
@@ -436,7 +464,7 @@ impl RusplorerApp {
                 drives.push(drive);
             }
         }
-        
+
         drives
     }
 
@@ -444,7 +472,7 @@ impl RusplorerApp {
         // Cancel any running background computation
         self.cancel_token.store(true, Ordering::SeqCst);
         self.cancel_token = Arc::new(AtomicBool::new(false));
-        
+
         self.contents.clear();
         self.file_sizes.clear();
         self.max_file_size = 0;
@@ -471,7 +499,12 @@ impl RusplorerApp {
                     let name = e.file_name().to_string_lossy().to_string();
                     let is_dir = path.is_dir();
                     let modified = e.metadata().ok().and_then(|m| m.modified().ok());
-                    FileEntry { name, is_dir, size: 0, modified }
+                    FileEntry {
+                        name,
+                        is_dir,
+                        size: 0,
+                        modified,
+                    }
                 })
                 .collect();
 
@@ -485,7 +518,11 @@ impl RusplorerApp {
                             SortColumn::Date => a.modified.cmp(&b.modified),
                             SortColumn::Size => std::cmp::Ordering::Equal, // will be re-sorted when sizes arrive
                         };
-                        if self.sort_ascending { ord } else { ord.reverse() }
+                        if self.sort_ascending {
+                            ord
+                        } else {
+                            ord.reverse()
+                        }
                     }
                 }
             });
@@ -513,7 +550,7 @@ impl RusplorerApp {
         let pause_token = self.pause_token.clone();
         let (tx, rx) = channel();
         let (done_tx, done_rx) = channel::<PathBuf>();
-        
+
         std::thread::spawn(move || {
             // First: send all file sizes immediately (fast)
             for path in file_paths {
@@ -523,24 +560,24 @@ impl RusplorerApp {
                 let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 let _ = tx.send((path, size));
             }
-            
+
             // Then: compute directory sizes in parallel
             let num_threads = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4)
                 .min(dir_paths.len().max(1));
-            
+
             if !dir_paths.is_empty() {
                 let work_queue = std::sync::Arc::new(std::sync::Mutex::new(dir_paths));
                 let mut handles = Vec::new();
-                
+
                 for _ in 0..num_threads {
                     let queue = work_queue.clone();
                     let cancel = cancel_token.clone();
                     let pause = pause_token.clone();
                     let tx = tx.clone();
                     let done_tx = done_tx.clone();
-                    
+
                     handles.push(std::thread::spawn(move || {
                         loop {
                             let dir_path = {
@@ -549,12 +586,12 @@ impl RusplorerApp {
                                     Err(_) => break,
                                 }
                             };
-                            
+
                             let dir_path = match dir_path {
                                 Some(p) => p,
                                 None => break,
                             };
-                            
+
                             if cancel.load(Ordering::SeqCst) {
                                 return;
                             }
@@ -564,9 +601,16 @@ impl RusplorerApp {
                                     return;
                                 }
                             }
-                            
+
                             let mut accumulated = 0u64;
-                            calculate_dir_size_progressive(&dir_path, &dir_path, &cancel, &pause, &tx, &mut accumulated);
+                            calculate_dir_size_progressive(
+                                &dir_path,
+                                &dir_path,
+                                &cancel,
+                                &pause,
+                                &tx,
+                                &mut accumulated,
+                            );
                             // Always send final size (handles empty dirs and permission errors)
                             let _ = tx.send((dir_path.clone(), accumulated));
                             // Signal this directory is done computing
@@ -574,7 +618,7 @@ impl RusplorerApp {
                         }
                     }));
                 }
-                
+
                 for handle in handles {
                     let _ = handle.join();
                 }
@@ -594,8 +638,12 @@ impl RusplorerApp {
 
         self.contents.sort_by(|a, b| {
             // Parent directory always first
-            if a.name.starts_with("[..]") { return std::cmp::Ordering::Less; }
-            if b.name.starts_with("[..]") { return std::cmp::Ordering::Greater; }
+            if a.name.starts_with("[..]") {
+                return std::cmp::Ordering::Less;
+            }
+            if b.name.starts_with("[..]") {
+                return std::cmp::Ordering::Greater;
+            }
 
             // Dirs always before files
             match (a.is_dir, b.is_dir) {
@@ -605,8 +653,14 @@ impl RusplorerApp {
                     let ord = match sort_column {
                         SortColumn::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
                         SortColumn::Size => {
-                            let sa = file_sizes.get(&current_path.join(&a.name)).copied().unwrap_or(0);
-                            let sb = file_sizes.get(&current_path.join(&b.name)).copied().unwrap_or(0);
+                            let sa = file_sizes
+                                .get(&current_path.join(&a.name))
+                                .copied()
+                                .unwrap_or(0);
+                            let sb = file_sizes
+                                .get(&current_path.join(&b.name))
+                                .copied()
+                                .unwrap_or(0);
                             sa.cmp(&sb)
                         }
                         SortColumn::Date => a.modified.cmp(&b.modified),
@@ -625,14 +679,16 @@ impl RusplorerApp {
                 self.forward_history.clear(); // Clear forward history on new navigation
             }
             self.current_path = path;
-            
+
             // Save the current path to config
             self.config.last_path = self.current_path.to_string_lossy().to_string();
-            self.config.show_date_columns = self.show_date_columns.iter()
+            self.config.show_date_columns = self
+                .show_date_columns
+                .iter()
                 .map(|(k, v)| (k.to_string_lossy().to_string(), *v))
                 .collect();
             self.config.save();
-            
+
             self.refresh_contents();
             // Restart watcher for the new directory
             self.start_file_watcher();
@@ -692,10 +748,38 @@ impl RusplorerApp {
     fn is_code_file(path: &PathBuf) -> bool {
         if let Some(ext) = path.extension() {
             let ext_str = ext.to_string_lossy().to_lowercase();
-            matches!(ext_str.as_str(), 
-                "rs" | "js" | "ts" | "jsx" | "tsx" | "py" | "java" | "c" | "cpp" | "h" | "hpp" | 
-                "cs" | "go" | "rb" | "php" | "html" | "css" | "scss" | "json" | "xml" | "yaml" | 
-                "yml" | "toml" | "md" | "txt" | "sh" | "bat" | "ps1" | "sql" | "vue" | "svelte"
+            matches!(
+                ext_str.as_str(),
+                "rs" | "js"
+                    | "ts"
+                    | "jsx"
+                    | "tsx"
+                    | "py"
+                    | "java"
+                    | "c"
+                    | "cpp"
+                    | "h"
+                    | "hpp"
+                    | "cs"
+                    | "go"
+                    | "rb"
+                    | "php"
+                    | "html"
+                    | "css"
+                    | "scss"
+                    | "json"
+                    | "xml"
+                    | "yaml"
+                    | "yml"
+                    | "toml"
+                    | "md"
+                    | "txt"
+                    | "sh"
+                    | "bat"
+                    | "ps1"
+                    | "sql"
+                    | "vue"
+                    | "svelte"
             )
         } else {
             false
@@ -705,7 +789,8 @@ impl RusplorerApp {
     fn is_archive(path: &PathBuf) -> bool {
         if let Some(ext) = path.extension() {
             let ext_str = ext.to_string_lossy().to_lowercase();
-            matches!(ext_str.as_str(), 
+            matches!(
+                ext_str.as_str(),
                 "7z" | "zip" | "rar" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "iso"
             )
         } else {
@@ -737,10 +822,10 @@ impl RusplorerApp {
             let days = secs / 86400;
             let epoch_start = 719163; // Days from year 0 to 1970-01-01
             let total_days = epoch_start + days as i64;
-            
+
             // Simple date calculation
             let mut remaining_days = total_days;
-            
+
             // Find the year
             let mut year = (remaining_days / 365) as i32;
             let mut days_in_years = 0i64;
@@ -754,7 +839,7 @@ impl RusplorerApp {
                 days_in_years -= if is_leap { 366 } else { 365 };
             }
             remaining_days = total_days - days_in_years;
-            
+
             // Find month and day
             let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
             let days_in_months = if is_leap {
@@ -762,7 +847,7 @@ impl RusplorerApp {
             } else {
                 [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
             };
-            
+
             let mut month = 1;
             for (i, &days_in_month) in days_in_months.iter().enumerate() {
                 if remaining_days < days_in_month as i64 {
@@ -772,13 +857,16 @@ impl RusplorerApp {
                 remaining_days -= days_in_month as i64;
             }
             let day = remaining_days + 1;
-            
+
             // Time calculation
             let time_secs = secs % 86400;
             let hour = time_secs / 3600;
             let minute = (time_secs % 3600) / 60;
-            
-            format!("{:04}-{:02}-{:02} {:02}:{:02}", year, month, day, hour, minute)
+
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}",
+                year, month, day, hour, minute
+            )
         } else {
             String::new()
         }
@@ -828,37 +916,36 @@ impl RusplorerApp {
         if let Some(stop_tx) = self.stop_watcher.take() {
             let _ = stop_tx.send(());
         }
-        
+
         let (tx, rx) = channel();
         let (stop_tx, stop_rx) = channel();
         let current_path = self.current_path.clone();
-        
+
         // Create watcher in a separate thread
         let tx = std::sync::Arc::new(std::sync::Mutex::new(tx));
-        
+
         std::thread::spawn(move || {
             let tx = tx.clone();
-            if let Ok(mut watcher) = recommended_watcher(
-                move |res| {
-                    match res {
-                        Ok(notify::event::Event {
-                            kind: notify::event::EventKind::Modify(_) 
-                                | notify::event::EventKind::Create(_) 
-                                | notify::event::EventKind::Remove(_),
-                            paths,
-                            ..
-                        }) => {
-                            // Send the actual changed paths to invalidate cache
-                            for path in paths {
-                                if let Ok(tx) = tx.lock() {
-                                    let _ = tx.send(path);
-                                }
+            if let Ok(mut watcher) = recommended_watcher(move |res| {
+                match res {
+                    Ok(notify::event::Event {
+                        kind:
+                            notify::event::EventKind::Modify(_)
+                            | notify::event::EventKind::Create(_)
+                            | notify::event::EventKind::Remove(_),
+                        paths,
+                        ..
+                    }) => {
+                        // Send the actual changed paths to invalidate cache
+                        for path in paths {
+                            if let Ok(tx) = tx.lock() {
+                                let _ = tx.send(path);
                             }
                         }
-                        _ => {}
                     }
-                },
-            ) {
+                    _ => {}
+                }
+            }) {
                 // Watch the directory (non-recursive to avoid flood of deep events)
                 match watcher.watch(&current_path, RecursiveMode::NonRecursive) {
                     Ok(_) => {
@@ -871,27 +958,30 @@ impl RusplorerApp {
                 }
             }
         });
-        
+
         self.watch_receiver = Some(rx);
         self.stop_watcher = Some(stop_tx);
     }
-    
+
     fn process_file_changes(&mut self) {
         let mut needs_refresh = false;
-        
+
         if let Some(ref rx) = self.watch_receiver {
             while let Ok(path) = rx.try_recv() {
                 // Only care about direct children of current directory
                 if let Some(parent) = path.parent() {
                     if parent == self.current_path {
-                        let file_name = path.file_name()
+                        let file_name = path
+                            .file_name()
                             .unwrap_or_default()
                             .to_string_lossy()
                             .to_string();
                         let exists_in_list = self.contents.iter().any(|e| e.name == file_name);
                         let exists_on_disk = path.exists();
-                        
-                        if (exists_on_disk && !exists_in_list) || (!exists_on_disk && exists_in_list) {
+
+                        if (exists_on_disk && !exists_in_list)
+                            || (!exists_on_disk && exists_in_list)
+                        {
                             // Direct child created or removed - full refresh needed
                             needs_refresh = true;
                         } else if exists_on_disk && !path.is_dir() {
@@ -908,7 +998,7 @@ impl RusplorerApp {
                 }
             }
         }
-        
+
         if needs_refresh {
             self.refresh_contents();
         }
@@ -938,14 +1028,14 @@ impl eframe::App for RusplorerApp {
 
         // Process any file system changes detected by watcher
         self.process_file_changes();
-        
+
         // Track window focus and pause/resume background work
         let is_focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         if is_focused != self.is_focused {
             self.is_focused = is_focused;
             self.pause_token.store(!is_focused, Ordering::SeqCst);
         }
-        
+
         // Handle drag and drop
         ctx.input(|i| {
             let dropped_files = &i.raw.dropped_files;
@@ -956,9 +1046,10 @@ impl eframe::App for RusplorerApp {
                     .collect();
                 if !self.dragged_files.is_empty() {
                     // Check if it's a right-click drag (we'll detect this by checking pointer events)
-                    self.is_right_click_drag = i.pointer.button_down(egui::PointerButton::Secondary);
+                    self.is_right_click_drag =
+                        i.pointer.button_down(egui::PointerButton::Secondary);
                     self.show_drop_menu = self.is_right_click_drag;
-                    
+
                     // Left click defaults to move
                     if !self.is_right_click_drag {
                         let files = self.dragged_files.clone();
@@ -1001,7 +1092,10 @@ impl eframe::App for RusplorerApp {
         // Handle mouse buttons 4 and 5 (back/forward)
         ctx.input(|i| {
             for event in &i.events {
-                if let egui::Event::PointerButton { button, pressed, .. } = event {
+                if let egui::Event::PointerButton {
+                    button, pressed, ..
+                } = event
+                {
                     if *pressed {
                         match button {
                             egui::PointerButton::Extra1 => {
@@ -1051,24 +1145,24 @@ impl eframe::App for RusplorerApp {
                 const VK_V: i32 = 0x56;
                 const VK_X: i32 = 0x58;
                 const VK_DELETE: i32 = 0x2E;
-                
+
                 let ctrl_down = unsafe { GetAsyncKeyState(VK_CONTROL) } as u16 & 0x8000 != 0;
                 let c_down = ctrl_down && (unsafe { GetAsyncKeyState(VK_C) } as u16 & 0x8000 != 0);
                 let v_down = ctrl_down && (unsafe { GetAsyncKeyState(VK_V) } as u16 & 0x8000 != 0);
                 let x_down = ctrl_down && (unsafe { GetAsyncKeyState(VK_X) } as u16 & 0x8000 != 0);
                 let del_down = unsafe { GetAsyncKeyState(VK_DELETE) } as u16 & 0x8000 != 0;
-                
+
                 // Edge detection: only trigger on press (transition from not-pressed to pressed)
                 let copy_pressed = c_down && !self.prev_ctrl_c_down;
                 let paste_pressed = v_down && !self.prev_ctrl_v_down;
                 let cut_pressed = x_down && !self.prev_ctrl_x_down;
                 let delete_pressed = del_down && !self.prev_del_down;
-                
+
                 self.prev_ctrl_c_down = c_down;
                 self.prev_ctrl_v_down = v_down;
                 self.prev_ctrl_x_down = x_down;
                 self.prev_del_down = del_down;
-                
+
                 (copy_pressed, cut_pressed, paste_pressed, delete_pressed)
             }
             #[cfg(not(windows))]
@@ -1082,10 +1176,12 @@ impl eframe::App for RusplorerApp {
         };
 
         if got_copy && !self.selected_entries.is_empty() {
-            let files: Vec<PathBuf> = self.selected_entries.iter()
+            let files: Vec<PathBuf> = self
+                .selected_entries
+                .iter()
                 .map(|name| self.current_path.join(name))
                 .collect();
-            
+
             #[cfg(windows)]
             {
                 if let Ok(_) = copy_files_to_clipboard(&files) {
@@ -1101,10 +1197,12 @@ impl eframe::App for RusplorerApp {
         }
 
         if got_cut && !self.selected_entries.is_empty() {
-            let files: Vec<PathBuf> = self.selected_entries.iter()
+            let files: Vec<PathBuf> = self
+                .selected_entries
+                .iter()
                 .map(|name| self.current_path.join(name))
                 .collect();
-            
+
             #[cfg(windows)]
             {
                 if let Ok(_) = copy_files_to_clipboard(&files) {
@@ -1126,11 +1224,11 @@ impl eframe::App for RusplorerApp {
                 if let Ok(clipboard_files) = read_files_from_clipboard() {
                     if !clipboard_files.is_empty() {
                         let dest = self.current_path.clone();
-                        
+
                         // Check if these are our internal cut files
-                        let is_cut = self.clipboard_mode == Some(ClipboardMode::Cut) 
+                        let is_cut = self.clipboard_mode == Some(ClipboardMode::Cut)
                             && clipboard_files == self.clipboard_files;
-                        
+
                         if is_cut {
                             let _ = RusplorerApp::move_files(&clipboard_files, &dest);
                             self.clipboard_files.clear();
@@ -1138,7 +1236,7 @@ impl eframe::App for RusplorerApp {
                         } else {
                             let _ = RusplorerApp::copy_files(&clipboard_files, &dest);
                         }
-                        
+
                         self.refresh_contents();
                     }
                 }
@@ -1149,7 +1247,7 @@ impl eframe::App for RusplorerApp {
                     if !self.clipboard_files.is_empty() {
                         let files = self.clipboard_files.clone();
                         let dest = self.current_path.clone();
-                        
+
                         match mode {
                             ClipboardMode::Copy => {
                                 let _ = RusplorerApp::copy_files(&files, &dest);
@@ -1160,7 +1258,7 @@ impl eframe::App for RusplorerApp {
                                 self.clipboard_mode = None;
                             }
                         }
-                        
+
                         self.refresh_contents();
                     }
                 }
@@ -1169,10 +1267,12 @@ impl eframe::App for RusplorerApp {
 
         // Handle DEL key - send to recycle bin
         if got_delete && !self.selected_entries.is_empty() {
-            let files_to_delete: Vec<PathBuf> = self.selected_entries.iter()
+            let files_to_delete: Vec<PathBuf> = self
+                .selected_entries
+                .iter()
                 .map(|name| self.current_path.join(name))
                 .collect();
-            
+
             #[cfg(windows)]
             {
                 // Build double-null-terminated wide string list
@@ -1185,7 +1285,7 @@ impl eframe::App for RusplorerApp {
                     path_buffer.extend_from_slice(&wide);
                 }
                 path_buffer.push(0u16); // Final null terminator
-                
+
                 unsafe {
                     let mut file_op = SHFILEOPSTRUCTW {
                         hwnd: std::ptr::null_mut(),
@@ -1197,7 +1297,7 @@ impl eframe::App for RusplorerApp {
                         hNameMappings: std::ptr::null_mut(),
                         lpszProgressTitle: std::ptr::null(),
                     };
-                    
+
                     let result = SHFileOperationW(&mut file_op);
                     if result == 0 {
                         self.selected_entries.clear();
@@ -1229,36 +1329,42 @@ impl eframe::App for RusplorerApp {
                 for drive in &self.available_drives {
                     let current_drive = self.current_path.to_string_lossy();
                     let is_current = current_drive.starts_with(drive);
-                    
+
                     if ui.selectable_label(is_current, drive).clicked() {
                         selected_drive = Some(PathBuf::from(drive));
                     }
                 }
-                
+
                 // Filter in the middle
                 ui.label("Filter:");
                 ui.allocate_ui(egui::vec2(70.0, 20.0), |ui| {
                     ui.text_edit_singleline(&mut self.filter);
                 });
-                
+
                 // Add space and push navigation buttons to the right
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("🔄").on_hover_text("Refresh").clicked() {
                         self.refresh_contents();
                     }
-                    
+
                     let forward_enabled = !self.forward_history.is_empty();
-                    if ui.add_enabled(forward_enabled, egui::Button::new("▶")).clicked() {
+                    if ui
+                        .add_enabled(forward_enabled, egui::Button::new("▶"))
+                        .clicked()
+                    {
                         self.go_forward();
                     }
-                    
+
                     let back_enabled = !self.back_history.is_empty();
-                    if ui.add_enabled(back_enabled, egui::Button::new("◀")).clicked() {
+                    if ui
+                        .add_enabled(back_enabled, egui::Button::new("◀"))
+                        .clicked()
+                    {
                         self.go_back();
                     }
                 });
             });
-            
+
             // Handle drive selection
             if let Some(drive) = selected_drive {
                 self.navigate_to(drive);
@@ -1269,37 +1375,33 @@ impl eframe::App for RusplorerApp {
             // Breadcrumbs
             let breadcrumbs = self.get_breadcrumbs();
             let mut navigate_to_path: Option<PathBuf> = None;
-            
+
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = [5.0, 5.0].into();
-                
+
                 for (i, (path, name)) in breadcrumbs.iter().enumerate() {
                     let is_last = i == breadcrumbs.len() - 1;
-                    
+
                     if i > 0 {
-                        ui.vertical(|ui| {
-                            ui.add_space(5.0);
-                            ui.label("/");
-                        });
+                        ui.label("/");
                     }
-                    
+
                     if is_last {
                         // Current directory - not clickable, just plain text
-                        ui.vertical(|ui| {
-                            ui.add_space(3.0);
-                            ui.label(name);
-                        });
+                        ui.label(name);
                     } else {
                         // Parent directories - clickable pills
-                        let button = egui::Button::new(egui::RichText::new(name).color(egui::Color32::BLACK))
-                            .fill(egui::Color32::from_rgb(255, 245, 150))
-                            .frame(true);
+                        let button = egui::Button::new(
+                            egui::RichText::new(name).color(egui::Color32::BLACK),
+                        )
+                        .fill(egui::Color32::from_rgb(255, 245, 150))
+                        .frame(true);
                         if ui.add(button).clicked() {
                             navigate_to_path = Some(path.clone());
                         }
                     }
                 }
-                
+
                 // Copy path button
                 if ui.button("📋").on_hover_text("Copy full path").clicked() {
                     if let Ok(mut clipboard) = Clipboard::new() {
@@ -1316,7 +1418,11 @@ impl eframe::App for RusplorerApp {
             ui.separator();
 
             // Table with proper column alignment
-            let show_dates = self.show_date_columns.get(&self.current_path).copied().unwrap_or(false);
+            let show_dates = self
+                .show_date_columns
+                .get(&self.current_path)
+                .copied()
+                .unwrap_or(false);
             let mut sort_changed = false;
 
             // Clear entry rects for this frame
@@ -1324,27 +1430,38 @@ impl eframe::App for RusplorerApp {
             self.any_button_hovered = false;
 
             let row_height = 18.0;
-            
+
             // Measure actual text widths for tight columns
             let font_id = egui::TextStyle::Body.resolve(ui.style());
-            
+
             // Find the widest size label in current contents
-            let max_size_str = self.contents.iter()
+            let max_size_str = self
+                .contents
+                .iter()
                 .filter_map(|entry| {
                     if entry.name.starts_with("[..]") {
                         None
                     } else {
                         let full_path = self.current_path.join(&entry.name);
-                        self.file_sizes.get(&full_path)
+                        self.file_sizes
+                            .get(&full_path)
                             .map(|size| Self::format_file_size(*size))
-                            .or(Some(if entry.is_dir { "0 B".to_string() } else { "...".to_string() }))
+                            .or(Some(if entry.is_dir {
+                                "0 B".to_string()
+                            } else {
+                                "...".to_string()
+                            }))
                     }
                 })
                 .max_by_key(|s| s.len())
                 .unwrap_or_else(|| "0 B".to_string());
-            
-            let size_text_width = ui.fonts(|f| f.layout_no_wrap(max_size_str, font_id.clone(), egui::Color32::WHITE).size().x);
-            
+
+            let size_text_width = ui.fonts(|f| {
+                f.layout_no_wrap(max_size_str, font_id.clone(), egui::Color32::WHITE)
+                    .size()
+                    .x
+            });
+
             // Check if any directories are still computing
             let has_computing = self.contents.iter().any(|entry| {
                 if entry.is_dir && !entry.name.starts_with("[..]") {
@@ -1354,25 +1471,41 @@ impl eframe::App for RusplorerApp {
                     false
                 }
             });
-            
+
             let hourglass_width = if has_computing {
-                ui.fonts(|f| f.layout_no_wrap("⏳".to_string(), font_id.clone(), egui::Color32::WHITE).size().x)
+                ui.fonts(|f| {
+                    f.layout_no_wrap("⏳".to_string(), font_id.clone(), egui::Color32::WHITE)
+                        .size()
+                        .x
+                })
             } else {
                 0.0
             };
-            
+
             let date_text_width = if show_dates {
-                ui.fonts(|f| f.layout_no_wrap("2026-02-17 14:30".to_string(), font_id.clone(), egui::Color32::WHITE).size().x)
+                ui.fonts(|f| {
+                    f.layout_no_wrap(
+                        "2026-02-17 14:30".to_string(),
+                        font_id.clone(),
+                        egui::Color32::WHITE,
+                    )
+                    .size()
+                    .x
+                })
             } else {
                 0.0
             };
-            
+
             // Calculate exact column widths from available space
             let available = ui.available_width();
-            let size_col_w = size_text_width + hourglass_width + 7.0;  // text + spinner (if any) + padding
-            let date_col_w = if show_dates { date_text_width + 20.0 } else { 18.0 }; // +20 for X button + padding
+            let size_col_w = size_text_width + hourglass_width + 7.0; // text + spinner (if any) + padding
+            let date_col_w = if show_dates {
+                date_text_width + 20.0
+            } else {
+                18.0
+            }; // +20 for X button + padding
             let name_col_w = (available - size_col_w - date_col_w - 15.0).max(50.0);
-            
+
             let table_builder = TableBuilder::new(ui)
                 .striped(true)
                 .resizable(false)
@@ -1387,13 +1520,18 @@ impl eframe::App for RusplorerApp {
                     // Name header
                     header.col(|ui| {
                         let arrow = if self.sort_column == SortColumn::Name {
-                            if self.sort_ascending { "↑" } else { "↓" }
-                        } else { "" };
+                            if self.sort_ascending { " ^" } else { " v" }
+                        } else {
+                            ""
+                        };
                         let text = format!("Name{}", arrow);
-                        if ui.add_sized(
-                            ui.available_size(),
-                            egui::Button::new(egui::RichText::new(&text).strong())
-                        ).clicked() {
+                        if ui
+                            .add_sized(
+                                ui.available_size(),
+                                egui::Button::new(egui::RichText::new(&text).strong()),
+                            )
+                            .clicked()
+                        {
                             if self.sort_column == SortColumn::Name {
                                 self.sort_ascending = !self.sort_ascending;
                             } else {
@@ -1407,13 +1545,18 @@ impl eframe::App for RusplorerApp {
                     // Size header
                     header.col(|ui| {
                         let arrow = if self.sort_column == SortColumn::Size {
-                            if self.sort_ascending { "↑" } else { "↓" }
-                        } else { "" };
+                            if self.sort_ascending { " ^" } else { " v" }
+                        } else {
+                            ""
+                        };
                         let text = format!("Size{}", arrow);
-                        if ui.add_sized(
-                            ui.available_size(),
-                            egui::Button::new(egui::RichText::new(&text).strong())
-                        ).clicked() {
+                        if ui
+                            .add_sized(
+                                ui.available_size(),
+                                egui::Button::new(egui::RichText::new(&text).strong()),
+                            )
+                            .clicked()
+                        {
                             if self.sort_column == SortColumn::Size {
                                 self.sort_ascending = !self.sort_ascending;
                             } else {
@@ -1428,8 +1571,13 @@ impl eframe::App for RusplorerApp {
                     header.col(|ui| {
                         if show_dates {
                             ui.horizontal(|ui| {
-                                if ui.small_button("X").on_hover_text("Hide date column").clicked() {
-                                    self.show_date_columns.insert(self.current_path.clone(), false);
+                                if ui
+                                    .small_button("X")
+                                    .on_hover_text("Hide date column")
+                                    .clicked()
+                                {
+                                    self.show_date_columns
+                                        .insert(self.current_path.clone(), false);
                                     if self.sort_column == SortColumn::Date {
                                         self.sort_column = SortColumn::Name;
                                         self.sort_ascending = true;
@@ -1437,13 +1585,18 @@ impl eframe::App for RusplorerApp {
                                     sort_changed = true;
                                 }
                                 let arrow = if self.sort_column == SortColumn::Date {
-                                    if self.sort_ascending { "↑" } else { "↓" }
-                                } else { "" };
+                                    if self.sort_ascending { " ^" } else { " v" }
+                                } else {
+                                    ""
+                                };
                                 let text = format!("Modified{}", arrow);
-                                if ui.add_sized(
-                                    egui::vec2(ui.available_width(), ui.available_height()),
-                                    egui::Button::new(egui::RichText::new(&text).strong())
-                                ).clicked() {
+                                if ui
+                                    .add_sized(
+                                        egui::vec2(ui.available_width(), ui.available_height()),
+                                        egui::Button::new(egui::RichText::new(&text).strong()),
+                                    )
+                                    .clicked()
+                                {
                                     if self.sort_column == SortColumn::Date {
                                         self.sort_ascending = !self.sort_ascending;
                                     } else {
@@ -1454,8 +1607,13 @@ impl eframe::App for RusplorerApp {
                                 }
                             });
                         } else {
-                            if ui.small_button("📅").on_hover_text("Show modification date").clicked() {
-                                self.show_date_columns.insert(self.current_path.clone(), true);
+                            if ui
+                                .small_button("📅")
+                                .on_hover_text("Show modification date")
+                                .clicked()
+                            {
+                                self.show_date_columns
+                                    .insert(self.current_path.clone(), true);
                                 self.sort_column = SortColumn::Date;
                                 self.sort_ascending = false;
                                 sort_changed = true;
@@ -1467,15 +1625,22 @@ impl eframe::App for RusplorerApp {
                     for entry in self.contents.clone() {
                         // Filter
                         if !entry.name.starts_with("[..]") && !self.filter.is_empty() {
-                            if !entry.name.to_lowercase().contains(&self.filter.to_lowercase()) {
+                            if !entry
+                                .name
+                                .to_lowercase()
+                                .contains(&self.filter.to_lowercase())
+                            {
                                 continue;
                             }
                         }
 
                         let is_selected = self.selected_entries.contains(&entry.name);
-                        let is_in_clipboard = self.clipboard_files.contains(&self.current_path.join(&entry.name));
+                        let is_in_clipboard = self
+                            .clipboard_files
+                            .contains(&self.current_path.join(&entry.name));
                         let full_path = self.current_path.join(&entry.name);
-                        let is_computing = entry.is_dir && !entry.name.starts_with("[..]")
+                        let is_computing = entry.is_dir
+                            && !entry.name.starts_with("[..]")
                             && !self.dirs_done.contains(&full_path);
 
                         let size_label = if entry.name.starts_with("[..]") {
@@ -1483,21 +1648,36 @@ impl eframe::App for RusplorerApp {
                         } else {
                             match self.file_sizes.get(&full_path) {
                                 Some(size) => Self::format_file_size(*size),
-                                None => if entry.is_dir { "0 B".to_string() } else { "...".to_string() },
+                                None => {
+                                    if entry.is_dir {
+                                        "0 B".to_string()
+                                    } else {
+                                        "...".to_string()
+                                    }
+                                }
                             }
                         };
 
                         body.row(row_height, |mut row| {
                             // Name column
                             row.col(|ui| {
+                                let col_width = ui.available_width();
+
                                 let button = if is_selected && is_in_clipboard {
-                                    egui::Button::new(egui::RichText::new(&entry.name).color(egui::Color32::WHITE).italics())
-                                        .fill(egui::Color32::from_rgb(100, 150, 255))
-                                        .frame(false)
+                                    egui::Button::new(
+                                        egui::RichText::new(&entry.name)
+                                            .color(egui::Color32::WHITE)
+                                            .italics(),
+                                    )
+                                    .fill(egui::Color32::from_rgb(100, 150, 255))
+                                    .frame(false)
                                 } else if is_selected {
-                                    egui::Button::new(egui::RichText::new(&entry.name).color(egui::Color32::WHITE))
-                                        .fill(egui::Color32::from_rgb(100, 150, 255))
-                                        .frame(false)
+                                    egui::Button::new(
+                                        egui::RichText::new(&entry.name)
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(egui::Color32::from_rgb(100, 150, 255))
+                                    .frame(false)
                                 } else if is_in_clipboard && entry.is_dir {
                                     egui::Button::new(egui::RichText::new(&entry.name).italics())
                                         .fill(egui::Color32::from_rgb(255, 245, 150))
@@ -1514,14 +1694,10 @@ impl eframe::App for RusplorerApp {
                                         .fill(egui::Color32::from_rgb(255, 245, 150))
                                         .frame(false)
                                 } else {
-                                    egui::Button::new(&entry.name)
-                                        .frame(false)
+                                    egui::Button::new(&entry.name).frame(false)
                                 };
 
-                                let response = ui.add_sized(
-                                    egui::vec2(ui.available_width(), ui.available_height()),
-                                    button,
-                                );
+                                let response = ui.horizontal(|ui| ui.add(button)).inner;
 
                                 self.entry_rects.insert(entry.name.clone(), response.rect);
                                 if response.hovered() {
@@ -1545,7 +1721,8 @@ impl eframe::App for RusplorerApp {
                                 if response.secondary_clicked() {
                                     self.show_context_menu = true;
                                     self.context_menu_entry = Some(entry.clone());
-                                    self.context_menu_position = ui.input(|i| i.pointer.hover_pos().unwrap_or_default());
+                                    self.context_menu_position =
+                                        ui.input(|i| i.pointer.hover_pos().unwrap_or_default());
                                 }
 
                                 if response.double_clicked() {
@@ -1566,12 +1743,15 @@ impl eframe::App for RusplorerApp {
                                 if !entry.name.starts_with("[..]") {
                                     if let Some(size) = self.file_sizes.get(&full_path) {
                                         let bar_width = if self.max_file_size > 0 {
-                                            (*size as f32 / self.max_file_size as f32) * response.rect.width()
+                                            (*size as f32 / self.max_file_size as f32) * col_width
                                         } else {
                                             0.0
                                         };
                                         let bar_rect = egui::Rect::from_min_size(
-                                            egui::pos2(response.rect.left(), response.rect.bottom() - 2.0),
+                                            egui::pos2(
+                                                response.rect.left(),
+                                                response.rect.bottom() - 2.0,
+                                            ),
                                             egui::vec2(bar_width, 1.0),
                                         );
                                         ui.painter().rect_filled(
@@ -1585,29 +1765,33 @@ impl eframe::App for RusplorerApp {
 
                             // Size column - right aligned, no extra padding
                             row.col(|ui| {
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if !size_label.is_empty() {
-                                        let size_text = if is_in_clipboard {
-                                            egui::RichText::new(&size_label).weak().italics()
-                                        } else {
-                                            egui::RichText::new(&size_label).weak()
-                                        };
-                                        ui.label(size_text);
-                                    }
-                                    if is_computing {
-                                        if self.is_focused {
-                                            // Animated hourglass while computing
-                                            let spinner_chars = ['⏳', '⌛'];
-                                            let time = ui.input(|i| i.time);
-                                            let idx = ((time * 2.0) as usize) % spinner_chars.len();
-                                            ui.label(spinner_chars[idx].to_string());
-                                            ctx.request_repaint();
-                                        } else {
-                                            // Static hourglass when paused (window unfocused)
-                                            ui.label("⏳");
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if !size_label.is_empty() {
+                                            let size_text = if is_in_clipboard {
+                                                egui::RichText::new(&size_label).weak().italics()
+                                            } else {
+                                                egui::RichText::new(&size_label).weak()
+                                            };
+                                            ui.label(size_text);
                                         }
-                                    }
-                                });
+                                        if is_computing {
+                                            if self.is_focused {
+                                                // Animated hourglass while computing
+                                                let spinner_chars = ['⏳', '⌛'];
+                                                let time = ui.input(|i| i.time);
+                                                let idx =
+                                                    ((time * 2.0) as usize) % spinner_chars.len();
+                                                ui.label(spinner_chars[idx].to_string());
+                                                ctx.request_repaint();
+                                            } else {
+                                                // Static hourglass when paused (window unfocused)
+                                                ui.label("⏳");
+                                            }
+                                        }
+                                    },
+                                );
                             });
 
                             // Date column - right aligned, tight
@@ -1619,14 +1803,17 @@ impl eframe::App for RusplorerApp {
                                         String::new()
                                     };
                                     if !date_text.is_empty() {
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            let label = if is_in_clipboard {
-                                                egui::RichText::new(&date_text).weak().italics()
-                                            } else {
-                                                egui::RichText::new(&date_text).weak()
-                                            };
-                                            ui.label(label);
-                                        });
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                let label = if is_in_clipboard {
+                                                    egui::RichText::new(&date_text).weak().italics()
+                                                } else {
+                                                    egui::RichText::new(&date_text).weak()
+                                                };
+                                                ui.label(label);
+                                            },
+                                        );
                                     }
                                 }
                             });
@@ -1646,7 +1833,9 @@ impl eframe::App for RusplorerApp {
                         self.selection_drag_current = Some(pointer_pos);
                     }
                     if self.is_dragging_selection && !i.pointer.primary_down() {
-                        if let (Some(start), Some(end)) = (self.selection_drag_start, self.selection_drag_current) {
+                        if let (Some(start), Some(end)) =
+                            (self.selection_drag_start, self.selection_drag_current)
+                        {
                             let sel_rect = egui::Rect::from_two_pos(start, end);
                             if !i.modifiers.ctrl {
                                 self.selected_entries.clear();
@@ -1662,7 +1851,10 @@ impl eframe::App for RusplorerApp {
                         self.selection_drag_current = None;
                     }
                 }
-                if i.pointer.primary_clicked() && !self.any_button_hovered && !self.is_dragging_selection {
+                if i.pointer.primary_clicked()
+                    && !self.any_button_hovered
+                    && !self.is_dragging_selection
+                {
                     self.selected_entries.clear();
                 }
             });
@@ -1671,19 +1863,37 @@ impl eframe::App for RusplorerApp {
                 self.sort_contents();
                 self.config.sort_column = self.sort_column.clone();
                 self.config.sort_ascending = self.sort_ascending;
-                self.config.show_date_columns = self.show_date_columns.iter()
+                self.config.show_date_columns = self
+                    .show_date_columns
+                    .iter()
                     .map(|(k, v)| (k.to_string_lossy().to_string(), *v))
                     .collect();
                 self.config.save();
             }
 
             // Draw selection rectangle if dragging
-            if let (Some(start), Some(current)) = (self.selection_drag_start, self.selection_drag_current) {
+            if let (Some(start), Some(current)) =
+                (self.selection_drag_start, self.selection_drag_current)
+            {
                 let sel_rect = egui::Rect::from_two_pos(start, current);
-                ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("selection_rect")))
-                    .rect_stroke(sel_rect, 0.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 150, 255)));
-                ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("selection_rect")))
-                    .rect_filled(sel_rect, 0.0, egui::Color32::from_rgba_unmultiplied(100, 150, 255, 30));
+                ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("selection_rect"),
+                ))
+                .rect_stroke(
+                    sel_rect,
+                    0.0,
+                    egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 150, 255)),
+                );
+                ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("selection_rect"),
+                ))
+                .rect_filled(
+                    sel_rect,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(100, 150, 255, 30),
+                );
             }
         });
 
@@ -1695,7 +1905,7 @@ impl eframe::App for RusplorerApp {
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
                     ui.label(format!("{} item(s) dropped", self.dragged_files.len()));
-                    
+
                     ui.horizontal(|ui| {
                         if ui.button("Copy").clicked() {
                             let files = self.dragged_files.clone();
@@ -1707,7 +1917,7 @@ impl eframe::App for RusplorerApp {
                             self.show_drop_menu = false;
                             self.dragged_files.clear();
                         }
-                        
+
                         if ui.button("Move").clicked() {
                             let files = self.dragged_files.clone();
                             let dest = self.current_path.clone();
@@ -1736,7 +1946,7 @@ impl eframe::App for RusplorerApp {
         if self.show_context_menu {
             if let Some(ref entry) = self.context_menu_entry {
                 let full_path = self.current_path.join(&entry.name);
-                
+
                 egui::Window::new("Context Menu")
                     .collapsible(false)
                     .resizable(false)
@@ -1750,22 +1960,22 @@ impl eframe::App for RusplorerApp {
                     })
                     .show(ctx, |ui| {
                         ui.style_mut().spacing.button_padding = egui::vec2(4.0, 2.0);
-                        
+
                         // Open with VS Code
-                        if (entry.is_dir || Self::is_code_file(&full_path)) && ui.button("Open with Code").clicked() {
-                            let _ = std::process::Command::new("code")
-                                .arg(&full_path)
-                                .spawn();
+                        if (entry.is_dir || Self::is_code_file(&full_path))
+                            && ui.button("Open with Code").clicked()
+                        {
+                            let _ = std::process::Command::new("code").arg(&full_path).spawn();
                             self.show_context_menu = false;
                         }
-                        
+
                         // Extract here
                         if Self::is_archive(&full_path) && ui.button("Extract here").clicked() {
                             self.extract_archive_path = full_path.clone();
                             self.show_extract_dialog = true;
                             self.show_context_menu = false;
                         }
-                        
+
                         // Add to archive
                         if ui.button("Add to archive").clicked() {
                             self.files_to_archive.clear();
@@ -1776,10 +1986,11 @@ impl eframe::App for RusplorerApp {
                             } else {
                                 self.files_to_archive.push(full_path.clone());
                             }
-                            
+
                             // Default archive name based on first item
                             let stem = if let Some(first) = self.files_to_archive.first() {
-                                first.file_stem()
+                                first
+                                    .file_stem()
                                     .unwrap_or_default()
                                     .to_string_lossy()
                                     .to_string()
@@ -1790,9 +2001,9 @@ impl eframe::App for RusplorerApp {
                             self.show_archive_dialog = true;
                             self.show_context_menu = false;
                         }
-                        
+
                         ui.separator();
-                        
+
                         // Copy full path
                         if ui.button("📋 Copy full path").clicked() {
                             if let Ok(mut clipboard) = Clipboard::new() {
@@ -1800,14 +2011,14 @@ impl eframe::App for RusplorerApp {
                             }
                             self.show_context_menu = false;
                         }
-                        
+
                         // Rename
                         if !entry.name.starts_with("[..]") && ui.button("Rename").clicked() {
                             self.rename_buffer = entry.name.clone();
                             self.show_rename_dialog = true;
                             self.show_context_menu = false;
                         }
-                        
+
                         // Properties
                         if ui.button("Properties").clicked() {
                             let _ = std::process::Command::new("explorer")
@@ -1815,15 +2026,15 @@ impl eframe::App for RusplorerApp {
                                 .spawn();
                             self.show_context_menu = false;
                         }
-                        
+
                         ui.separator();
-                        
+
                         if ui.button("Cancel").clicked() {
                             self.show_context_menu = false;
                         }
                     });
             }
-            
+
             // Close context menu if clicked elsewhere
             if ctx.input(|i| i.pointer.primary_clicked() || i.key_pressed(egui::Key::Escape)) {
                 self.show_context_menu = false;
@@ -1834,7 +2045,10 @@ impl eframe::App for RusplorerApp {
         if self.show_archive_dialog {
             // Draw semi-transparent backdrop
             let screen_rect = ctx.screen_rect();
-            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::PanelResizeLine, egui::Id::new("archive_backdrop")));
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::PanelResizeLine,
+                egui::Id::new("archive_backdrop"),
+            ));
             painter.rect_filled(screen_rect, 0.0, egui::Color32::from_black_alpha(128));
 
             egui::Window::new("Add to archive")
@@ -1846,28 +2060,31 @@ impl eframe::App for RusplorerApp {
                         ui.label("Archive name:");
                         ui.text_edit_singleline(&mut self.archive_name_buffer);
                     });
-                    
+
                     ui.add_space(4.0);
-                    
+
                     ui.horizontal(|ui| {
                         ui.label("Format:");
                         ui.selectable_value(&mut self.archive_type, 0, "7z");
                         ui.selectable_value(&mut self.archive_type, 1, "zip");
                     });
-                    
+
                     ui.horizontal(|ui| {
                         ui.label("Compression:");
                         ui.selectable_value(&mut self.compression_level, 0, "Store");
                         ui.selectable_value(&mut self.compression_level, 1, "Medium");
                         ui.selectable_value(&mut self.compression_level, 2, "High");
                     });
-                    
+
                     ui.add_space(4.0);
-                    
-                    ui.label(format!("{} item(s) to archive", self.files_to_archive.len()));
-                    
+
+                    ui.label(format!(
+                        "{} item(s) to archive",
+                        self.files_to_archive.len()
+                    ));
+
                     ui.add_space(4.0);
-                    
+
                     ui.horizontal(|ui| {
                         if ui.button("Compress").clicked() {
                             let ext = match self.archive_type {
@@ -1883,28 +2100,34 @@ impl eframe::App for RusplorerApp {
                                 1 => "-mx5",
                                 _ => "-mx9",
                             };
-                            
-                            let archive_path = self.current_path.join(
-                                format!("{}.{}", self.archive_name_buffer, ext)
-                            );
+
+                            let archive_path = self
+                                .current_path
+                                .join(format!("{}.{}", self.archive_name_buffer, ext));
                             let archive_str = archive_path.to_string_lossy().to_string();
-                            
+
                             let archive_filename = format!("{}.{}", self.archive_name_buffer, ext);
                             let files_clone = self.files_to_archive.clone();
                             let (done_tx, done_rx) = channel();
                             let archive_str_clone = archive_str.clone();
                             let format_flag = format_flag.to_string();
                             let level_flag = level_flag.to_string();
-                            
+
                             std::thread::spawn(move || {
-                                let mut cmd = std::process::Command::new("C:\\Program Files\\7-Zip\\7z.exe");
+                                let mut cmd =
+                                    std::process::Command::new("C:\\Program Files\\7-Zip\\7z.exe");
                                 cmd.args(&["a", &format_flag, &level_flag, &archive_str_clone]);
                                 for f in &files_clone {
                                     cmd.arg(f);
                                 }
                                 let result = cmd.spawn().or_else(|_| {
                                     let mut cmd2 = std::process::Command::new("7z.exe");
-                                    cmd2.args(&["a", &format_flag, &level_flag, &archive_str_clone]);
+                                    cmd2.args(&[
+                                        "a",
+                                        &format_flag,
+                                        &level_flag,
+                                        &archive_str_clone,
+                                    ]);
                                     for f in &files_clone {
                                         cmd2.arg(f);
                                     }
@@ -1915,12 +2138,12 @@ impl eframe::App for RusplorerApp {
                                 }
                                 let _ = done_tx.send(archive_filename);
                             });
-                            
+
                             self.archive_done_receiver = Some(done_rx);
                             self.show_archive_dialog = false;
                             self.files_to_archive.clear();
                         }
-                        
+
                         if ui.button("Cancel").clicked() {
                             self.show_archive_dialog = false;
                             self.files_to_archive.clear();
@@ -1934,11 +2157,11 @@ impl eframe::App for RusplorerApp {
             let archive_path = self.extract_archive_path.clone();
             let dest = self.current_path.clone();
             let (done_tx, done_rx) = channel();
-            
+
             std::thread::spawn(move || {
                 let dest_str = dest.to_string_lossy().to_string();
                 let archive_str = archive_path.to_string_lossy().to_string();
-                
+
                 let result = std::process::Command::new("C:\\Program Files\\7-Zip\\7z.exe")
                     .args(&["x", &archive_str, &format!("-o{}", dest_str)])
                     .spawn()
@@ -1947,13 +2170,13 @@ impl eframe::App for RusplorerApp {
                             .args(&["x", &archive_str, &format!("-o{}", dest_str)])
                             .spawn()
                     });
-                
+
                 if let Ok(mut child) = result {
                     let _ = child.wait();
                 }
                 let _ = done_tx.send(());
             });
-            
+
             self.extract_done_receiver = Some(done_rx);
         }
 
@@ -1968,7 +2191,7 @@ impl eframe::App for RusplorerApp {
                     .show(ctx, |ui| {
                         ui.label("New name:");
                         let response = ui.text_edit_singleline(&mut self.rename_buffer);
-                        
+
                         // Auto-focus the text field
                         if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             // Perform rename
@@ -1980,7 +2203,7 @@ impl eframe::App for RusplorerApp {
                             self.show_rename_dialog = false;
                             self.refresh_contents();
                         }
-                        
+
                         ui.horizontal(|ui| {
                             if ui.button("OK").clicked() {
                                 let old_path = self.current_path.join(&entry_name);
@@ -1991,7 +2214,7 @@ impl eframe::App for RusplorerApp {
                                 self.show_rename_dialog = false;
                                 self.refresh_contents();
                             }
-                            
+
                             if ui.button("Cancel").clicked() {
                                 self.show_rename_dialog = false;
                             }
@@ -2004,10 +2227,14 @@ impl eframe::App for RusplorerApp {
         if self.show_extract_dialog {
             // Draw semi-transparent backdrop
             let screen_rect = ctx.screen_rect();
-            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::PanelResizeLine, egui::Id::new("extract_backdrop")));
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::PanelResizeLine,
+                egui::Id::new("extract_backdrop"),
+            ));
             painter.rect_filled(screen_rect, 0.0, egui::Color32::from_black_alpha(128));
 
-            let archive_name = self.extract_archive_path
+            let archive_name = self
+                .extract_archive_path
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()

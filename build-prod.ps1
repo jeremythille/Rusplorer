@@ -13,7 +13,10 @@ cargo build --release
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "`nBuild successful!`nLaunching Rusplorer...`n"
-    & ".\target\release\rusplorer.exe"
+    Start-Process ".\target\release\rusplorer.exe"
+    Write-Host "Rusplorer launched in background. Close this window when done."
+    Read-Host "Press Enter to exit"
 } else {
     Write-Host "Build failed!"
+    Read-Host "Press Enter to exit"
 }
