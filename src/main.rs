@@ -395,6 +395,12 @@ struct RusplorerApp {
     is_dragging_selection: bool,
     selection_before_drag: HashSet<String>,
     any_button_hovered: bool,
+    // Internal drag-and-drop
+    dnd_active: bool,
+    dnd_sources: Vec<PathBuf>,
+    dnd_label: String,
+    dnd_start_pos: Option<egui::Pos2>,
+    dnd_drop_target: Option<String>,
     dirs_done: HashSet<PathBuf>,
     dirs_done_receiver: Option<Receiver<PathBuf>>,
     show_date_columns: HashMap<PathBuf, bool>,
@@ -490,6 +496,11 @@ impl Default for RusplorerApp {
             is_dragging_selection: false,
             selection_before_drag: HashSet::new(),
             any_button_hovered: false,
+            dnd_active: false,
+            dnd_sources: Vec::new(),
+            dnd_label: String::new(),
+            dnd_start_pos: None,
+            dnd_drop_target: None,
             dirs_done: HashSet::new(),
             dirs_done_receiver: None,
             show_date_columns,
@@ -1474,6 +1485,27 @@ impl eframe::App for RusplorerApp {
                 .unwrap_or(false);
             let mut sort_changed = false;
 
+            // Before clearing rects, use last frame's rects to set drop target for this frame
+            if self.dnd_active {
+                let cursor = ctx.input(|i| i.pointer.hover_pos());
+                self.dnd_drop_target = cursor.and_then(|pos| {
+                    self.entry_rects.iter().find_map(|(name, rect)| {
+                        if rect.contains(pos) {
+                            // Only dirs (and [..]) are valid, not drag sources
+                            let full = self.current_path.join(name);
+                            let is_parent = name.starts_with("[..]");
+                            let is_dir = is_parent || full.is_dir();
+                            let is_source = !is_parent && self.dnd_sources.contains(&full);
+                            if is_dir && !is_source { Some(name.clone()) } else { None }
+                        } else {
+                            None
+                        }
+                    })
+                });
+            } else {
+                self.dnd_drop_target = None;
+            }
+
             // Clear entry rects for this frame
             self.entry_rects.clear();
             self.any_button_hovered = false;
@@ -1713,11 +1745,23 @@ impl eframe::App for RusplorerApp {
                             }
                         };
 
+                        // Determine if this folder is a drop target
+                        let is_drop_target = self.dnd_active
+                            && entry.is_dir
+                            && self.dnd_drop_target.as_deref() == Some(&entry.name);
+
                         // Name column
                         row.col(|ui| {
                                 let col_width = ui.available_width();
 
-                                let button = if is_selected && is_in_clipboard {
+                                let button = if is_drop_target {
+                                    egui::Button::new(
+                                        egui::RichText::new(&entry.name)
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(egui::Color32::from_rgb(80, 200, 80))
+                                    .frame(false)
+                                } else if is_selected && is_in_clipboard {
                                       egui::Button::new(
                                           egui::RichText::new(&entry.name)
                                               .color(egui::Color32::WHITE)
@@ -1753,11 +1797,57 @@ impl eframe::App for RusplorerApp {
                                     egui::Button::new(&entry.name).frame(false)
                                 };
 
+                                let button = button.sense(egui::Sense::click_and_drag());
                                 let response = ui.horizontal(|ui| ui.add(button)).inner;
 
                                 self.entry_rects.insert(entry.name.clone(), response.rect);
-                                if response.hovered() {
+                                // Use direct cursor-rect check so hover works even during drag
+                                let cursor_over = ui.input(|i| {
+                                    i.pointer.hover_pos().map_or(false, |p| response.rect.contains(p))
+                                });
+                                if cursor_over || response.hovered() {
                                     self.any_button_hovered = true;
+                                }
+
+                                // Drag-and-drop: detect drag start
+                                if response.drag_started() && !entry.name.starts_with("[..]") {
+                                    self.dnd_start_pos = ui.input(|i| i.pointer.hover_pos());
+                                }
+                                if response.dragged()
+                                    && !self.dnd_active
+                                    && !entry.name.starts_with("[..]")
+                                {
+                                    if let Some(start) = self.dnd_start_pos {
+                                        if let Some(current) = ui.input(|i| i.pointer.hover_pos()) {
+                                            if start.distance(current) > 5.0 {
+                                                // Start drag
+                                                if self.selected_entries.contains(&entry.name) {
+                                                    // Drag all selected entries
+                                                    self.dnd_sources = self
+                                                        .selected_entries
+                                                        .iter()
+                                                        .map(|n| self.current_path.join(n))
+                                                        .collect();
+                                                } else {
+                                                    // Drag just this entry
+                                                    self.dnd_sources = vec![self.current_path.join(&entry.name)];
+                                                    self.selected_entries.clear();
+                                                    self.selected_entries.insert(entry.name.clone());
+                                                }
+                                                let count = self.dnd_sources.len();
+                                                self.dnd_label = if count == 1 {
+                                                    if entry.is_dir {
+                                                        format!("📁 {}", &entry.name)
+                                                    } else {
+                                                        format!("📄 {}", &entry.name)
+                                                    }
+                                                } else {
+                                                    format!("📦 {} items", count)
+                                                };
+                                                self.dnd_active = true;
+                                            }
+                                        }
+                                    }
                                 }
 
                                 if response.clicked() {
@@ -1899,7 +1989,8 @@ impl eframe::App for RusplorerApp {
                         });
                     });
 
-            // Handle rectangular selection
+            // Handle rectangular selection (only when not dragging files)
+            if !self.dnd_active {
             ctx.input(|i| {
                 if let Some(pointer_pos) = i.pointer.hover_pos() {
                     if i.pointer.primary_pressed() && !self.any_button_hovered {
@@ -1934,6 +2025,7 @@ impl eframe::App for RusplorerApp {
                     }
                 }
             });
+            } // end if !self.dnd_active
 
             if sort_changed {
                 self.sort_contents();
@@ -1970,6 +2062,69 @@ impl eframe::App for RusplorerApp {
                     0.0,
                     egui::Color32::from_rgba_unmultiplied(100, 150, 255, 30),
                 );
+            }
+
+            // Handle drag-and-drop: detect release and perform move
+            if self.dnd_active {
+                if !ctx.input(|i| i.pointer.primary_down()) {
+                    if let Some(target_name) = self.dnd_drop_target.take() {
+                        let dest = if target_name.starts_with("[..]") {
+                            self.current_path.parent().map(|p| p.to_path_buf())
+                        } else {
+                            Some(self.current_path.join(&target_name))
+                        };
+                        if let Some(dest) = dest.filter(|d| d.is_dir()) {
+                            let sources: Vec<PathBuf> = self.dnd_sources
+                                .iter()
+                                .filter(|s| **s != dest)
+                                .cloned()
+                                .collect();
+                            if !sources.is_empty() {
+                                let _ = Self::move_files(&sources, &dest);
+                                self.selected_entries.clear();
+                                self.refresh_contents();
+                            }
+                        }
+                    }
+                    self.dnd_active = false;
+                    self.dnd_sources.clear();
+                    self.dnd_label.clear();
+                    self.dnd_start_pos = None;
+                    self.dnd_drop_target = None;
+                }
+
+                // Draw ghost label near cursor
+                if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
+                    let painter = ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Tooltip,
+                        egui::Id::new("dnd_ghost"),
+                    ));
+                    let galley = painter.layout_no_wrap(
+                        self.dnd_label.clone(),
+                        egui::FontId::proportional(12.0),
+                        egui::Color32::WHITE,
+                    );
+                    let text_rect = egui::Rect::from_min_size(
+                        pos + egui::vec2(12.0, 12.0),
+                        galley.size() + egui::vec2(12.0, 6.0),
+                    );
+                    painter.rect_filled(
+                        text_rect,
+                        4.0,
+                        egui::Color32::from_rgba_unmultiplied(40, 40, 40, 220),
+                    );
+                    painter.rect_stroke(
+                        text_rect,
+                        4.0,
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 150, 255)),
+                    );
+                    painter.galley(
+                        text_rect.min + egui::vec2(6.0, 3.0),
+                        galley,
+                        egui::Color32::WHITE,
+                    );
+                    ctx.request_repaint();
+                }
             }
         });
 
