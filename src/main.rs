@@ -163,6 +163,53 @@ fn read_files_from_clipboard() -> Result<Vec<PathBuf>, Box<dyn std::error::Error
     }
 }
 
+/// Resolve a Windows .lnk shortcut file to its target path
+#[cfg(windows)]
+fn resolve_lnk(path: &Path) -> Option<PathBuf> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::Interface;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
+        COINIT_APARTMENTTHREADED, STGM,
+    };
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+    use windows::core::PCWSTR;
+
+    let wide_path: Vec<u16> = OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let coin_hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let result = (|| -> Option<PathBuf> {
+            let shell_link: IShellLinkW =
+                CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+            let persist_file: IPersistFile = shell_link.cast().ok()?;
+            persist_file
+                .Load(PCWSTR(wide_path.as_ptr()), STGM(0))
+                .ok()?;
+            let mut buf = [0u16; 261];
+            // SLGP_RAWPATH = 0x4
+            shell_link
+                .GetPath(
+                    &mut buf,
+                    std::ptr::null_mut(),
+                    0x4u32,
+                )
+                .ok()?;
+            let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            let target = String::from_utf16_lossy(&buf[..len]);
+            if target.is_empty() { None } else { Some(PathBuf::from(target)) }
+        })();
+        if coin_hr.is_ok() {
+            CoUninitialize();
+        }
+        result
+    }
+}
+
 /// Recursively calculate directory size, sending updates progressively
 fn calculate_dir_size_progressive(
     path: &Path,
@@ -1742,9 +1789,32 @@ impl eframe::App for RusplorerApp {
                                         self.selected_action = Some(FileAction::OpenDir(new_path));
                                     } else {
                                         let full_path = self.current_path.join(&entry.name);
-                                        let _ = std::process::Command::new("explorer")
-                                            .arg(&full_path)
-                                            .spawn();
+                                        // Resolve .lnk shortcuts
+                                        #[cfg(windows)]
+                                        let resolved = if entry.name
+                                            .to_lowercase()
+                                            .ends_with(".lnk")
+                                        {
+                                            resolve_lnk(&full_path)
+                                        } else {
+                                            None
+                                        };
+                                        #[cfg(not(windows))]
+                                        let resolved: Option<PathBuf> = None;
+                                        if let Some(target) = resolved {
+                                            if target.is_dir() {
+                                                self.selected_action =
+                                                    Some(FileAction::OpenDir(target));
+                                            } else {
+                                                let _ = std::process::Command::new("explorer")
+                                                    .arg(&target)
+                                                    .spawn();
+                                            }
+                                        } else {
+                                            let _ = std::process::Command::new("explorer")
+                                                .arg(&full_path)
+                                                .spawn();
+                                        }
                                     }
                                 }
 
