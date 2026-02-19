@@ -346,6 +346,7 @@ struct RusplorerApp {
     selection_drag_current: Option<egui::Pos2>,
     entry_rects: HashMap<String, egui::Rect>,
     is_dragging_selection: bool,
+    selection_before_drag: HashSet<String>,
     any_button_hovered: bool,
     dirs_done: HashSet<PathBuf>,
     dirs_done_receiver: Option<Receiver<PathBuf>>,
@@ -440,6 +441,7 @@ impl Default for RusplorerApp {
             selection_drag_current: None,
             entry_rects: HashMap::new(),
             is_dragging_selection: false,
+            selection_before_drag: HashSet::new(),
             any_button_hovered: false,
             dirs_done: HashSet::new(),
             dirs_done_receiver: None,
@@ -1506,10 +1508,25 @@ impl eframe::App for RusplorerApp {
             }; // +20 for X button + padding
             let name_col_w = (available - size_col_w - date_col_w - 15.0).max(50.0);
 
+            // Pre-filter entries for the table body
+            let filter_lower = self.filter.to_lowercase();
+            let filtered_entries: Vec<FileEntry> = self
+                .contents
+                .iter()
+                .filter(|entry| {
+                    entry.name.starts_with("[..]")
+                        || self.filter.is_empty()
+                        || entry.name.to_lowercase().contains(&filter_lower)
+                })
+                .cloned()
+                .collect();
+            let num_rows = filtered_entries.len();
+
             let table_builder = TableBuilder::new(ui)
                 .striped(true)
                 .resizable(false)
                 .vscroll(true)
+                .drag_to_scroll(false)
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                 .column(Column::exact(name_col_w).clip(true))
                 .column(Column::exact(size_col_w))
@@ -1621,18 +1638,9 @@ impl eframe::App for RusplorerApp {
                         }
                     });
                 })
-                .body(|mut body| {
-                    for entry in self.contents.clone() {
-                        // Filter
-                        if !entry.name.starts_with("[..]") && !self.filter.is_empty() {
-                            if !entry
-                                .name
-                                .to_lowercase()
-                                .contains(&self.filter.to_lowercase())
-                            {
-                                continue;
-                            }
-                        }
+                .body(|body| {
+                    body.rows(row_height, num_rows, |mut row| {
+                        let entry = &filtered_entries[row.index()];
 
                         let is_selected = self.selected_entries.contains(&entry.name);
                         let is_in_clipboard = self
@@ -1658,9 +1666,8 @@ impl eframe::App for RusplorerApp {
                             }
                         };
 
-                        body.row(row_height, |mut row| {
-                            // Name column
-                            row.col(|ui| {
+                        // Name column
+                        row.col(|ui| {
                                 let col_width = ui.available_width();
 
                                 let button = if is_selected && is_in_clipboard {
@@ -1820,8 +1827,7 @@ impl eframe::App for RusplorerApp {
                                 }
                             });
                         });
-                    }
-                });
+                    });
 
             // Handle rectangular selection
             ctx.input(|i| {
@@ -1830,16 +1836,17 @@ impl eframe::App for RusplorerApp {
                         self.is_dragging_selection = true;
                         self.selection_drag_start = Some(pointer_pos);
                         self.selection_drag_current = Some(pointer_pos);
+                        self.selection_before_drag = self.selected_entries.clone();
                     }
                     if self.is_dragging_selection && i.pointer.primary_down() {
                         self.selection_drag_current = Some(pointer_pos);
-                    }
-                    if self.is_dragging_selection && !i.pointer.primary_down() {
                         if let (Some(start), Some(end)) =
                             (self.selection_drag_start, self.selection_drag_current)
                         {
                             let sel_rect = egui::Rect::from_two_pos(start, end);
-                            if !i.modifiers.ctrl {
+                            if i.modifiers.ctrl {
+                                self.selected_entries = self.selection_before_drag.clone();
+                            } else {
                                 self.selected_entries.clear();
                             }
                             for (name, rect) in &self.entry_rects {
@@ -1848,9 +1855,12 @@ impl eframe::App for RusplorerApp {
                                 }
                             }
                         }
+                    }
+                    if self.is_dragging_selection && !i.pointer.primary_down() {
                         self.is_dragging_selection = false;
                         self.selection_drag_start = None;
                         self.selection_drag_current = None;
+                        self.selection_before_drag.clear();
                     }
                 }
             });
