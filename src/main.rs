@@ -163,6 +163,192 @@ fn read_files_from_clipboard() -> Result<Vec<PathBuf>, Box<dyn std::error::Error
     }
 }
 
+/// Initiate an OLE drag-and-drop of the given files out to other applications (e.g. Explorer).
+/// Blocks until the user drops or cancels.  Returns `true` when the target performed a *move*
+/// (so we should refresh our listing).
+#[cfg(windows)]
+fn ole_drag_files_out(files: &[PathBuf]) -> bool {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::{implement, HRESULT};
+    use windows::Win32::Foundation::{BOOL, E_NOTIMPL, S_OK};
+    use windows::Win32::System::Com::{
+        IDataObject, IDataObject_Impl, FORMATETC, STGMEDIUM,
+        TYMED_HGLOBAL,
+    };
+    use windows::Win32::System::Memory::{
+        GlobalAlloc, GlobalLock, GlobalUnlock, GLOBAL_ALLOC_FLAGS,
+    };
+    use windows::Win32::System::Ole::{
+        DoDragDrop, IDropSource, IDropSource_Impl, DROPEFFECT, DROPEFFECT_COPY,
+        DROPEFFECT_MOVE, DROPEFFECT_NONE,
+    };
+    use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
+
+    const CF_HDROP_RAW: u16 = 15;
+    const MK_LBUTTON: u32 = 0x0001;
+    const DRAGDROP_S_DROP: HRESULT = HRESULT(0x00040100_i32);
+    const DRAGDROP_S_CANCEL: HRESULT = HRESULT(0x00040101_i32);
+    const DRAGDROP_S_USEDEFAULTCURSORS: HRESULT = HRESULT(0x00040102_i32);
+
+    // ── IDropSource ──────────────────────────────────────────────────────
+    #[implement(IDropSource)]
+    struct DropSource;
+
+    impl IDropSource_Impl for DropSource_Impl {
+        fn QueryContinueDrag(&self, fescapepressed: BOOL, grfkeystate: MODIFIERKEYS_FLAGS) -> HRESULT {
+            if fescapepressed.as_bool() {
+                DRAGDROP_S_CANCEL
+            } else if grfkeystate.0 & MK_LBUTTON == 0 {
+                DRAGDROP_S_DROP
+            } else {
+                S_OK
+            }
+        }
+        fn GiveFeedback(&self, _dweffect: DROPEFFECT) -> HRESULT {
+            DRAGDROP_S_USEDEFAULTCURSORS
+        }
+    }
+
+    // ── IDataObject (CF_HDROP only) ──────────────────────────────────────
+    #[implement(IDataObject)]
+    struct HdropData {
+        blob: Vec<u8>,
+    }
+
+    impl IDataObject_Impl for HdropData_Impl {
+        fn GetData(
+            &self,
+            pformatetcin: *const FORMATETC,
+        ) -> windows::core::Result<STGMEDIUM> {
+            unsafe {
+                let fmt = &*pformatetcin;
+                if fmt.cfFormat != CF_HDROP_RAW {
+                    return Err(windows::core::Error::from_hresult(E_NOTIMPL));
+                }
+                let hmem = GlobalAlloc(
+                    GLOBAL_ALLOC_FLAGS(0x0042), // GMEM_MOVEABLE | GMEM_ZEROINIT
+                    self.blob.len(),
+                )?;
+                let ptr = GlobalLock(hmem) as *mut u8;
+                if ptr.is_null() {
+                    return Err(windows::core::Error::from_hresult(E_NOTIMPL));
+                }
+                std::ptr::copy_nonoverlapping(self.blob.as_ptr(), ptr, self.blob.len());
+                let _ = GlobalUnlock(hmem);
+                let mut medium: STGMEDIUM = std::mem::zeroed();
+                medium.tymed = TYMED_HGLOBAL.0 as u32;
+                medium.u.hGlobal = hmem;
+                Ok(medium)
+            }
+        }
+        fn GetDataHere(
+            &self,
+            _: *const FORMATETC,
+            _: *mut STGMEDIUM,
+        ) -> windows::core::Result<()> {
+            Err(windows::core::Error::from_hresult(E_NOTIMPL))
+        }
+        fn QueryGetData(&self, pformatetc: *const FORMATETC) -> HRESULT {
+            unsafe {
+                if (*pformatetc).cfFormat == CF_HDROP_RAW {
+                    S_OK
+                } else {
+                    HRESULT(0x80040064_u32 as i32) // DV_E_FORMATETC
+                }
+            }
+        }
+        fn GetCanonicalFormatEtc(
+            &self,
+            _: *const FORMATETC,
+            _: *mut FORMATETC,
+        ) -> HRESULT {
+            E_NOTIMPL
+        }
+        fn SetData(
+            &self,
+            _: *const FORMATETC,
+            _: *const STGMEDIUM,
+            _: BOOL,
+        ) -> windows::core::Result<()> {
+            Err(windows::core::Error::from_hresult(E_NOTIMPL))
+        }
+        fn EnumFormatEtc(
+            &self,
+            dwdirection: u32,
+        ) -> windows::core::Result<windows::Win32::System::Com::IEnumFORMATETC> {
+            use windows::Win32::UI::Shell::SHCreateStdEnumFmtEtc;
+            if dwdirection != 1 { // DATADIR_GET
+                return Err(windows::core::Error::from_hresult(E_NOTIMPL));
+            }
+            let fmt = FORMATETC {
+                cfFormat: CF_HDROP_RAW,
+                ptd: std::ptr::null_mut(),
+                dwAspect: 1, // DVASPECT_CONTENT
+                lindex: -1,
+                tymed: TYMED_HGLOBAL.0 as u32,
+            };
+            unsafe { SHCreateStdEnumFmtEtc(&[fmt]) }
+        }
+        fn DAdvise(
+            &self,
+            _: *const FORMATETC,
+            _: u32,
+            _: Option<&windows::Win32::System::Com::IAdviseSink>,
+        ) -> windows::core::Result<u32> {
+            Err(windows::core::Error::from_hresult(E_NOTIMPL))
+        }
+        fn DUnadvise(&self, _: u32) -> windows::core::Result<()> {
+            Err(windows::core::Error::from_hresult(E_NOTIMPL))
+        }
+        fn EnumDAdvise(
+            &self,
+        ) -> windows::core::Result<windows::Win32::System::Com::IEnumSTATDATA> {
+            Err(windows::core::Error::from_hresult(E_NOTIMPL))
+        }
+    }
+
+    // ── Build HDROP blob ─────────────────────────────────────────────────
+    let mut wide_chars: Vec<u16> = Vec::new();
+    for file in files {
+        let wide: Vec<u16> = OsStr::new(file.as_os_str())
+            .encode_wide()
+            .chain(std::iter::once(0u16))
+            .collect();
+        wide_chars.extend_from_slice(&wide);
+    }
+    wide_chars.push(0u16); // double-null terminator
+
+    let dropfiles_size: usize = 20;
+    let file_data_size = wide_chars.len() * 2;
+    let total_size = dropfiles_size + file_data_size;
+
+    let mut blob = vec![0u8; total_size];
+    blob[0..4].copy_from_slice(&20u32.to_le_bytes());   // pFiles
+    blob[16..20].copy_from_slice(&1u32.to_le_bytes());  // fWide
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            wide_chars.as_ptr() as *const u8,
+            blob.as_mut_ptr().add(dropfiles_size),
+            file_data_size,
+        );
+    }
+
+    // ── Perform OLE drag ─────────────────────────────────────────────────
+    let data_obj: IDataObject = HdropData { blob }.into();
+    let source: IDropSource = DropSource.into();
+    let mut effect = DROPEFFECT_NONE;
+    let hr = unsafe {
+        DoDragDrop(
+            &data_obj,
+            &source,
+            DROPEFFECT_COPY | DROPEFFECT_MOVE,
+            &mut effect,
+        )
+    };
+    hr == DRAGDROP_S_DROP && effect == DROPEFFECT_MOVE
+}
+
 /// Resolve a Windows .lnk shortcut file to its target path
 #[cfg(windows)]
 fn resolve_lnk(path: &Path) -> Option<PathBuf> {
@@ -356,7 +542,140 @@ fn try_move_to_rusplorer_desktop() -> bool {
     }
 }
 
+/// Returns the IDropTarget COM object (must be kept alive for the duration of the session).
+/// Returns None if registration failed.
+#[cfg(windows)]
+fn register_ole_drop_target(
+    hwnd_raw: *mut std::ffi::c_void,
+    sender: std::sync::mpsc::Sender<Vec<PathBuf>>,
+) -> Option<windows::Win32::System::Ole::IDropTarget> {
+    use windows::core::implement;
+    use windows::Win32::Foundation::{HWND, POINTL, S_OK};
+    use windows::Win32::System::Com::{IDataObject, FORMATETC, TYMED_HGLOBAL};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    use windows::Win32::System::Ole::{
+        IDropTarget, IDropTarget_Impl, RegisterDragDrop, RevokeDragDrop,
+        DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_NONE,
+    };
+    use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
+
+    const CF_HDROP_RAW: u16 = 15;
+
+    #[implement(IDropTarget)]
+    struct DropTarget {
+        sender: std::sync::mpsc::Sender<Vec<PathBuf>>,
+    }
+
+    impl IDropTarget_Impl for DropTarget_Impl {
+        fn DragEnter(
+            &self,
+            pdataobj: Option<&IDataObject>,
+            _grfkeystate: MODIFIERKEYS_FLAGS,
+            _pt: &POINTL,
+            pdweffect: *mut DROPEFFECT,
+        ) -> windows::core::Result<()> {
+            unsafe {
+                let ok = if let Some(obj) = pdataobj {
+                    let fmt = FORMATETC {
+                        cfFormat: CF_HDROP_RAW,
+                        ptd: std::ptr::null_mut(),
+                        dwAspect: 1,
+                        lindex: -1,
+                        tymed: TYMED_HGLOBAL.0 as u32,
+                    };
+                    obj.QueryGetData(&fmt) == S_OK
+                } else {
+                    false
+                };
+                *pdweffect = if ok { DROPEFFECT_COPY } else { DROPEFFECT_NONE };
+            }
+            Ok(())
+        }
+
+        fn DragOver(
+            &self,
+            _grfkeystate: MODIFIERKEYS_FLAGS,
+            _pt: &POINTL,
+            pdweffect: *mut DROPEFFECT,
+        ) -> windows::core::Result<()> {
+            unsafe { *pdweffect = DROPEFFECT_COPY; }
+            Ok(())
+        }
+
+        fn DragLeave(&self) -> windows::core::Result<()> {
+            Ok(())
+        }
+
+        fn Drop(
+            &self,
+            pdataobj: Option<&IDataObject>,
+            _grfkeystate: MODIFIERKEYS_FLAGS,
+            _pt: &POINTL,
+            pdweffect: *mut DROPEFFECT,
+        ) -> windows::core::Result<()> {
+            unsafe {
+                *pdweffect = DROPEFFECT_NONE;
+                let obj = match pdataobj { Some(o) => o, None => return Ok(()) };
+                let fmt = FORMATETC {
+                    cfFormat: CF_HDROP_RAW,
+                    ptd: std::ptr::null_mut(),
+                    dwAspect: 1,
+                    lindex: -1,
+                    tymed: TYMED_HGLOBAL.0 as u32,
+                };
+                let medium = match obj.GetData(&fmt) { Ok(m) => m, Err(_) => return Ok(()) };
+                let hmem = medium.u.hGlobal;
+                let locked = GlobalLock(hmem) as *const u8;
+                if locked.is_null() { return Ok(()); }
+
+                // Parse DROPFILES: pFiles (u32) at offset 0, fWide (u32) at offset 16
+                let pfiles = std::ptr::read_unaligned(locked as *const u32) as usize;
+                let fwide  = std::ptr::read_unaligned(locked.add(16) as *const u32);
+                let mut files: Vec<PathBuf> = Vec::new();
+                if fwide != 0 {
+                    let mut ptr = locked.add(pfiles) as *const u16;
+                    loop {
+                        let start = ptr;
+                        let mut len = 0usize;
+                        while *ptr != 0 { ptr = ptr.add(1); len += 1; }
+                        if len == 0 { break; }
+                        let s = String::from_utf16_lossy(
+                            std::slice::from_raw_parts(start, len));
+                        files.push(PathBuf::from(s));
+                        ptr = ptr.add(1);
+                    }
+                }
+                let _ = GlobalUnlock(hmem);
+
+                if !files.is_empty() {
+                    let _ = self.sender.send(files);
+                    *pdweffect = DROPEFFECT_COPY;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let drop_target: IDropTarget = DropTarget { sender }.into();
+    unsafe {
+        let hwnd = HWND(hwnd_raw);
+        // Remove any existing drop target (winit registers its own)
+        let _ = RevokeDragDrop(hwnd);
+        if RegisterDragDrop(hwnd, &drop_target).is_ok() {
+            Some(drop_target)
+        } else {
+            None
+        }
+    }
+}
+
 fn main() -> Result<(), eframe::Error> {
+    // Initialise OLE on the main thread so DoDragDrop works
+    #[cfg(windows)]
+    unsafe {
+        let _ = windows::Win32::System::Ole::OleInitialize(None);
+    }
+
     let mut options = eframe::NativeOptions::default();
     options.viewport.inner_size = Some(egui::vec2(660.0, 600.0));
     eframe::run_native(
@@ -539,6 +858,15 @@ struct RusplorerApp {
     // Virtual desktop placement on startup
     startup_vd_done: bool,
     startup_vd_attempts: u8,
+    // OLE drop-in channel: Explorer → Rusplorer
+    ole_drop_receiver: Option<std::sync::mpsc::Receiver<Vec<PathBuf>>>,
+    ole_drop_sender: Option<std::sync::mpsc::Sender<Vec<PathBuf>>>,
+    drop_target_registered: bool,
+    // Keep the COM IDropTarget alive for the lifetime of the app
+    #[cfg(windows)]
+    _ole_drop_target: Option<windows::Win32::System::Ole::IDropTarget>,
+    #[cfg(not(windows))]
+    _ole_drop_target: Option<()>,
 }
 
 #[derive(Clone)]
@@ -578,6 +906,7 @@ impl Default for RusplorerApp {
             .map(|(k, v)| (PathBuf::from(k), *v))
             .collect();
         let sort_column = config.sort_column.clone();
+        let (ole_tx, ole_rx) = std::sync::mpsc::channel::<Vec<PathBuf>>();
         let sort_ascending = config.sort_ascending;
         let favorites: Vec<PathBuf> = config.favorites.iter().map(PathBuf::from).collect();
 
@@ -646,6 +975,10 @@ impl Default for RusplorerApp {
             tree_children_cache: HashMap::new(),
             startup_vd_done: false,
             startup_vd_attempts: 0,
+            ole_drop_receiver: Some(ole_rx),
+            ole_drop_sender: Some(ole_tx),
+            drop_target_registered: false,
+            _ole_drop_target: None,
         };
 
         // Pre-expand the tree down to the current folder so it's visible on startup.
@@ -1397,6 +1730,34 @@ impl eframe::App for RusplorerApp {
             { self.startup_vd_done = true; }
         }
 
+        // Register OLE IDropTarget on our HWND so Explorer can drag files in
+        #[cfg(windows)]
+        if !self.drop_target_registered {
+            if let Some(tx) = self.ole_drop_sender.take() {
+                let wide_title: Vec<u16> = OsStr::new("Rusplorer")
+                    .encode_wide()
+                    .chain(std::iter::once(0))
+                    .collect();
+                unsafe {
+                    let hwnd_raw = winapi::um::winuser::FindWindowW(
+                        std::ptr::null(), wide_title.as_ptr());
+                    if !hwnd_raw.is_null() {
+                        let hwnd_ptr = hwnd_raw as *mut _;
+                        if let Some(target) = register_ole_drop_target(hwnd_ptr, tx) {
+                            self._ole_drop_target = Some(target);
+                            self.drop_target_registered = true;
+                        } else {
+                            // Registration failed — don't retry (probably no OLE)
+                            self.drop_target_registered = true;
+                        }
+                    } else {
+                        // HWND not ready yet — put sender back
+                        self.ole_drop_sender = Some(tx);
+                    }
+                }
+            }
+        }
+
         // Check if archive compression finished
         if let Some(ref rx) = self.archive_done_receiver {
             if let Ok(archive_name) = rx.try_recv() {
@@ -1424,6 +1785,32 @@ impl eframe::App for RusplorerApp {
         if is_focused != self.is_focused {
             self.is_focused = is_focused;
             self.pause_token.store(!is_focused, Ordering::SeqCst);
+        }
+
+        // Receive OLE drops from Explorer (drag-in)
+        #[cfg(windows)]
+        {
+            let incoming: Vec<Vec<PathBuf>> = self.ole_drop_receiver
+                .as_ref()
+                .map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).collect())
+                .unwrap_or_default();
+            for files in incoming {
+                if !files.is_empty() {
+                    let dest = self.current_path.clone();
+                    for f in &files {
+                        if let Some(name) = f.file_name() {
+                            let dst = dest.join(name);
+                            if f.is_dir() {
+                                let _ = copy_dir_recursive(f, &dst);
+                            } else {
+                                let _ = std::fs::copy(f, &dst);
+                            }
+                        }
+                    }
+                    self.refresh_contents();
+                    ctx.request_repaint();
+                }
+            }
         }
 
         // Handle drag and drop
@@ -2538,7 +2925,36 @@ impl eframe::App for RusplorerApp {
 
             // Handle drag-and-drop: detect release and perform move
             if self.dnd_active {
-                if !ctx.input(|i| i.pointer.primary_down()) {
+                let pointer_down = ctx.input(|i| i.pointer.primary_down());
+                let hover_pos = ctx.input(|i| i.pointer.hover_pos());
+
+                // Cursor left the window while dragging → OLE drag-and-drop to Explorer
+                #[cfg(windows)]
+                {
+                    let screen_rect = ctx.input(|i| i.screen_rect());
+                    let cursor_outside = match hover_pos {
+                        Some(pos) => !screen_rect.contains(pos),
+                        None => true,
+                    };
+                    if pointer_down && cursor_outside && !self.dnd_sources.is_empty() {
+                        let sources = self.dnd_sources.clone();
+                        // Reset internal DnD state first
+                        self.dnd_active = false;
+                        self.dnd_sources.clear();
+                        self.dnd_label.clear();
+                        self.dnd_start_pos = None;
+                        self.dnd_drop_target = None;
+                        self.dnd_drop_target_prev = None;
+                        // Blocking OLE drag — pumps Windows messages until drop/cancel
+                        let was_move = ole_drag_files_out(&sources);
+                        if was_move {
+                            self.selected_entries.clear();
+                        }
+                        self.refresh_contents();
+                    }
+                }
+
+                if !pointer_down && self.dnd_active {
                     if let Some(dest) = self.dnd_drop_target.take().filter(|d| d.is_dir()) {
                         let sources: Vec<PathBuf> = self.dnd_sources
                             .iter()
