@@ -525,7 +525,8 @@ struct RusplorerApp {
     dnd_sources: Vec<PathBuf>,
     dnd_label: String,
     dnd_start_pos: Option<egui::Pos2>,
-    dnd_drop_target: Option<String>,
+    dnd_drop_target: Option<PathBuf>,
+    dnd_drop_target_prev: Option<PathBuf>, // previous frame's value, used for color display
     dirs_done: HashSet<PathBuf>,
     dirs_done_receiver: Option<Receiver<PathBuf>>,
     show_date_columns: HashMap<PathBuf, bool>,
@@ -634,6 +635,7 @@ impl Default for RusplorerApp {
             dnd_label: String::new(),
             dnd_start_pos: None,
             dnd_drop_target: None,
+            dnd_drop_target_prev: None,
             dirs_done: HashSet::new(),
             dirs_done_receiver: None,
             show_date_columns,
@@ -1133,6 +1135,10 @@ fn render_tree_node(
     nav: &mut Option<PathBuf>,
     current_path: &PathBuf,
     depth: usize,
+    dnd_active: bool,
+    dnd_sources: &[PathBuf],
+    dnd_drop_target: &Option<PathBuf>,
+    hovered_drop: &mut Option<PathBuf>,
 ) {
     let is_expanded = expanded.contains(path);
     let display_name = path
@@ -1172,6 +1178,10 @@ fn render_tree_node(
         }
     };
 
+    let is_tree_drop_target = dnd_active
+        && dnd_drop_target.as_ref() == Some(path)
+        && !is_current; // can't drop onto the current folder (it's the source parent)
+
     let response = ui.allocate_ui_with_layout(
         egui::vec2(max_w, 16.0),
         egui::Layout::left_to_right(egui::Align::Center),
@@ -1181,14 +1191,22 @@ fn render_tree_node(
             if indent > 0.0 {
                 ui.add_space(indent);
             }
-            let base_text = egui::RichText::new(&truncated_name)
-                .color(if is_current { egui::Color32::WHITE } else { egui::Color32::BLACK });
+            let text_color = if is_current || is_tree_drop_target {
+                egui::Color32::WHITE
+            } else {
+                egui::Color32::BLACK
+            };
+            let base_text = egui::RichText::new(&truncated_name).color(text_color);
             let label_text = if is_ancestor || is_current {
                 base_text.font(font_id.clone())
             } else {
                 base_text
             };
-            let button = if is_current {
+            let button = if is_tree_drop_target {
+                egui::Button::new(label_text)
+                    .fill(egui::Color32::from_rgb(80, 200, 80))
+                    .frame(false)
+            } else if is_current {
                 egui::Button::new(label_text)
                     .fill(egui::Color32::from_rgb(100, 150, 255))
                     .frame(false)
@@ -1204,6 +1222,17 @@ fn render_tree_node(
             ui.add(button)
         },
     );
+    // Record rect for next-frame DnD drop detection
+    // Instead, detect hover directly this frame
+    let is_valid_drop = dnd_active && !is_current && !dnd_sources.contains(path);
+    // Use raw rect check — response.inner.hovered() is suppressed while a mouse button is held
+    if is_valid_drop {
+        if let Some(pos) = ui.ctx().input(|i| i.pointer.hover_pos()) {
+            if response.inner.rect.contains(pos) {
+                *hovered_drop = Some(path.clone());
+            }
+        }
+    }
     if response.inner
             .on_hover_text(path.to_string_lossy())
             .clicked()
@@ -1228,7 +1257,7 @@ fn render_tree_node(
     if is_expanded {
         if let Some(children) = children_cache.get(path).cloned() {
             for child in &children {
-                render_tree_node(ui, child, expanded, children_cache, nav, current_path, depth + 1);
+                render_tree_node(ui, child, expanded, children_cache, nav, current_path, depth + 1, dnd_active, dnd_sources, dnd_drop_target, hovered_drop);
             }
         }
     }
@@ -1348,6 +1377,15 @@ impl RusplorerApp {
 
 impl eframe::App for RusplorerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Rotate drop target: prev holds last frame's value for color display;
+        // current is reset to None so tree / breadcrumbs / table can detect fresh this frame.
+        if self.dnd_active {
+            self.dnd_drop_target_prev = self.dnd_drop_target.clone();
+            self.dnd_drop_target = None;
+        } else {
+            self.dnd_drop_target_prev = None;
+        }
+
         // Move own window to "Rusplorer" virtual desktop on startup (in-process: no E_ACCESSDENIED)
         if !self.startup_vd_done {
             self.startup_vd_attempts += 1;
@@ -1748,6 +1786,10 @@ impl eframe::App for RusplorerApp {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("📁 Tree").small());
                 });
+                let dnd_active = self.dnd_active;
+                let dnd_drop_target = self.dnd_drop_target_prev.clone(); // use prev for display
+                let dnd_sources: Vec<PathBuf> = self.dnd_sources.clone();
+                let mut tree_hovered_drop: Option<PathBuf> = None;
                 egui::ScrollArea::vertical()
                     .id_source("tree_scroll")
                     .auto_shrink([false, false])
@@ -1769,9 +1811,16 @@ impl eframe::App for RusplorerApp {
                                 &mut nav_from_panel,
                                 &self.current_path.clone(),
                                 0,
+                                dnd_active,
+                                &dnd_sources,
+                                &dnd_drop_target,
+                                &mut tree_hovered_drop,
                             );
                         }
                     });
+                if let Some(target) = tree_hovered_drop {
+                    self.dnd_drop_target = Some(target);
+                }
             });
 
         if let Some(path) = nav_from_panel {
@@ -1847,13 +1896,31 @@ impl eframe::App for RusplorerApp {
                         // Current directory - not clickable, just plain text
                         ui.label(name);
                     } else {
-                        // Parent directories - clickable pills
+                        // Parent directories - clickable pills; also valid DnD drop targets
+                        let is_bc_drop = self.dnd_active
+                            && self.dnd_drop_target_prev.as_ref() == Some(path);
+                        let fill = if is_bc_drop {
+                            egui::Color32::from_rgb(80, 200, 80)
+                        } else {
+                            egui::Color32::from_rgb(255, 245, 150)
+                        };
+                        let text_color = if is_bc_drop { egui::Color32::WHITE } else { egui::Color32::BLACK };
                         let button = egui::Button::new(
-                            egui::RichText::new(name).color(egui::Color32::BLACK),
+                            egui::RichText::new(name).color(text_color),
                         )
-                        .fill(egui::Color32::from_rgb(255, 245, 150))
+                        .fill(fill)
                         .frame(true);
-                        if ui.add(button).clicked() {
+                        let resp = ui.add(button);
+                        // Same-frame DnD detection for breadcrumbs (use raw rect check;
+                        // resp.hovered() is suppressed while a mouse button is held)
+                        if self.dnd_active && !self.dnd_sources.contains(path) {
+                            if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
+                                if resp.rect.contains(pos) {
+                                    self.dnd_drop_target = Some(path.clone());
+                                }
+                            }
+                        }
+                        if resp.clicked() {
                             navigate_to_path = Some(path.clone());
                         }
                     }
@@ -1882,28 +1949,31 @@ impl eframe::App for RusplorerApp {
                 .unwrap_or(false);
             let mut sort_changed = false;
 
-            // Before clearing rects, use last frame's rects to set drop target for this frame
+            // Same-frame DnD detection for file-table entries
             if self.dnd_active {
                 let cursor = ctx.input(|i| i.pointer.hover_pos());
-                self.dnd_drop_target = cursor.and_then(|pos| {
-                    self.entry_rects.iter().find_map(|(name, rect)| {
+                if let Some(pos) = cursor {
+                    if let Some(found) = self.entry_rects.iter().find_map(|(name, rect)| {
                         if rect.contains(pos) {
-                            // Only dirs (and [..]) are valid, not drag sources
-                            let full = self.current_path.join(name);
                             let is_parent = name.starts_with("[..]");
+                            let full = if is_parent {
+                                self.current_path.parent()?.to_path_buf()
+                            } else {
+                                self.current_path.join(name)
+                            };
                             let is_dir = is_parent || full.is_dir();
-                            let is_source = !is_parent && self.dnd_sources.contains(&full);
-                            if is_dir && !is_source { Some(name.clone()) } else { None }
+                            let is_source = self.dnd_sources.contains(&full);
+                            if is_dir && !is_source { Some(full) } else { None }
                         } else {
                             None
                         }
-                    })
-                });
-            } else {
-                self.dnd_drop_target = None;
+                    }) {
+                        self.dnd_drop_target = Some(found);
+                    }
+                }
             }
 
-            // Clear entry rects for this frame
+            // Clear rect map for this frame
             self.entry_rects.clear();
             self.any_button_hovered = false;
 
@@ -2143,9 +2213,14 @@ impl eframe::App for RusplorerApp {
                         };
 
                         // Determine if this folder is a drop target
+                        let entry_abs = if entry.name.starts_with("[..]") {
+                            self.current_path.parent().map(|p| p.to_path_buf())
+                        } else {
+                            Some(self.current_path.join(&entry.name))
+                        };
                         let is_drop_target = self.dnd_active
                             && entry.is_dir
-                            && self.dnd_drop_target.as_deref() == Some(&entry.name);
+                            && entry_abs.as_ref() == self.dnd_drop_target_prev.as_ref();
 
                         // Name column
                         row.col(|ui| {
@@ -2464,23 +2539,16 @@ impl eframe::App for RusplorerApp {
             // Handle drag-and-drop: detect release and perform move
             if self.dnd_active {
                 if !ctx.input(|i| i.pointer.primary_down()) {
-                    if let Some(target_name) = self.dnd_drop_target.take() {
-                        let dest = if target_name.starts_with("[..]") {
-                            self.current_path.parent().map(|p| p.to_path_buf())
-                        } else {
-                            Some(self.current_path.join(&target_name))
-                        };
-                        if let Some(dest) = dest.filter(|d| d.is_dir()) {
-                            let sources: Vec<PathBuf> = self.dnd_sources
-                                .iter()
-                                .filter(|s| **s != dest)
-                                .cloned()
-                                .collect();
-                            if !sources.is_empty() {
-                                let _ = Self::move_files(&sources, &dest);
-                                self.selected_entries.clear();
-                                self.refresh_contents();
-                            }
+                    if let Some(dest) = self.dnd_drop_target.take().filter(|d| d.is_dir()) {
+                        let sources: Vec<PathBuf> = self.dnd_sources
+                            .iter()
+                            .filter(|s| **s != dest)
+                            .cloned()
+                            .collect();
+                        if !sources.is_empty() {
+                            let _ = Self::move_files(&sources, &dest);
+                            self.selected_entries.clear();
+                            self.refresh_contents();
                         }
                     }
                     self.dnd_active = false;
