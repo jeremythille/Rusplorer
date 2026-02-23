@@ -1,19 +1,20 @@
 #!/usr/bin/env pwsh
 
-# Get the directory where this script is located
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-
-# Change to the script directory (which should be source_code/)
-Set-Location $scriptDir
-
-# Set rootPath to the parent directory (where the repository root is)
-$rootPath = Split-Path -Parent $scriptDir
-
-# Verify we have Cargo.toml
-if (-not (Test-Path "Cargo.toml")) {
-    Write-Host "Error: Cargo.toml not found in script directory: $scriptDir"
-    Read-Host "Press Enter to exit"
-    exit 1
+# Handle both running from root or from within source_code/
+if ((Split-Path -Leaf $PWD) -eq "source_code") {
+    # Already in source_code/
+    $rootPath = Split-Path -Parent $PWD
+} else {
+    # Running from root, go into source_code/
+    $sourceCodePath = Join-Path $PWD "source_code"
+    if (Test-Path $sourceCodePath) {
+        Set-Location $sourceCodePath
+        $rootPath = Split-Path -Parent $PWD
+    } else {
+        Write-Host "Error: source_code/ folder not found!"
+        Read-Host "Press Enter to exit"
+        exit 1
+    }
 }
 
 # Kill rusplorer.exe if it's running
