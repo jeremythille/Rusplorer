@@ -1929,18 +1929,26 @@ impl eframe::App for RusplorerApp {
                 let x_down = ctrl_down && (unsafe { GetAsyncKeyState(VK_X) } as u16 & 0x8000 != 0);
                 let del_down = unsafe { GetAsyncKeyState(VK_DELETE) } as u16 & 0x8000 != 0;
 
-                // Edge detection: only trigger on press (transition from not-pressed to pressed)
-                let copy_pressed = c_down && !self.prev_ctrl_c_down;
-                let paste_pressed = v_down && !self.prev_ctrl_v_down;
-                let cut_pressed = x_down && !self.prev_ctrl_x_down;
-                let delete_pressed = del_down && !self.prev_del_down;
-
+                // Always update prev state to avoid a false edge-trigger when we regain focus
+                let prev_c = self.prev_ctrl_c_down;
+                let prev_v = self.prev_ctrl_v_down;
+                let prev_x = self.prev_ctrl_x_down;
+                let prev_d = self.prev_del_down;
                 self.prev_ctrl_c_down = c_down;
                 self.prev_ctrl_v_down = v_down;
                 self.prev_ctrl_x_down = x_down;
                 self.prev_del_down = del_down;
 
-                (copy_pressed, cut_pressed, paste_pressed, delete_pressed)
+                // Only fire actions when Rusplorer actually has focus
+                if self.is_focused {
+                    let copy_pressed   = c_down   && !prev_c;
+                    let paste_pressed  = v_down   && !prev_v;
+                    let cut_pressed    = x_down   && !prev_x;
+                    let delete_pressed = del_down && !prev_d;
+                    (copy_pressed, cut_pressed, paste_pressed, delete_pressed)
+                } else {
+                    (false, false, false, false)
+                }
             }
             #[cfg(not(windows))]
             {
