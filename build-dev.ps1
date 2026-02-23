@@ -13,6 +13,7 @@ cargo build
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "`nBuild successful!`nLaunching Rusplorer...`n"
+    # Rusplorer moves itself to the "Rusplorer" virtual desktop on startup (in-process).
     Start-Process ".\target\debug\rusplorer.exe"
 } else {
     Write-Host "Build failed!"

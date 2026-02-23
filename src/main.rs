@@ -260,13 +260,135 @@ fn calculate_dir_size_progressive(
     true
 }
 
+/// Parse a Windows GUID string like "{DA9C62FD-3F94-400B-87B5-A43B9EB6C70D}" into a GUID struct.
+#[cfg(windows)]
+fn parse_guid(s: &str) -> Option<windows::core::GUID> {
+    let s = s.trim_matches(|c| c == '{' || c == '}');
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 5 { return None; }
+    let data1 = u32::from_str_radix(parts[0], 16).ok()?;
+    let data2 = u16::from_str_radix(parts[1], 16).ok()?;
+    let data3 = u16::from_str_radix(parts[2], 16).ok()?;
+    let d3    = u16::from_str_radix(parts[3], 16).ok()?;
+    let d4    = u64::from_str_radix(parts[4], 16).ok()?;
+    Some(windows::core::GUID {
+        data1, data2, data3,
+        data4: [
+            (d3 >> 8) as u8, (d3 & 0xFF) as u8,
+            ((d4 >> 40) & 0xFF) as u8, ((d4 >> 32) & 0xFF) as u8,
+            ((d4 >> 24) & 0xFF) as u8, ((d4 >> 16) & 0xFF) as u8,
+            ((d4 >> 8)  & 0xFF) as u8, ( d4        & 0xFF) as u8,
+        ],
+    })
+}
+
+/// Look up the registry for a virtual desktop named "Rusplorer" and return its GUID.
+#[cfg(windows)]
+fn find_rusplorer_desktop_guid() -> Option<windows::core::GUID> {
+    use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let desktops = hkcu
+        .open_subkey(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VirtualDesktops\Desktops")
+        .ok()?;
+    for key_name in desktops.enum_keys().flatten() {
+        if let Ok(subkey) = desktops.open_subkey(&key_name) {
+            let name: String = subkey.get_value("Name").unwrap_or_default();
+            if name == "Rusplorer" {
+                return parse_guid(&key_name);
+            }
+        }
+    }
+    None
+}
+
+/// Move own window to the "Rusplorer" virtual desktop.
+/// Uses the public IVirtualDesktopManager COM API — works in-process (no E_ACCESSDENIED).
+/// Returns true if the move succeeded OR if no "Rusplorer" desktop exists (no point retrying).
+#[cfg(windows)]
+fn try_move_to_rusplorer_desktop() -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize,
+        CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::IVirtualDesktopManager;
+
+    let desktop_guid = match find_rusplorer_desktop_guid() {
+        Some(g) => g,
+        None => return true, // No "Rusplorer" desktop — nothing to do, stop retrying
+    };
+
+    let wide_title: Vec<u16> = OsStr::new("Rusplorer")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let hwnd_raw = winapi::um::winuser::FindWindowW(std::ptr::null(), wide_title.as_ptr());
+        if hwnd_raw.is_null() {
+            return false; // Window not visible yet — retry later
+        }
+        let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
+
+        let coin_hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+
+        // CLSID_VirtualDesktopManager = {AA509086-5CA9-4C25-8F95-589D3C07B48A}
+        const CLSID_VDM: windows::core::GUID = windows::core::GUID {
+            data1: 0xAA509086,
+            data2: 0x5CA9,
+            data3: 0x4C25,
+            data4: [0x8F, 0x95, 0x58, 0x9D, 0x3C, 0x07, 0xB4, 0x8A],
+        };
+
+        let result = (|| -> Option<bool> {
+            let mgr: IVirtualDesktopManager =
+                CoCreateInstance(&CLSID_VDM, None, CLSCTX_LOCAL_SERVER).ok()?;
+            mgr.MoveWindowToDesktop(hwnd, &desktop_guid).ok()?;
+            Some(true)
+        })()
+        .unwrap_or(false);
+
+        if coin_hr.is_ok() {
+            CoUninitialize();
+        }
+        result
+    }
+}
+
 fn main() -> Result<(), eframe::Error> {
     let mut options = eframe::NativeOptions::default();
-    options.viewport.inner_size = Some(egui::vec2(400.0, 600.0));
+    options.viewport.inner_size = Some(egui::vec2(660.0, 600.0));
     eframe::run_native(
         "Rusplorer",
         options,
         Box::new(|cc| {
+            // Embed Iosevka Aile Regular + Bold (subsetted) at compile time
+            let mut fonts = egui::FontDefinitions::default();
+
+            fonts.font_data.insert(
+                "IosevkaAile-Regular".to_owned(),
+                egui::FontData::from_static(include_bytes!("fonts/IosevkaAile-Regular.ttf")),
+            );
+            fonts.font_data.insert(
+                "IosevkaAile-Bold".to_owned(),
+                egui::FontData::from_static(include_bytes!("fonts/IosevkaAile-Bold.ttf")),
+            );
+            // Replace the default proportional font with Iosevka Aile Regular
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "IosevkaAile-Regular".to_owned());
+            // Register Bold under a named family used in the tree
+            fonts
+                .families
+                .entry(egui::FontFamily::Name("Bold".into()))
+                .or_default()
+                .insert(0, "IosevkaAile-Bold".to_owned());
+
+            cc.egui_ctx.set_fonts(fonts);
+
             let mut style = (*cc.egui_ctx.style()).clone();
             // Set 11pt font size for all text styles
             for (_, font_id) in &mut style.text_styles {
@@ -303,6 +425,8 @@ struct Config {
     sort_column: SortColumn,
     #[serde(default = "default_sort_ascending")]
     sort_ascending: bool,
+    #[serde(default)]
+    favorites: Vec<String>,
 }
 
 fn default_sort_column() -> SortColumn {
@@ -334,6 +458,7 @@ impl Config {
             show_date_columns: HashMap::new(),
             sort_column: SortColumn::Name,
             sort_ascending: true,
+            favorites: Vec::new(),
         }
     }
 
@@ -406,6 +531,13 @@ struct RusplorerApp {
     show_date_columns: HashMap<PathBuf, bool>,
     sort_column: SortColumn,
     sort_ascending: bool,
+    // Left panel
+    favorites: Vec<PathBuf>,
+    tree_expanded: HashSet<PathBuf>,
+    tree_children_cache: HashMap<PathBuf, Vec<PathBuf>>,
+    // Virtual desktop placement on startup
+    startup_vd_done: bool,
+    startup_vd_attempts: u8,
 }
 
 #[derive(Clone)]
@@ -446,6 +578,7 @@ impl Default for RusplorerApp {
             .collect();
         let sort_column = config.sort_column.clone();
         let sort_ascending = config.sort_ascending;
+        let favorites: Vec<PathBuf> = config.favorites.iter().map(PathBuf::from).collect();
 
         let mut app = Self {
             current_path,
@@ -506,7 +639,22 @@ impl Default for RusplorerApp {
             show_date_columns,
             sort_column,
             sort_ascending,
+            favorites,
+            tree_expanded: HashSet::new(),
+            tree_children_cache: HashMap::new(),
+            startup_vd_done: false,
+            startup_vd_attempts: 0,
         };
+
+        // Pre-expand the tree down to the current folder so it's visible on startup.
+        // Walk every ancestor (including current_path itself) from root downward.
+        let ancestors: Vec<PathBuf> = app.current_path.ancestors().map(|p| p.to_path_buf()).collect();
+        for ancestor in ancestors.into_iter().rev() {
+            let children = read_dir_children(&ancestor);
+            app.tree_children_cache.insert(ancestor.clone(), children);
+            app.tree_expanded.insert(ancestor);
+        }
+
         app.refresh_contents();
         app.start_file_watcher();
         app
@@ -752,6 +900,16 @@ impl RusplorerApp {
             self.refresh_contents();
             // Restart watcher for the new directory
             self.start_file_watcher();
+
+            // Keep tree in sync: expand ancestors down to the new folder
+            let ancestors: Vec<PathBuf> = self.current_path.ancestors().map(|p| p.to_path_buf()).collect();
+            for ancestor in ancestors.into_iter().rev() {
+                if !self.tree_children_cache.contains_key(&ancestor) {
+                    let children = read_dir_children(&ancestor);
+                    self.tree_children_cache.insert(ancestor.clone(), children);
+                }
+                self.tree_expanded.insert(ancestor);
+            }
         }
     }
 
@@ -953,6 +1111,129 @@ impl RusplorerApp {
     }
 }
 
+fn read_dir_children(path: &PathBuf) -> Vec<PathBuf> {
+    std::fs::read_dir(path)
+        .map(|entries| {
+            let mut children: Vec<PathBuf> = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.path())
+                .collect();
+            children.sort();
+            children
+        })
+        .unwrap_or_default()
+}
+
+fn render_tree_node(
+    ui: &mut egui::Ui,
+    path: &PathBuf,
+    expanded: &mut HashSet<PathBuf>,
+    children_cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
+    nav: &mut Option<PathBuf>,
+    current_path: &PathBuf,
+    depth: usize,
+) {
+    let is_expanded = expanded.contains(path);
+    let display_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string_lossy().to_string());
+
+    let indent = depth as f32 * 10.0;
+    let max_w = ui.available_width();
+    let is_current = path == current_path;
+    let is_ancestor = !is_current && current_path.ancestors().any(|a| a == path.as_path());
+
+    // Truncate display name to fit available width (prevents layout overflow)
+    let font_id = if is_ancestor || is_current {
+        egui::FontId::new(11.0, egui::FontFamily::Name("Bold".into()))
+    } else {
+        egui::FontId::new(11.0, egui::FontFamily::Proportional)
+    };
+    let btn_width = max_w - indent - 4.0; // padding
+    let truncated_name = {
+        let fonts = ui.fonts(|f| f.clone());
+        let full_w = fonts.layout_no_wrap(display_name.clone(), font_id.clone(), egui::Color32::WHITE).size().x;
+        if full_w <= btn_width || btn_width <= 0.0 {
+            display_name.clone()
+        } else {
+            let ellipsis = "…";
+            let mut truncated = display_name.clone();
+            while !truncated.is_empty() {
+                truncated.pop();
+                let candidate = format!("{}{}", truncated, ellipsis);
+                let w = fonts.layout_no_wrap(candidate.clone(), font_id.clone(), egui::Color32::WHITE).size().x;
+                if w <= btn_width {
+                    break;
+                }
+            }
+            format!("{}…", truncated)
+        }
+    };
+
+    let response = ui.allocate_ui_with_layout(
+        egui::vec2(max_w, 16.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_max_width(max_w);
+            ui.set_clip_rect(ui.max_rect());
+            if indent > 0.0 {
+                ui.add_space(indent);
+            }
+            let base_text = egui::RichText::new(&truncated_name)
+                .color(if is_current { egui::Color32::WHITE } else { egui::Color32::BLACK });
+            let label_text = if is_ancestor || is_current {
+                base_text.font(font_id.clone())
+            } else {
+                base_text
+            };
+            let button = if is_current {
+                egui::Button::new(label_text)
+                    .fill(egui::Color32::from_rgb(100, 150, 255))
+                    .frame(false)
+            } else if is_ancestor {
+                egui::Button::new(label_text)
+                    .fill(egui::Color32::from_rgb(255, 200, 60))
+                    .frame(false)
+            } else {
+                egui::Button::new(label_text)
+                    .fill(egui::Color32::from_rgb(255, 245, 150))
+                    .frame(false)
+            };
+            ui.add(button)
+        },
+    );
+    if response.inner
+            .on_hover_text(path.to_string_lossy())
+            .clicked()
+        {
+            // Toggle expand/collapse
+            if is_expanded {
+                expanded.remove(path);
+            } else {
+                expanded.insert(path.clone());
+                if !children_cache.contains_key(path) {
+                    let children = read_dir_children(path);
+                    children_cache.insert(path.clone(), children);
+                }
+            }
+            // Only navigate if this isn't already the current folder —
+            // navigate_to would re-expand everything and undo a collapse
+            if !is_current {
+                *nav = Some(path.clone());
+            }
+        }
+
+    if is_expanded {
+        if let Some(children) = children_cache.get(path).cloned() {
+            for child in &children {
+                render_tree_node(ui, child, expanded, children_cache, nav, current_path, depth + 1);
+            }
+        }
+    }
+}
+
 fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -1067,6 +1348,17 @@ impl RusplorerApp {
 
 impl eframe::App for RusplorerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Move own window to "Rusplorer" virtual desktop on startup (in-process: no E_ACCESSDENIED)
+        if !self.startup_vd_done {
+            self.startup_vd_attempts += 1;
+            #[cfg(windows)]
+            if try_move_to_rusplorer_desktop() || self.startup_vd_attempts >= 10 {
+                self.startup_vd_done = true;
+            }
+            #[cfg(not(windows))]
+            { self.startup_vd_done = true; }
+        }
+
         // Check if archive compression finished
         if let Some(ref rx) = self.archive_done_receiver {
             if let Ok(archive_name) = rx.try_recv() {
@@ -1381,6 +1673,111 @@ impl eframe::App for RusplorerApp {
             }
         }
 
+        // ── Left panel ────────────────────────────────────────────────────
+        let mut nav_from_panel: Option<PathBuf> = None;
+        egui::SidePanel::left("left_panel")
+            .exact_width(250.0)
+            .resizable(false)
+            .show(ctx, |ui| {
+                // ── Favorites ────────────────────────────────────────────
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("⭐ Favorites").small());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(egui::Button::new("+").small().frame(false))
+                            .on_hover_text("Add current folder to favorites")
+                            .clicked()
+                        {
+                            if !self.favorites.contains(&self.current_path) {
+                                self.favorites.push(self.current_path.clone());
+                                self.config.favorites = self
+                                    .favorites
+                                    .iter()
+                                    .map(|f| f.to_string_lossy().to_string())
+                                    .collect();
+                                self.config.save();
+                            }
+                        }
+                    });
+                });
+
+                let mut remove_fav: Option<usize> = None;
+                for (i, fav) in self.favorites.iter().enumerate() {
+                    let name = fav
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| fav.to_string_lossy().to_string());
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        let is_cur = *fav == self.current_path;
+                        let label = egui::RichText::new(&name)
+                            .small()
+                            .color(if is_cur { egui::Color32::WHITE } else { egui::Color32::BLACK });
+                        let btn = if is_cur {
+                            egui::Button::new(label).fill(egui::Color32::from_rgb(100, 150, 255)).frame(false)
+                        } else {
+                            egui::Button::new(label).fill(egui::Color32::from_rgb(255, 245, 150)).frame(false)
+                        };
+                        if ui
+                            .add(btn)
+                            .on_hover_text(fav.to_string_lossy())
+                            .clicked()
+                        {
+                            nav_from_panel = Some(fav.clone());
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add(egui::Button::new("×").small().frame(false)).clicked() {
+                                remove_fav = Some(i);
+                            }
+                        });
+                    });
+                }
+                if let Some(i) = remove_fav {
+                    self.favorites.remove(i);
+                    self.config.favorites = self
+                        .favorites
+                        .iter()
+                        .map(|f| f.to_string_lossy().to_string())
+                        .collect();
+                    self.config.save();
+                }
+
+                ui.separator();
+
+                // ── Folder tree ──────────────────────────────────────────
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("📁 Tree").small());
+                });
+                egui::ScrollArea::vertical()
+                    .id_source("tree_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.set_max_width(ui.available_width());
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let drives: Vec<PathBuf> = self
+                            .available_drives
+                            .iter()
+                            .map(PathBuf::from)
+                            .collect();
+                        for drive in &drives {
+                            render_tree_node(
+                                ui,
+                                drive,
+                                &mut self.tree_expanded,
+                                &mut self.tree_children_cache,
+                                &mut nav_from_panel,
+                                &self.current_path.clone(),
+                                0,
+                            );
+                        }
+                    });
+            });
+
+        if let Some(path) = nav_from_panel {
+            self.navigate_to(path);
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             // Drive selector with filter and navigation buttons
             let mut selected_drive: Option<PathBuf> = None;
@@ -1616,7 +2013,7 @@ impl eframe::App for RusplorerApp {
                     // Name header
                     header.col(|ui| {
                         let arrow = if self.sort_column == SortColumn::Name {
-                            if self.sort_ascending { " ^" } else { " v" }
+                            if self.sort_ascending { " ↑" } else { " ↓" }
                         } else {
                             ""
                         };
@@ -1641,7 +2038,7 @@ impl eframe::App for RusplorerApp {
                     // Size header
                     header.col(|ui| {
                         let arrow = if self.sort_column == SortColumn::Size {
-                            if self.sort_ascending { " ^" } else { " v" }
+                            if self.sort_ascending { " ↑" } else { " ↓" }
                         } else {
                             ""
                         };
@@ -1681,7 +2078,7 @@ impl eframe::App for RusplorerApp {
                                     sort_changed = true;
                                 }
                                 let arrow = if self.sort_column == SortColumn::Date {
-                                    if self.sort_ascending { " ^" } else { " v" }
+                                    if self.sort_ascending { " ↑" } else { " ↓" }
                                 } else {
                                     ""
                                 };

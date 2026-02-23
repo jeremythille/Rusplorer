@@ -15,7 +15,8 @@ dirs = "5.0"
 notify = "6.1"
 winapi = { version = "0.3", features = ["winuser", "shellapi", "winbase"] }
 wchar = "0.11"
-windows = { version = "0.58", features = ["Win32_UI_Shell", "Win32_System_Com", "Win32_Foundation", "Win32_Storage_FileSystem"] }
+winreg = "0.55"
+windows = { version = "0.58", features = ["Win32_UI_Shell", "Win32_System_Com", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Registry"] }
 
 [build-dependencies]
 winres = "0.1"
