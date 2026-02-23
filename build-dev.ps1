@@ -1,5 +1,8 @@
 #!/usr/bin/env pwsh
 
+# Change to the script's directory
+Set-Location (Split-Path -Parent $MyInvocation.MyCommand.Path)
+
 # Kill rusplorer.exe if it's running
 $process = Get-Process rusplorer -ErrorAction SilentlyContinue
 if ($process) {
