@@ -1,7 +1,20 @@
 #!/usr/bin/env pwsh
 
-# Change to the script's directory
-Set-Location (Split-Path -Parent $MyInvocation.MyCommand.Path)
+# Get the directory where this script is located
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# Change to the script directory (which should be source_code/)
+Set-Location $scriptDir
+
+# Set rootPath to the parent directory (where the repository root is)
+$rootPath = Split-Path -Parent $scriptDir
+
+# Verify we have Cargo.toml
+if (-not (Test-Path "Cargo.toml")) {
+    Write-Host "Error: Cargo.toml not found in script directory: $scriptDir"
+    Read-Host "Press Enter to exit"
+    exit 1
+}
 
 # Kill rusplorer.exe if it's running
 $process = Get-Process rusplorer -ErrorAction SilentlyContinue
@@ -35,8 +48,16 @@ if ($LASTEXITCODE -eq 0) {
     Remove-Item ".cargo-lock" -Force -ErrorAction SilentlyContinue
     Remove-Item ".\target\release\.cargo-lock" -Force -ErrorAction SilentlyContinue
     
-    Write-Host "Launching Rusplorer...`n"
-    Start-Process ".\target\release\rusplorer.exe"
+    # Copy rusplorer.exe to root
+    $exePath = Join-Path $releaseDir "rusplorer.exe"
+    if (Test-Path $exePath) {
+        Write-Host "Copying rusplorer.exe to root..."
+        Copy-Item $exePath -Destination "$rootPath/rusplorer.exe" -Force
+        Write-Host "Binary ready: $rootPath/rusplorer.exe"
+    }
+    
+    Write-Host "`nLaunching Rusplorer...`n"
+    Start-Process "$rootPath/rusplorer.exe"
     Write-Host "Rusplorer launched in background. Close this window when done."
     Read-Host "Press Enter to exit"
 } else {
