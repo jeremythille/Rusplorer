@@ -20,7 +20,7 @@ windows = { version = "0.58", features = ["Win32_UI_Shell", "Win32_System_Com", 
 windows-core = "0.58"
 
 [build-dependencies]
-winres = "0.1"
+embed-resource = "2"
 
 [[bin]]
 name = "rusplorer"

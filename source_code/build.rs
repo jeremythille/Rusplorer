@@ -1,9 +1,4 @@
 fn main() {
-    #[cfg(windows)]
-    {
-        winres::WindowsResource::new()
-            .set_icon("logo/Rustplorer-logo.ico")
-            .compile()
-            .expect("Failed to compile Windows resources");
-    }
+    embed_resource::compile("logo/app.rc", embed_resource::NONE);
 }
+
