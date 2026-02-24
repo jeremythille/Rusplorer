@@ -858,6 +858,9 @@ struct RusplorerApp {
     left_panel_width: f32,
     right_panel_width: f32,
     prev_left_panel_width: f32,
+    // Tabs
+    tabs: Vec<TabState>,
+    active_tab: usize,
     // Virtual desktop placement on startup
     startup_vd_done: bool,
     startup_vd_attempts: u8,
@@ -891,6 +894,39 @@ struct FileEntry {
     #[allow(dead_code)]
     size: u64,
     modified: Option<SystemTime>,
+}
+
+/// Per-tab browsing state.  Lightweight: only stores what needs to be
+/// preserved across tab switches.  Everything else (computed sizes, watcher,
+/// selection, etc.) is rebuilt on switch via `refresh_contents()`.
+struct TabState {
+    path: PathBuf,
+    back_history: Vec<PathBuf>,
+    forward_history: Vec<PathBuf>,
+    filter: String,
+    sort_column: SortColumn,
+    sort_ascending: bool,
+}
+
+impl TabState {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            back_history: Vec::new(),
+            forward_history: Vec::new(),
+            filter: String::new(),
+            sort_column: SortColumn::Name,
+            sort_ascending: true,
+        }
+    }
+
+    /// Short display label: last path component, or drive letter.
+    fn label(&self) -> String {
+        self.path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.path.to_string_lossy().to_string())
+    }
 }
 
 impl Default for RusplorerApp {
@@ -979,6 +1015,8 @@ impl Default for RusplorerApp {
             left_panel_width: 150.0,
             right_panel_width: 0.0,
             prev_left_panel_width: 0.0,
+            tabs: Vec::new(), // populated below
+            active_tab: 0,
             startup_vd_done: false,
             startup_vd_attempts: 0,
             ole_drop_receiver: Some(ole_rx),
@@ -995,6 +1033,16 @@ impl Default for RusplorerApp {
             app.tree_children_cache.insert(ancestor.clone(), children);
             app.tree_expanded.insert(ancestor);
         }
+
+        // Initialise tabs with the starting path
+        app.tabs.push(TabState {
+            path: app.current_path.clone(),
+            back_history: Vec::new(),
+            forward_history: Vec::new(),
+            filter: app.filter.clone(),
+            sort_column: app.sort_column.clone(),
+            sort_ascending: app.sort_ascending,
+        });
 
         app.refresh_contents();
         app.start_file_watcher();
@@ -1015,6 +1063,85 @@ impl RusplorerApp {
         }
 
         drives
+    }
+
+    // ── Tab helpers ────────────────────────────────────────────────────
+
+    /// Save the current browsing state into the active tab.
+    fn save_active_tab(&mut self) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.path = self.current_path.clone();
+            tab.back_history = self.back_history.clone();
+            tab.forward_history = self.forward_history.clone();
+            tab.filter = self.filter.clone();
+            tab.sort_column = self.sort_column.clone();
+            tab.sort_ascending = self.sort_ascending;
+        }
+    }
+
+    /// Restore per-tab state from the given tab index into the app fields
+    /// and refresh directory contents + watcher.
+    fn restore_tab(&mut self, index: usize) {
+        if let Some(tab) = self.tabs.get(index) {
+            self.current_path = tab.path.clone();
+            self.back_history = tab.back_history.clone();
+            self.forward_history = tab.forward_history.clone();
+            self.filter = tab.filter.clone();
+            self.sort_column = tab.sort_column.clone();
+            self.sort_ascending = tab.sort_ascending;
+            self.selected_entries.clear();
+
+            // Keep tree in sync
+            let ancestors: Vec<PathBuf> = self.current_path.ancestors().map(|p| p.to_path_buf()).collect();
+            for ancestor in ancestors.into_iter().rev() {
+                if !self.tree_children_cache.contains_key(&ancestor) {
+                    let children = read_dir_children(&ancestor);
+                    self.tree_children_cache.insert(ancestor.clone(), children);
+                }
+                self.tree_expanded.insert(ancestor);
+            }
+
+            self.refresh_contents();
+            self.start_file_watcher();
+        }
+    }
+
+    /// Switch to a different tab index.
+    fn switch_to_tab(&mut self, index: usize) {
+        if index == self.active_tab || index >= self.tabs.len() {
+            return;
+        }
+        self.save_active_tab();
+        self.active_tab = index;
+        self.restore_tab(index);
+    }
+
+    /// Open a new tab.  Clones the current path by default.
+    fn new_tab(&mut self, path: Option<PathBuf>) {
+        self.save_active_tab();
+        let tab_path = path.unwrap_or_else(|| self.current_path.clone());
+        self.tabs.push(TabState::new(tab_path));
+        self.active_tab = self.tabs.len() - 1;
+        self.restore_tab(self.active_tab);
+    }
+
+    /// Close the tab at `index`.  Won't close the last remaining tab.
+    fn close_tab(&mut self, index: usize) {
+        if self.tabs.len() <= 1 {
+            return;
+        }
+        self.tabs.remove(index);
+        if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len() - 1;
+        } else if index < self.active_tab {
+            self.active_tab -= 1;
+        } else if index == self.active_tab {
+            // We removed the active tab — restore whichever tab is now at this index
+            self.active_tab = self.active_tab.min(self.tabs.len() - 1);
+            self.restore_tab(self.active_tab);
+            return;
+        }
+        // No restore needed here — active tab didn't change identity
     }
 
     fn refresh_contents(&mut self) {
@@ -1251,6 +1378,8 @@ impl RusplorerApp {
                 }
                 self.tree_expanded.insert(ancestor);
             }
+
+            self.save_active_tab();
         }
     }
 
@@ -1259,6 +1388,7 @@ impl RusplorerApp {
             self.forward_history.push(self.current_path.clone());
             self.current_path = previous;
             self.refresh_contents();
+            self.save_active_tab();
         }
     }
 
@@ -1267,6 +1397,7 @@ impl RusplorerApp {
             self.back_history.push(self.current_path.clone());
             self.current_path = next;
             self.refresh_contents();
+            self.save_active_tab();
         }
     }
 
@@ -2258,34 +2389,40 @@ impl eframe::App for RusplorerApp {
                 let dnd_drop_target = self.dnd_drop_target_prev.clone(); // use prev for display
                 let dnd_sources: Vec<PathBuf> = self.dnd_sources.clone();
                 let mut tree_hovered_drop: Option<PathBuf> = None;
-                egui::ScrollArea::vertical()
-                    .id_source("tree_scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.set_max_width(ui.available_width());
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        let drives: Vec<PathBuf> = self
-                            .available_drives
-                            .iter()
-                            .map(PathBuf::from)
-                            .collect();
-                        for drive in &drives {
-                            render_tree_node(
-                                ui,
-                                drive,
-                                &mut self.tree_expanded,
-                                &mut self.tree_children_cache,
-                                &mut nav_from_panel,
-                                &self.current_path.clone(),
-                                0,
-                                dnd_active,
-                                &dnd_sources,
-                                &dnd_drop_target,
-                                &mut tree_hovered_drop,
-                            );
-                        }
-                    });
+                // Restrict the clip rect to the remaining area so scrolled tree
+                // content cannot bleed over the favorites section above.
+                let tree_clip = ui.clip_rect().intersect(ui.available_rect_before_wrap());
+                ui.scope(|ui| {
+                    ui.set_clip_rect(tree_clip);
+                    egui::ScrollArea::vertical()
+                        .id_source("tree_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.set_max_width(ui.available_width());
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            let drives: Vec<PathBuf> = self
+                                .available_drives
+                                .iter()
+                                .map(PathBuf::from)
+                                .collect();
+                            for drive in &drives {
+                                render_tree_node(
+                                    ui,
+                                    drive,
+                                    &mut self.tree_expanded,
+                                    &mut self.tree_children_cache,
+                                    &mut nav_from_panel,
+                                    &self.current_path.clone(),
+                                    0,
+                                    dnd_active,
+                                    &dnd_sources,
+                                    &dnd_drop_target,
+                                    &mut tree_hovered_drop,
+                                );
+                            }
+                        });
+                });
                 if let Some(target) = tree_hovered_drop {
                     self.dnd_drop_target = Some(target);
                 }
@@ -2296,6 +2433,94 @@ impl eframe::App for RusplorerApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            // ── Tab bar ──────────────────────────────────────────────────
+            let mut switch_to: Option<usize> = None;
+            let mut close_idx: Option<usize> = None;
+            let mut open_new_tab = false;
+
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                for i in 0..self.tabs.len() {
+                    let is_active = i == self.active_tab;
+                    let label_text = self.tabs[i].label();
+                    let display = if label_text.len() > 20 {
+                        format!("{}…", &label_text[..19])
+                    } else {
+                        label_text.clone()
+                    };
+
+                    let fill = if is_active {
+                        egui::Color32::from_rgb(60, 60, 60)
+                    } else {
+                        egui::Color32::from_rgb(40, 40, 40)
+                    };
+
+                    let frame = egui::Frame::none()
+                        .fill(fill)
+                        .inner_margin(egui::Margin::symmetric(6.0, 3.0))
+                        .rounding(egui::Rounding { nw: 4.0, ne: 4.0, sw: 0.0, se: 0.0 });
+
+                    let resp = frame.show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            let text_color = if is_active {
+                                egui::Color32::WHITE
+                            } else {
+                                egui::Color32::GRAY
+                            };
+                            let tab_btn = ui.add(
+                                egui::Button::new(
+                                    egui::RichText::new(&display).color(text_color).small(),
+                                )
+                                .frame(false),
+                            );
+                            if tab_btn.clicked() {
+                                switch_to = Some(i);
+                            }
+                            tab_btn.on_hover_text(self.tabs[i].path.to_string_lossy());
+
+                            // Close button (only when more than 1 tab)
+                            if self.tabs.len() > 1 {
+                                let close = ui.add(
+                                    egui::Button::new(
+                                        egui::RichText::new("×").color(text_color).small(),
+                                    )
+                                    .frame(false),
+                                );
+                                if close.clicked() {
+                                    close_idx = Some(i);
+                                }
+                            }
+                        });
+                    });
+
+                    // Middle-click anywhere on the tab to close
+                    if resp.response.middle_clicked() && self.tabs.len() > 1 {
+                        close_idx = Some(i);
+                    }
+                }
+
+                // "+" button to add a new tab
+                if ui
+                    .add(egui::Button::new(egui::RichText::new("+").small()).frame(false))
+                    .on_hover_text("New tab")
+                    .clicked()
+                {
+                    open_new_tab = true;
+                }
+            });
+            ui.add_space(1.0);
+
+            // Process tab actions (after the borrow of self.tabs in the loop ends)
+            if let Some(idx) = close_idx {
+                self.close_tab(idx);
+            } else if let Some(idx) = switch_to {
+                self.switch_to_tab(idx);
+            }
+            if open_new_tab {
+                self.new_tab(None);
+            }
+
             // Drive selector with filter and navigation buttons
             let mut selected_drive: Option<PathBuf> = None;
             ui.horizontal(|ui| {
