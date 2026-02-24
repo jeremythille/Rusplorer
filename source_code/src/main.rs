@@ -166,8 +166,9 @@ fn read_files_from_clipboard() -> Result<Vec<PathBuf>, Box<dyn std::error::Error
 /// Initiate an OLE drag-and-drop of the given files out to other applications (e.g. Explorer).
 /// Blocks until the user drops or cancels.  Returns `true` when the target performed a *move*
 /// (so we should refresh our listing).
+/// `right_button`: if true, tracks MK_RBUTTON instead of MK_LBUTTON.
 #[cfg(windows)]
-fn ole_drag_files_out(files: &[PathBuf]) -> bool {
+fn ole_drag_files_out(files: &[PathBuf], right_button: bool) -> bool {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use windows::core::{implement, HRESULT};
@@ -187,19 +188,24 @@ fn ole_drag_files_out(files: &[PathBuf]) -> bool {
 
     const CF_HDROP_RAW: u16 = 15;
     const MK_LBUTTON: u32 = 0x0001;
+    const MK_RBUTTON: u32 = 0x0002;
     const DRAGDROP_S_DROP: HRESULT = HRESULT(0x00040100_i32);
     const DRAGDROP_S_CANCEL: HRESULT = HRESULT(0x00040101_i32);
     const DRAGDROP_S_USEDEFAULTCURSORS: HRESULT = HRESULT(0x00040102_i32);
 
+    let track_button: u32 = if right_button { MK_RBUTTON } else { MK_LBUTTON };
+
     // ── IDropSource ──────────────────────────────────────────────────────
     #[implement(IDropSource)]
-    struct DropSource;
+    struct DropSource {
+        button_mask: u32,
+    }
 
     impl IDropSource_Impl for DropSource_Impl {
         fn QueryContinueDrag(&self, fescapepressed: BOOL, grfkeystate: MODIFIERKEYS_FLAGS) -> HRESULT {
             if fescapepressed.as_bool() {
                 DRAGDROP_S_CANCEL
-            } else if grfkeystate.0 & MK_LBUTTON == 0 {
+            } else if grfkeystate.0 & self.button_mask == 0 {
                 DRAGDROP_S_DROP
             } else {
                 S_OK
@@ -336,7 +342,7 @@ fn ole_drag_files_out(files: &[PathBuf]) -> bool {
 
     // ── Perform OLE drag ─────────────────────────────────────────────────
     let data_obj: IDataObject = HdropData { blob }.into();
-    let source: IDropSource = DropSource.into();
+    let source: IDropSource = DropSource { button_mask: track_button }.into();
     let mut effect = DROPEFFECT_NONE;
     let hr = unsafe {
         DoDragDrop(
@@ -347,6 +353,45 @@ fn ole_drag_files_out(files: &[PathBuf]) -> bool {
         )
     };
     hr == DRAGDROP_S_DROP && effect == DROPEFFECT_MOVE
+}
+
+/// Create a Windows .lnk shortcut pointing at `target` inside `dest_dir`.
+#[cfg(windows)]
+fn create_lnk_shortcut(target: &PathBuf, dest_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::Interface;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
+        COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+    use windows::core::PCWSTR;
+
+    let stem = target
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "shortcut".to_string());
+    let lnk_path = dest_dir.join(format!("{}.lnk", stem));
+
+    let target_wide: Vec<u16> = OsStr::new(target).encode_wide().chain(std::iter::once(0)).collect();
+    let lnk_wide: Vec<u16> = OsStr::new(&lnk_path).encode_wide().chain(std::iter::once(0)).collect();
+
+    unsafe {
+        let coin_hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let shell_link: IShellLinkW =
+                CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+            shell_link.SetPath(PCWSTR(target_wide.as_ptr()))?;
+            let persist_file: IPersistFile = shell_link.cast()?;
+            persist_file.Save(PCWSTR(lnk_wide.as_ptr()), true)?;
+            Ok(())
+        })();
+        if coin_hr.is_ok() {
+            CoUninitialize();
+        }
+        result
+    }
 }
 
 /// Resolve a Windows .lnk shortcut file to its target path
@@ -548,6 +593,7 @@ fn try_move_to_rusplorer_desktop() -> bool {
 fn register_ole_drop_target(
     hwnd_raw: *mut std::ffi::c_void,
     sender: std::sync::mpsc::Sender<Vec<PathBuf>>,
+    right_click_sender: std::sync::mpsc::Sender<Vec<PathBuf>>,
 ) -> Option<windows::Win32::System::Ole::IDropTarget> {
     use windows::core::implement;
     use windows::Win32::Foundation::{HWND, POINTL, S_OK};
@@ -560,20 +606,24 @@ fn register_ole_drop_target(
     use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 
     const CF_HDROP_RAW: u16 = 15;
+    const MK_RBUTTON: u32 = 0x0002;
 
     #[implement(IDropTarget)]
     struct DropTarget {
         sender: std::sync::mpsc::Sender<Vec<PathBuf>>,
+        right_click_sender: std::sync::mpsc::Sender<Vec<PathBuf>>,
+        last_key_state: std::cell::Cell<u32>,
     }
 
     impl IDropTarget_Impl for DropTarget_Impl {
         fn DragEnter(
             &self,
             pdataobj: Option<&IDataObject>,
-            _grfkeystate: MODIFIERKEYS_FLAGS,
+            grfkeystate: MODIFIERKEYS_FLAGS,
             _pt: &POINTL,
             pdweffect: *mut DROPEFFECT,
         ) -> windows::core::Result<()> {
+            self.last_key_state.set(grfkeystate.0);
             unsafe {
                 let ok = if let Some(obj) = pdataobj {
                     let fmt = FORMATETC {
@@ -594,10 +644,11 @@ fn register_ole_drop_target(
 
         fn DragOver(
             &self,
-            _grfkeystate: MODIFIERKEYS_FLAGS,
+            grfkeystate: MODIFIERKEYS_FLAGS,
             _pt: &POINTL,
             pdweffect: *mut DROPEFFECT,
         ) -> windows::core::Result<()> {
+            self.last_key_state.set(grfkeystate.0);
             unsafe { *pdweffect = DROPEFFECT_COPY; }
             Ok(())
         }
@@ -648,7 +699,12 @@ fn register_ole_drop_target(
                 let _ = GlobalUnlock(hmem);
 
                 if !files.is_empty() {
-                    let _ = self.sender.send(files);
+                    // If right-button was held during drag, send to right_click channel
+                    if self.last_key_state.get() & MK_RBUTTON != 0 {
+                        let _ = self.right_click_sender.send(files);
+                    } else {
+                        let _ = self.sender.send(files);
+                    }
                     *pdweffect = DROPEFFECT_COPY;
                 }
             }
@@ -656,7 +712,11 @@ fn register_ole_drop_target(
         }
     }
 
-    let drop_target: IDropTarget = DropTarget { sender }.into();
+    let drop_target: IDropTarget = DropTarget {
+        sender,
+        right_click_sender,
+        last_key_state: std::cell::Cell::new(0),
+    }.into();
     unsafe {
         let hwnd = HWND(hwnd_raw);
         // Remove any existing drop target (winit registers its own)
@@ -844,8 +904,13 @@ struct RusplorerApp {
     dnd_sources: Vec<PathBuf>,
     dnd_label: String,
     dnd_start_pos: Option<egui::Pos2>,
+    dnd_drag_entry: Option<String>,  // entry name when pointer was pressed (raw tracking)
     dnd_drop_target: Option<PathBuf>,
     dnd_drop_target_prev: Option<PathBuf>, // previous frame's value, used for color display
+    dnd_is_right_click: bool,
+    dnd_suppress: bool, // suppress new drag detection until all buttons are released
+    // Pending right-click drop menu: (sources, destination, screen position)
+    dnd_right_drop_menu: Option<(Vec<PathBuf>, PathBuf, egui::Pos2)>,
     dirs_done: HashSet<PathBuf>,
     dirs_done_receiver: Option<Receiver<PathBuf>>,
     show_date_columns: HashMap<PathBuf, bool>,
@@ -867,6 +932,8 @@ struct RusplorerApp {
     // OLE drop-in channel: Explorer → Rusplorer
     ole_drop_receiver: Option<std::sync::mpsc::Receiver<Vec<PathBuf>>>,
     ole_drop_sender: Option<std::sync::mpsc::Sender<Vec<PathBuf>>>,
+    ole_rclick_drop_receiver: Option<std::sync::mpsc::Receiver<Vec<PathBuf>>>,
+    ole_rclick_drop_sender: Option<std::sync::mpsc::Sender<Vec<PathBuf>>>,
     drop_target_registered: bool,
     // Keep the COM IDropTarget alive for the lifetime of the app
     #[cfg(windows)]
@@ -946,6 +1013,7 @@ impl Default for RusplorerApp {
             .collect();
         let sort_column = config.sort_column.clone();
         let (ole_tx, ole_rx) = std::sync::mpsc::channel::<Vec<PathBuf>>();
+        let (ole_rc_tx, ole_rc_rx) = std::sync::mpsc::channel::<Vec<PathBuf>>();
         let sort_ascending = config.sort_ascending;
         let favorites: Vec<PathBuf> = config.favorites.iter().map(PathBuf::from).collect();
 
@@ -1002,8 +1070,12 @@ impl Default for RusplorerApp {
             dnd_sources: Vec::new(),
             dnd_label: String::new(),
             dnd_start_pos: None,
+            dnd_drag_entry: None,
             dnd_drop_target: None,
             dnd_drop_target_prev: None,
+            dnd_is_right_click: false,
+            dnd_suppress: false,
+            dnd_right_drop_menu: None,
             dirs_done: HashSet::new(),
             dirs_done_receiver: None,
             show_date_columns,
@@ -1021,6 +1093,8 @@ impl Default for RusplorerApp {
             startup_vd_attempts: 0,
             ole_drop_receiver: Some(ole_rx),
             ole_drop_sender: Some(ole_tx),
+            ole_rclick_drop_receiver: Some(ole_rc_rx),
+            ole_rclick_drop_sender: Some(ole_rc_tx),
             drop_target_registered: false,
             _ole_drop_target: None,
         };
@@ -1065,6 +1139,20 @@ impl RusplorerApp {
         drives
     }
 
+    /// Collapse the entire tree, then expand only the ancestors of `path`.
+    /// This ensures unrelated drives/folders are hidden after every navigation.
+    fn expand_tree_to(&mut self, path: &PathBuf) {
+        self.tree_expanded.clear();
+        let ancestors: Vec<PathBuf> = path.ancestors().map(|p| p.to_path_buf()).collect();
+        for ancestor in ancestors.into_iter().rev() {
+            if !self.tree_children_cache.contains_key(&ancestor) {
+                let children = read_dir_children(&ancestor);
+                self.tree_children_cache.insert(ancestor.clone(), children);
+            }
+            self.tree_expanded.insert(ancestor);
+        }
+    }
+
     // ── Tab helpers ────────────────────────────────────────────────────
 
     /// Save the current browsing state into the active tab.
@@ -1091,15 +1179,9 @@ impl RusplorerApp {
             self.sort_ascending = tab.sort_ascending;
             self.selected_entries.clear();
 
-            // Keep tree in sync
-            let ancestors: Vec<PathBuf> = self.current_path.ancestors().map(|p| p.to_path_buf()).collect();
-            for ancestor in ancestors.into_iter().rev() {
-                if !self.tree_children_cache.contains_key(&ancestor) {
-                    let children = read_dir_children(&ancestor);
-                    self.tree_children_cache.insert(ancestor.clone(), children);
-                }
-                self.tree_expanded.insert(ancestor);
-            }
+            // Collapse everything unrelated, expand only ancestors of new path
+            let path_snap = self.current_path.clone();
+            self.expand_tree_to(&path_snap);
 
             self.refresh_contents();
             self.start_file_watcher();
@@ -1369,15 +1451,9 @@ impl RusplorerApp {
             // Restart watcher for the new directory
             self.start_file_watcher();
 
-            // Keep tree in sync: expand ancestors down to the new folder
-            let ancestors: Vec<PathBuf> = self.current_path.ancestors().map(|p| p.to_path_buf()).collect();
-            for ancestor in ancestors.into_iter().rev() {
-                if !self.tree_children_cache.contains_key(&ancestor) {
-                    let children = read_dir_children(&ancestor);
-                    self.tree_children_cache.insert(ancestor.clone(), children);
-                }
-                self.tree_expanded.insert(ancestor);
-            }
+            // Collapse everything unrelated, expand only ancestors of new path
+            let path_snap = self.current_path.clone();
+            self.expand_tree_to(&path_snap);
 
             self.save_active_tab();
         }
@@ -1387,6 +1463,8 @@ impl RusplorerApp {
         if let Some(previous) = self.back_history.pop() {
             self.forward_history.push(self.current_path.clone());
             self.current_path = previous;
+            let path_snap = self.current_path.clone();
+            self.expand_tree_to(&path_snap);
             self.refresh_contents();
             self.save_active_tab();
         }
@@ -1396,6 +1474,8 @@ impl RusplorerApp {
         if let Some(next) = self.forward_history.pop() {
             self.back_history.push(self.current_path.clone());
             self.current_path = next;
+            let path_snap = self.current_path.clone();
+            self.expand_tree_to(&path_snap);
             self.refresh_contents();
             self.save_active_tab();
         }
@@ -1564,11 +1644,25 @@ impl RusplorerApp {
 
     fn copy_files(sources: &[PathBuf], dest: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         for source in sources {
+            let file_name = source.file_name().unwrap();
+            let mut target = dest.join(file_name);
+
+            // If target already exists (e.g. copying to same folder), generate a unique name
+            if target.exists() {
+                let stem = target.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                let ext = target.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+                let mut n = 1u32;
+                target = dest.join(format!("{} - Copy{}", stem, ext));
+                while target.exists() {
+                    n += 1;
+                    target = dest.join(format!("{} - Copy ({}){}", stem, n, ext));
+                }
+            }
+
             if source.is_dir() {
-                copy_dir_recursive(source, &dest.join(source.file_name().unwrap()))?;
+                copy_dir_recursive(source, &target)?;
             } else {
-                let file_name = source.file_name().unwrap();
-                std::fs::copy(source, dest.join(file_name))?;
+                std::fs::copy(source, &target)?;
             }
         }
         Ok(())
@@ -1856,6 +1950,32 @@ impl eframe::App for RusplorerApp {
             self.dnd_drop_target_prev = None;
         }
 
+        // Clear suppress flag once all buttons are physically released.
+        // We must use GetAsyncKeyState (actual hardware state) instead of egui's
+        // pointer tracking, because egui never receives WM_xBUTTONUP when the
+        // release happened in another window (e.g. another Rusplorer instance).
+        if self.dnd_suppress {
+            #[cfg(windows)]
+            {
+                use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+                let lmb_down = unsafe { GetAsyncKeyState(0x01) } & (0x8000u16 as i16) != 0; // VK_LBUTTON
+                let rmb_down = unsafe { GetAsyncKeyState(0x02) } & (0x8000u16 as i16) != 0; // VK_RBUTTON
+                if !lmb_down && !rmb_down {
+                    self.dnd_suppress = false;
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let any_held = ctx.input(|i|
+                    i.pointer.primary_down()
+                        || i.pointer.button_down(egui::PointerButton::Secondary)
+                );
+                if !any_held {
+                    self.dnd_suppress = false;
+                }
+            }
+        }
+
         // Move own window to "Rusplorer" virtual desktop on startup (in-process: no E_ACCESSDENIED)
         if !self.startup_vd_done {
             self.startup_vd_attempts += 1;
@@ -1871,6 +1991,7 @@ impl eframe::App for RusplorerApp {
         #[cfg(windows)]
         if !self.drop_target_registered {
             if let Some(tx) = self.ole_drop_sender.take() {
+                let rc_tx = self.ole_rclick_drop_sender.take();
                 let wide_title: Vec<u16> = OsStr::new("Rusplorer")
                     .encode_wide()
                     .chain(std::iter::once(0))
@@ -1880,7 +2001,8 @@ impl eframe::App for RusplorerApp {
                         std::ptr::null(), wide_title.as_ptr());
                     if !hwnd_raw.is_null() {
                         let hwnd_ptr = hwnd_raw as *mut _;
-                        if let Some(target) = register_ole_drop_target(hwnd_ptr, tx) {
+                        let rc = rc_tx.unwrap_or_else(|| std::sync::mpsc::channel().0);
+                        if let Some(target) = register_ole_drop_target(hwnd_ptr, tx, rc) {
                             self._ole_drop_target = Some(target);
                             self.drop_target_registered = true;
                         } else {
@@ -1888,8 +2010,9 @@ impl eframe::App for RusplorerApp {
                             self.drop_target_registered = true;
                         }
                     } else {
-                        // HWND not ready yet — put sender back
+                        // HWND not ready yet — put senders back
                         self.ole_drop_sender = Some(tx);
+                        self.ole_rclick_drop_sender = rc_tx;
                     }
                 }
             }
@@ -1924,7 +2047,7 @@ impl eframe::App for RusplorerApp {
             self.pause_token.store(!is_focused, Ordering::SeqCst);
         }
 
-        // Receive OLE drops from Explorer (drag-in)
+        // Receive OLE drops from Explorer (drag-in)  — left-click = move
         #[cfg(windows)]
         {
             let incoming: Vec<Vec<PathBuf>> = self.ole_drop_receiver
@@ -1934,17 +2057,25 @@ impl eframe::App for RusplorerApp {
             for files in incoming {
                 if !files.is_empty() {
                     let dest = self.current_path.clone();
-                    for f in &files {
-                        if let Some(name) = f.file_name() {
-                            let dst = dest.join(name);
-                            if f.is_dir() {
-                                let _ = copy_dir_recursive(f, &dst);
-                            } else {
-                                let _ = std::fs::copy(f, &dst);
-                            }
-                        }
-                    }
+                    let _ = Self::move_files(&files, &dest);
                     self.refresh_contents();
+                    ctx.request_repaint();
+                }
+            }
+        }
+
+        // Receive OLE right-click drops — show menu
+        #[cfg(windows)]
+        {
+            let incoming: Vec<Vec<PathBuf>> = self.ole_rclick_drop_receiver
+                .as_ref()
+                .map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).collect())
+                .unwrap_or_default();
+            for files in incoming {
+                if !files.is_empty() {
+                    let dest = self.current_path.clone();
+                    let drop_pos = ctx.input(|i| i.pointer.hover_pos().unwrap_or(egui::pos2(300.0, 300.0)));
+                    self.dnd_right_drop_menu = Some((files, dest, drop_pos));
                     ctx.request_repaint();
                 }
             }
@@ -2389,11 +2520,11 @@ impl eframe::App for RusplorerApp {
                 let dnd_drop_target = self.dnd_drop_target_prev.clone(); // use prev for display
                 let dnd_sources: Vec<PathBuf> = self.dnd_sources.clone();
                 let mut tree_hovered_drop: Option<PathBuf> = None;
-                // Restrict the clip rect to the remaining area so scrolled tree
-                // content cannot bleed over the favorites section above.
-                let tree_clip = ui.clip_rect().intersect(ui.available_rect_before_wrap());
-                ui.scope(|ui| {
-                    ui.set_clip_rect(tree_clip);
+                // Constrain the scroll area to the remaining rect so scrolled
+                // tree content cannot bleed over the favorites section above.
+                let tree_rect = ui.available_rect_before_wrap();
+                ui.allocate_ui_at_rect(tree_rect, |ui| {
+                    ui.set_clip_rect(ui.max_rect());
                     egui::ScrollArea::vertical()
                         .id_source("tree_scroll")
                         .auto_shrink([false, false])
@@ -2974,11 +3105,36 @@ impl eframe::App for RusplorerApp {
                                     self.any_button_hovered = true;
                                 }
 
-                                // Drag-and-drop: detect drag start
-                                if response.drag_started() && !entry.name.starts_with("[..]") {
+                                // Drag-and-drop: raw pointer state detection
+                                // (avoids egui's drag_started_by/dragged_by which desync
+                                //  after the blocking DoDragDrop OLE call)
+                                let primary_down = ui.input(|i| i.pointer.primary_down());
+                                let secondary_down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
+                                let any_btn_down = primary_down || secondary_down;
+
+                                // Detect new press on this entry
+                                if cursor_over
+                                    && any_btn_down
+                                    && !self.dnd_active
+                                    && !self.dnd_suppress
+                                    && self.dnd_start_pos.is_none()
+                                    && !entry.name.starts_with("[..]")
+                                {
                                     self.dnd_start_pos = ui.input(|i| i.pointer.hover_pos());
+                                    self.dnd_drag_entry = Some(entry.name.clone());
+                                    self.dnd_is_right_click = secondary_down;
                                 }
-                                if response.dragged()
+
+                                // Clear stale press when pointer is released without triggering a drag
+                                if !self.dnd_active && !any_btn_down {
+                                    self.dnd_start_pos = None;
+                                    self.dnd_drag_entry = None;
+                                }
+
+                                // Activate DnD when dragged far enough with button held
+                                let is_this_entry_drag = any_btn_down
+                                    && self.dnd_drag_entry.as_deref() == Some(&entry.name);
+                                if is_this_entry_drag
                                     && !self.dnd_active
                                     && !entry.name.starts_with("[..]")
                                 {
@@ -3010,6 +3166,10 @@ impl eframe::App for RusplorerApp {
                                                     format!("📦 {} items", count)
                                                 };
                                                 self.dnd_active = true;
+                                                // Show move/copy hint in label for right-click drag
+                                                if self.dnd_is_right_click {
+                                                    self.dnd_label = format!("{}  [Move / Copy / Shortcut]", self.dnd_label);
+                                                }
                                             }
                                         }
                                     }
@@ -3029,7 +3189,7 @@ impl eframe::App for RusplorerApp {
                                     }
                                 }
 
-                                if response.secondary_clicked() {
+                                if response.secondary_clicked() && !self.dnd_is_right_click {
                                     self.show_context_menu = true;
                                     self.context_menu_entry = Some(entry.clone());
                                     self.context_menu_position =
@@ -3229,12 +3389,14 @@ impl eframe::App for RusplorerApp {
                 );
             }
 
-            // Handle drag-and-drop: detect release and perform move
+            // Handle drag-and-drop: detect release and perform action
             if self.dnd_active {
-                let pointer_down = ctx.input(|i| i.pointer.primary_down());
+                let left_down = ctx.input(|i| i.pointer.primary_down());
+                let right_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
+                let pointer_down = if self.dnd_is_right_click { right_down } else { left_down };
                 let hover_pos = ctx.input(|i| i.pointer.hover_pos());
 
-                // Cursor left the window while dragging → OLE drag-and-drop to Explorer
+                // Cursor left the window while dragging → OLE drag-and-drop to Explorer / other apps
                 #[cfg(windows)]
                 {
                     let screen_rect = ctx.input(|i| i.screen_rect());
@@ -3242,17 +3404,22 @@ impl eframe::App for RusplorerApp {
                         Some(pos) => !screen_rect.contains(pos),
                         None => true,
                     };
-                    if pointer_down && cursor_outside && !self.dnd_sources.is_empty() {
+                    let btn_held = if self.dnd_is_right_click { right_down } else { left_down };
+                    if btn_held && cursor_outside && !self.dnd_sources.is_empty() {
                         let sources = self.dnd_sources.clone();
+                        let is_right = self.dnd_is_right_click;
                         // Reset internal DnD state first
                         self.dnd_active = false;
+                        self.dnd_is_right_click = false;
                         self.dnd_sources.clear();
                         self.dnd_label.clear();
                         self.dnd_start_pos = None;
+                        self.dnd_drag_entry = None;
                         self.dnd_drop_target = None;
                         self.dnd_drop_target_prev = None;
+                        self.dnd_suppress = true;
                         // Blocking OLE drag — pumps Windows messages until drop/cancel
-                        let was_move = ole_drag_files_out(&sources);
+                        let was_move = ole_drag_files_out(&sources, is_right);
                         if was_move {
                             self.selected_entries.clear();
                         }
@@ -3261,23 +3428,41 @@ impl eframe::App for RusplorerApp {
                 }
 
                 if !pointer_down && self.dnd_active {
-                    if let Some(dest) = self.dnd_drop_target.take().filter(|d| d.is_dir()) {
-                        let sources: Vec<PathBuf> = self.dnd_sources
-                            .iter()
-                            .filter(|s| **s != dest)
-                            .cloned()
-                            .collect();
-                        if !sources.is_empty() {
+                    // Fallback: if no specific folder target, use current directory
+                    let dest = self.dnd_drop_target.take()
+                        .filter(|d| d.is_dir())
+                        .unwrap_or_else(|| self.current_path.clone());
+
+                    let sources: Vec<PathBuf> = self.dnd_sources
+                        .iter()
+                        .filter(|s| **s != dest)
+                        .cloned()
+                        .collect();
+
+                    if !sources.is_empty() {
+                        if self.dnd_is_right_click {
+                            // Right-click drop: open the move/copy/shortcut menu
+                            // Use latest pointer position (may be over the tree panel)
+                            let drop_pos = ctx.input(|i|
+                                i.pointer.latest_pos().or(i.pointer.hover_pos()).unwrap_or_default()
+                            );
+                            self.dnd_right_drop_menu = Some((sources, dest, drop_pos));
+                        } else {
+                            // Left-click drop: always move
                             let _ = Self::move_files(&sources, &dest);
                             self.selected_entries.clear();
                             self.refresh_contents();
                         }
                     }
+
                     self.dnd_active = false;
+                    self.dnd_is_right_click = false;
                     self.dnd_sources.clear();
                     self.dnd_label.clear();
                     self.dnd_start_pos = None;
+                    self.dnd_drag_entry = None;
                     self.dnd_drop_target = None;
+                    self.dnd_suppress = true;
                 }
 
                 // Draw ghost label near cursor
@@ -3317,47 +3502,125 @@ impl eframe::App for RusplorerApp {
 
         // Drop menu context window
         if self.show_drop_menu && !self.dragged_files.is_empty() {
-            egui::Window::new("Copy or Move?")
+            let old_resp = egui::Window::new("drop_copy_move_menu")
                 .collapsible(false)
                 .resizable(false)
+                .title_bar(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .frame(egui::Frame {
+                    fill: egui::Color32::from_rgb(230, 240, 255),
+                    stroke: egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
+                    inner_margin: egui::Margin::same(4.0),
+                    ..Default::default()
+                })
                 .show(ctx, |ui| {
-                    ui.label(format!("{} item(s) dropped", self.dragged_files.len()));
-
-                    ui.horizontal(|ui| {
-                        if ui.button("Copy").clicked() {
-                            let files = self.dragged_files.clone();
-                            let dest = self.current_path.clone();
-                            std::thread::spawn(move || {
-                                let _ = RusplorerApp::copy_files(&files, &dest);
-                                std::thread::sleep(std::time::Duration::from_millis(100));
-                            });
-                            self.show_drop_menu = false;
-                            self.dragged_files.clear();
-                        }
-
-                        if ui.button("Move").clicked() {
-                            let files = self.dragged_files.clone();
-                            let dest = self.current_path.clone();
-                            std::thread::spawn(move || {
-                                let _ = RusplorerApp::move_files(&files, &dest);
-                                std::thread::sleep(std::time::Duration::from_millis(100));
-                            });
-                            self.show_drop_menu = false;
-                            self.dragged_files.clear();
-                        }
-
-                        if ui.button("Cancel").clicked() {
-                            self.show_drop_menu = false;
-                            self.dragged_files.clear();
-                        }
-                    });
+                    ui.style_mut().spacing.button_padding = egui::vec2(6.0, 3.0);
+                    if ui.button("Move here").clicked() {
+                        let files = self.dragged_files.clone();
+                        let dest = self.current_path.clone();
+                        std::thread::spawn(move || {
+                            let _ = RusplorerApp::move_files(&files, &dest);
+                        });
+                        self.show_drop_menu = false;
+                        self.dragged_files.clear();
+                    }
+                    if ui.button("Copy here").clicked() {
+                        let files = self.dragged_files.clone();
+                        let dest = self.current_path.clone();
+                        std::thread::spawn(move || {
+                            let _ = RusplorerApp::copy_files(&files, &dest);
+                        });
+                        self.show_drop_menu = false;
+                        self.dragged_files.clear();
+                    }
                 });
+            let old_clicked_outside = ctx.input(|i| {
+                i.pointer.any_click()
+                    && old_resp.as_ref().map_or(true, |r| {
+                        i.pointer.interact_pos()
+                            .map_or(false, |p| !r.response.rect.contains(p))
+                    })
+            });
+            if old_clicked_outside {
+                self.show_drop_menu = false;
+                self.dragged_files.clear();
+            }
         }
 
         // Refresh contents periodically to catch updates from background threads
         if self.dragged_files.is_empty() && !self.show_drop_menu {
             // Let the file watcher pick up changes
+        }
+
+        // ── Right-click drop menu (Move / Copy / Create Shortcut) ──────────
+        if let Some((ref sources, ref dest, menu_pos)) = self.dnd_right_drop_menu.clone() {
+            let sources = sources.clone();
+            let dest = dest.clone();
+            let mut action: Option<&str> = None;
+            let is_same_drive = sources.first()
+                .and_then(|s| s.components().next())
+                .zip(dest.components().next())
+                .map(|(a, b)| a == b)
+                .unwrap_or(false);
+
+            let win_resp = egui::Window::new("drop_action_menu")
+                .collapsible(false)
+                .resizable(false)
+                .title_bar(false)
+                .fixed_pos(menu_pos)
+                .default_width(160.0)
+                .frame(egui::Frame {
+                    fill: egui::Color32::from_rgb(230, 240, 255),
+                    stroke: egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
+                    inner_margin: egui::Margin::same(4.0),
+                    ..Default::default()
+                })
+                .show(ctx, |ui| {
+                    ui.style_mut().spacing.button_padding = egui::vec2(6.0, 3.0);
+                    if ui.button(if is_same_drive { "Move here" } else { "Move here  (copy+delete)" }).clicked() {
+                        action = Some("move");
+                    }
+                    if ui.button("Copy here").clicked() {
+                        action = Some("copy");
+                    }
+                    #[cfg(windows)]
+                    if ui.button("Create shortcut here").clicked() {
+                        action = Some("shortcut");
+                    }
+                });
+            // Dismiss on click outside the menu window
+            let clicked_outside = ctx.input(|i| {
+                i.pointer.any_click()
+                    && win_resp.as_ref().map_or(true, |r| {
+                        i.pointer.interact_pos()
+                            .map_or(false, |p| !r.response.rect.contains(p))
+                    })
+            });
+            match action {
+                Some("move") => {
+                    let _ = Self::move_files(&sources, &dest);
+                    self.selected_entries.clear();
+                    self.refresh_contents();
+                    self.dnd_right_drop_menu = None;
+                }
+                Some("copy") => {
+                    let _ = Self::copy_files(&sources, &dest);
+                    self.refresh_contents();
+                    self.dnd_right_drop_menu = None;
+                }
+                #[cfg(windows)]
+                Some("shortcut") => {
+                    for s in &sources {
+                        let _ = create_lnk_shortcut(s, &dest);
+                    }
+                    self.refresh_contents();
+                    self.dnd_right_drop_menu = None;
+                }
+                Some(_) | None if clicked_outside => {
+                    self.dnd_right_drop_menu = None;
+                }
+                _ => {}
+            }
         }
 
         // Context menu

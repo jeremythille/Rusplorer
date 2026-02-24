@@ -7,7 +7,6 @@ edition = "2024"
 egui = "0.27"
 eframe = "0.27"
 egui-winit = "0.27"
-egui_extras = "0.27"
 arboard = "3.6"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -15,16 +14,13 @@ dirs = "5.0"
 notify = "6.1"
 winapi = { version = "0.3", features = ["winuser", "shellapi", "winbase"] }
 wchar = "0.11"
-winreg = "0.55"
-windows = { version = "0.58", features = ["Win32_UI_Shell", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_System_Ole", "Win32_System_Memory", "Win32_System_SystemServices", "Win32_Graphics_Gdi", "Win32_UI_Input_KeyboardAndMouse", "implement"] }
-windows-core = "0.58"
 
 [build-dependencies]
-embed-resource = "2"
+winres = "0.1"
 
 [[bin]]
 name = "rusplorer"
-path = "src/main.rs"
+path = "source_code/src/main.rs"
 
 [profile.dev]
 opt-level = 1
