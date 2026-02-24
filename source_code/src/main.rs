@@ -855,6 +855,9 @@ struct RusplorerApp {
     favorites: Vec<PathBuf>,
     tree_expanded: HashSet<PathBuf>,
     tree_children_cache: HashMap<PathBuf, Vec<PathBuf>>,
+    left_panel_width: f32,
+    right_panel_width: f32,
+    prev_left_panel_width: f32,
     // Virtual desktop placement on startup
     startup_vd_done: bool,
     startup_vd_attempts: u8,
@@ -973,6 +976,9 @@ impl Default for RusplorerApp {
             favorites,
             tree_expanded: HashSet::new(),
             tree_children_cache: HashMap::new(),
+            left_panel_width: 150.0,
+            right_panel_width: 0.0,
+            prev_left_panel_width: 0.0,
             startup_vd_done: false,
             startup_vd_attempts: 0,
             ole_drop_receiver: Some(ole_rx),
@@ -2108,8 +2114,75 @@ impl eframe::App for RusplorerApp {
 
         // ── Left panel ────────────────────────────────────────────────────
         let mut nav_from_panel: Option<PathBuf> = None;
+
+        // Measure ideal panel width from visible content (for this frame, apply next frame)
+        {
+            let font_id = egui::FontId::new(11.0, egui::FontFamily::Proportional);
+            let mut max_w: f32 = 80.0;
+            // Measure favorites (8px indent + name + 16px for × button)
+            for fav in &self.favorites {
+                let name = fav.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| fav.to_string_lossy().to_string());
+                let text_w = ctx.fonts(|f| f.layout_no_wrap(name, font_id.clone(), egui::Color32::WHITE).size().x);
+                max_w = max_w.max(8.0 + text_w + 16.0);
+            }
+            // Measure tree (recursively through expanded nodes)
+            fn measure_tree(
+                path: &PathBuf,
+                depth: usize,
+                expanded: &HashSet<PathBuf>,
+                cache: &HashMap<PathBuf, Vec<PathBuf>>,
+                font_id: &egui::FontId,
+                ctx: &egui::Context,
+                max_w: &mut f32,
+            ) {
+                let name = path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.to_string_lossy().to_string());
+                let indent = depth as f32 * 10.0;
+                let text_w = ctx.fonts(|f| f.layout_no_wrap(name, font_id.clone(), egui::Color32::WHITE).size().x);
+                *max_w = max_w.max(indent + text_w + 12.0);
+                if expanded.contains(path) {
+                    if let Some(children) = cache.get(path) {
+                        for child in children {
+                            measure_tree(child, depth + 1, expanded, cache, font_id, ctx, max_w);
+                        }
+                    }
+                }
+            }
+            for drive in &self.available_drives {
+                let drive_path = PathBuf::from(drive);
+                measure_tree(&drive_path, 0, &self.tree_expanded, &self.tree_children_cache, &font_id, ctx, &mut max_w);
+            }
+            self.left_panel_width = max_w.min(250.0).max(80.0);
+        }
+
+        // Capture right panel width on first frame, then resize window to fit left+right
+        let inner_w = ctx.input(|i| i.viewport().inner_rect.map(|r| r.width())).unwrap_or(0.0);
+        if self.right_panel_width == 0.0 && inner_w > 0.0 {
+            // Initialise: remember right panel width from the actual window and initial left panel
+            self.right_panel_width = (inner_w - self.left_panel_width - 8.0).max(200.0);
+            self.prev_left_panel_width = self.left_panel_width;
+        } else if self.right_panel_width > 0.0 {
+            let left_changed = (self.left_panel_width - self.prev_left_panel_width).abs() > 0.5;
+            if left_changed {
+                // Left panel changed — resize window to preserve right panel width
+                let desired_w = self.left_panel_width + self.right_panel_width + 8.0;
+                let h = ctx.input(|i| i.viewport().inner_rect.map(|r| r.height())).unwrap_or(600.0);
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(desired_w, h)));
+                self.prev_left_panel_width = self.left_panel_width;
+            } else {
+                // Left panel unchanged — if window width changed, user resized: update right_panel_width
+                let expected_w = self.left_panel_width + self.right_panel_width + 8.0;
+                if (inner_w - expected_w).abs() > 2.0 {
+                    self.right_panel_width = (inner_w - self.left_panel_width - 8.0).max(200.0);
+                }
+            }
+        }
+
         egui::SidePanel::left("left_panel")
-            .exact_width(250.0)
+            .exact_width(self.left_panel_width)
             .resizable(false)
             .show(ctx, |ui| {
                 // ── Favorites ────────────────────────────────────────────
