@@ -736,8 +736,32 @@ fn main() -> Result<(), eframe::Error> {
         let _ = windows::Win32::System::Ole::OleInitialize(None);
     }
 
+    // Parse optional session file from CLI: rusplorer.exe [session.rsess]
+    let session: Option<SessionData> = std::env::args()
+        .nth(1)
+        .and_then(|arg| SessionData::load_from_file(std::path::Path::new(&arg)));
+
     let mut options = eframe::NativeOptions::default();
-    options.viewport.inner_size = Some(egui::vec2(660.0, 600.0));
+    options.viewport.inner_size = session
+        .as_ref()
+        .and_then(|s| s.window_size)
+        .map(|[w, h]| egui::vec2(w, h))
+        .or(Some(egui::vec2(660.0, 600.0)));
+    options.viewport.position = session
+        .as_ref()
+        .and_then(|s| s.window_pos)
+        .map(|[x, y]| egui::pos2(x, y));
+    options.viewport.icon = {
+        let icon_bytes = include_bytes!("../Logo/Rustplorer logo.png");
+        let image = image::load_from_memory(icon_bytes).expect("Failed to load icon");
+        let rgba = image.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        Some(std::sync::Arc::new(egui::IconData {
+            rgba: rgba.into_raw(),
+            width,
+            height,
+        }))
+    };
     eframe::run_native(
         "Rusplorer",
         options,
@@ -784,7 +808,7 @@ fn main() -> Result<(), eframe::Error> {
             style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
             style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
             cc.egui_ctx.set_style(style);
-            Box::new(RusplorerApp::default())
+            Box::new(RusplorerApp::new(session))
         }),
     )
 }
@@ -845,6 +869,31 @@ impl Config {
         if let Ok(content) = serde_json::to_string_pretty(self) {
             let _ = std::fs::write(Self::path(), content);
         }
+    }
+}
+
+/// Snapshot of the current browsing session that can be saved to a `.rsess`
+/// file and restored by passing the file as a CLI argument.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct SessionData {
+    tabs: Vec<TabState>,
+    active_tab: usize,
+    #[serde(default)]
+    window_pos: Option<[f32; 2]>,
+    #[serde(default)]
+    window_size: Option<[f32; 2]>,
+}
+
+impl SessionData {
+    fn save_to_file(&self, path: &std::path::Path) -> Result<(), String> {
+        serde_json::to_string_pretty(self)
+            .map_err(|e| e.to_string())
+            .and_then(|content| std::fs::write(path, content).map_err(|e| e.to_string()))
+    }
+
+    fn load_from_file(path: &std::path::Path) -> Option<Self> {
+        let content = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&content).ok()
     }
 }
 
@@ -940,6 +989,10 @@ struct RusplorerApp {
     _ole_drop_target: Option<windows::Win32::System::Ole::IDropTarget>,
     #[cfg(not(windows))]
     _ole_drop_target: Option<()>,
+    // Save-session dialog
+    show_save_session_dialog: bool,
+    save_session_filename: String,
+    save_session_status: Option<String>,
 }
 
 #[derive(Clone)]
@@ -966,6 +1019,7 @@ struct FileEntry {
 /// Per-tab browsing state.  Lightweight: only stores what needs to be
 /// preserved across tab switches.  Everything else (computed sizes, watcher,
 /// selection, etc.) is rebuilt on switch via `refresh_contents()`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
 struct TabState {
     path: PathBuf,
     back_history: Vec<PathBuf>,
@@ -998,6 +1052,12 @@ impl TabState {
 
 impl Default for RusplorerApp {
     fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+impl RusplorerApp {
+    fn new(session: Option<SessionData>) -> Self {
         let available_drives = Self::list_drives();
         let config = Config::load();
         let start_path = PathBuf::from(&config.last_path);
@@ -1015,7 +1075,12 @@ impl Default for RusplorerApp {
         let (ole_tx, ole_rx) = std::sync::mpsc::channel::<Vec<PathBuf>>();
         let (ole_rc_tx, ole_rc_rx) = std::sync::mpsc::channel::<Vec<PathBuf>>();
         let sort_ascending = config.sort_ascending;
-        let favorites: Vec<PathBuf> = config.favorites.iter().map(PathBuf::from).collect();
+        let mut favorites: Vec<PathBuf> = config.favorites.iter().map(PathBuf::from).collect();
+        favorites.sort_by(|a, b| {
+            let a_name = a.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_else(|| a.to_string_lossy().to_lowercase().into());
+            let b_name = b.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_else(|| b.to_string_lossy().to_lowercase().into());
+            a_name.cmp(&b_name)
+        });
 
         let mut app = Self {
             current_path,
@@ -1097,6 +1162,9 @@ impl Default for RusplorerApp {
             ole_rclick_drop_sender: Some(ole_rc_tx),
             drop_target_registered: false,
             _ole_drop_target: None,
+            show_save_session_dialog: false,
+            save_session_filename: String::new(),
+            save_session_status: None,
         };
 
         // Pre-expand the tree down to the current folder so it's visible on startup.
@@ -1108,15 +1176,33 @@ impl Default for RusplorerApp {
             app.tree_expanded.insert(ancestor);
         }
 
-        // Initialise tabs with the starting path
-        app.tabs.push(TabState {
-            path: app.current_path.clone(),
-            back_history: Vec::new(),
-            forward_history: Vec::new(),
-            filter: app.filter.clone(),
-            sort_column: app.sort_column.clone(),
-            sort_ascending: app.sort_ascending,
-        });
+        // Initialise tabs — from session if provided, otherwise single tab at current path
+        if let Some(sess) = session {
+            if !sess.tabs.is_empty() {
+                app.tabs = sess.tabs;
+                app.active_tab = sess.active_tab.min(app.tabs.len().saturating_sub(1));
+                // Set current_path from the active tab
+                app.current_path = app.tabs[app.active_tab].path.clone();
+                // Expand tree to the active tab's path
+                let ancestors: Vec<PathBuf> = app.current_path.ancestors().map(|p| p.to_path_buf()).collect();
+                for ancestor in ancestors.into_iter().rev() {
+                    let children = read_dir_children(&ancestor);
+                    app.tree_children_cache.insert(ancestor.clone(), children);
+                    app.tree_expanded.insert(ancestor);
+                }
+            } else {
+                app.tabs.push(TabState::new(app.current_path.clone()));
+            }
+        } else {
+            app.tabs.push(TabState {
+                path: app.current_path.clone(),
+                back_history: Vec::new(),
+                forward_history: Vec::new(),
+                filter: app.filter.clone(),
+                sort_column: app.sort_column.clone(),
+                sort_ascending: app.sort_ascending,
+            });
+        }
 
         app.refresh_contents();
         app.start_file_watcher();
@@ -1125,6 +1211,24 @@ impl Default for RusplorerApp {
 }
 
 impl RusplorerApp {
+    /// Snapshot the current tabs into a `SessionData` and write it to `path`.
+    fn save_session_to_file(&mut self, path: &std::path::Path, ctx: &egui::Context) -> Result<(), String> {
+        self.save_active_tab();
+        let (window_pos, window_size) = ctx.input(|i| {
+            let vp = i.viewport();
+            let pos = vp.outer_rect.map(|r| [r.min.x, r.min.y]);
+            let size = vp.inner_rect.map(|r| [r.width(), r.height()]);
+            (pos, size)
+        });
+        let data = SessionData {
+            tabs: self.tabs.clone(),
+            active_tab: self.active_tab,
+            window_pos,
+            window_size,
+        };
+        data.save_to_file(path)
+    }
+
     fn list_drives() -> Vec<String> {
         let mut drives = Vec::new();
 
@@ -1685,7 +1789,11 @@ fn read_dir_children(path: &PathBuf) -> Vec<PathBuf> {
                 .filter(|e| e.path().is_dir())
                 .map(|e| e.path())
                 .collect();
-            children.sort();
+            children.sort_by(|a, b| {
+                let a_name = a.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+                let b_name = b.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+                a_name.cmp(&b_name)
+            });
             children
         })
         .unwrap_or_default()
@@ -2458,6 +2566,11 @@ impl eframe::App for RusplorerApp {
                         {
                             if !self.favorites.contains(&self.current_path) {
                                 self.favorites.push(self.current_path.clone());
+                                self.favorites.sort_by(|a, b| {
+                                    let a_name = a.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_else(|| a.to_string_lossy().to_lowercase().into());
+                                    let b_name = b.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_else(|| b.to_string_lossy().to_lowercase().into());
+                                    a_name.cmp(&b_name)
+                                });
                                 self.config.favorites = self
                                     .favorites
                                     .iter()
@@ -2568,6 +2681,7 @@ impl eframe::App for RusplorerApp {
             let mut switch_to: Option<usize> = None;
             let mut close_idx: Option<usize> = None;
             let mut open_new_tab = false;
+            let mut open_save_session = false;
 
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
@@ -2639,6 +2753,16 @@ impl eframe::App for RusplorerApp {
                 {
                     open_new_tab = true;
                 }
+
+                // Save session button
+                ui.add_space(4.0);
+                if ui
+                    .add(egui::Button::new(egui::RichText::new("💾").small()).frame(false))
+                    .on_hover_text("Save session")
+                    .clicked()
+                {
+                    open_save_session = true;
+                }
             });
             ui.add_space(1.0);
 
@@ -2650,6 +2774,69 @@ impl eframe::App for RusplorerApp {
             }
             if open_new_tab {
                 self.new_tab(None);
+            }
+            if open_save_session {
+                self.save_session_filename = "session.rsess".to_string();
+                self.save_session_status = None;
+                self.show_save_session_dialog = true;
+            }
+
+            // ── Save-session dialog ──────────────────────────────────────
+            if self.show_save_session_dialog {
+                let mut still_open = true;
+                egui::Window::new("Save Session")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .open(&mut still_open)
+                    .show(ctx, |ui| {
+                        ui.label("Save current tabs to a session file.");
+                        ui.label("You can restore it by running:");
+                        ui.label("  rusplorer.exe <file>");
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label("File name:");
+                            ui.text_edit_singleline(&mut self.save_session_filename);
+                        });
+                        if let Some(ref status) = self.save_session_status.clone() {
+                            ui.colored_label(
+                                if status.starts_with("Saved") {
+                                    egui::Color32::from_rgb(50, 160, 50)
+                                } else {
+                                    egui::Color32::RED
+                                },
+                                status,
+                            );
+                        }
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Save").clicked() {
+                                // Resolve path relative to exe directory
+                                let exe_dir = std::env::current_exe()
+                                    .ok()
+                                    .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                                let save_path = exe_dir.join(&self.save_session_filename);
+                                match self.save_session_to_file(&save_path, ctx) {
+                                    Ok(()) => {
+                                        self.save_session_status = Some(format!(
+                                            "Saved to {}",
+                                            save_path.display()
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        self.save_session_status = Some(format!("Error: {e}"));
+                                    }
+                                }
+                            }
+                            if ui.button("Close").clicked() {
+                                self.show_save_session_dialog = false;
+                            }
+                        });
+                    });
+                if !still_open {
+                    self.show_save_session_dialog = false;
+                }
             }
 
             // Drive selector with filter and navigation buttons
@@ -3129,6 +3316,7 @@ impl eframe::App for RusplorerApp {
                                 if !self.dnd_active && !any_btn_down {
                                     self.dnd_start_pos = None;
                                     self.dnd_drag_entry = None;
+                                    self.dnd_is_right_click = false;
                                 }
 
                                 // Activate DnD when dragged far enough with button held
@@ -3190,6 +3378,11 @@ impl eframe::App for RusplorerApp {
                                 }
 
                                 if response.secondary_clicked() && !self.dnd_is_right_click {
+                                    // Select the right-clicked entry if not already part of selection
+                                    if !self.selected_entries.contains(&entry.name) {
+                                        self.selected_entries.clear();
+                                        self.selected_entries.insert(entry.name.clone());
+                                    }
                                     self.show_context_menu = true;
                                     self.context_menu_entry = Some(entry.clone());
                                     self.context_menu_position =

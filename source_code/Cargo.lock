@@ -2841,6 +2841,7 @@ dependencies = [
  "egui-winit",
  "egui_extras",
  "embed-resource",
+ "image 0.25.9",
  "notify",
  "serde",
  "serde_json",
