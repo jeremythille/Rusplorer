@@ -762,8 +762,15 @@ fn main() -> Result<(), eframe::Error> {
             height,
         }))
     };
+    let is_dev = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_lowercase()))
+        .map(|name| name.contains("dev"))
+        .unwrap_or(false);
+    let window_title = if is_dev { "Rusplorer (dev)" } else { "Rusplorer" };
+
     eframe::run_native(
-        "Rusplorer",
+        window_title,
         options,
         Box::new(|cc| {
             // Embed Iosevka Aile Regular + Bold (subsetted) at compile time
@@ -2633,40 +2640,42 @@ impl eframe::App for RusplorerApp {
                 let dnd_drop_target = self.dnd_drop_target_prev.clone(); // use prev for display
                 let dnd_sources: Vec<PathBuf> = self.dnd_sources.clone();
                 let mut tree_hovered_drop: Option<PathBuf> = None;
-                // Constrain the scroll area to the remaining rect so scrolled
-                // tree content cannot bleed over the favorites section above.
+
+                // Use a child_ui with a strict clip rect so the tree scroll
+                // area cannot paint over the favorites section above.
                 let tree_rect = ui.available_rect_before_wrap();
-                ui.allocate_ui_at_rect(tree_rect, |ui| {
-                    ui.set_clip_rect(ui.max_rect());
-                    egui::ScrollArea::vertical()
-                        .id_source("tree_scroll")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.set_min_width(ui.available_width());
-                            ui.set_max_width(ui.available_width());
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            let drives: Vec<PathBuf> = self
-                                .available_drives
-                                .iter()
-                                .map(PathBuf::from)
-                                .collect();
-                            for drive in &drives {
-                                render_tree_node(
-                                    ui,
-                                    drive,
-                                    &mut self.tree_expanded,
-                                    &mut self.tree_children_cache,
-                                    &mut nav_from_panel,
-                                    &self.current_path.clone(),
-                                    0,
-                                    dnd_active,
-                                    &dnd_sources,
-                                    &dnd_drop_target,
-                                    &mut tree_hovered_drop,
-                                );
-                            }
-                        });
-                });
+                let mut child_ui = ui.child_ui(tree_rect, egui::Layout::top_down(egui::Align::LEFT));
+                child_ui.set_clip_rect(tree_rect);
+                egui::ScrollArea::vertical()
+                    .id_source("tree_scroll")
+                    .auto_shrink([false, false])
+                    .show(&mut child_ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.set_max_width(ui.available_width());
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let drives: Vec<PathBuf> = self
+                            .available_drives
+                            .iter()
+                            .map(PathBuf::from)
+                            .collect();
+                        for drive in &drives {
+                            render_tree_node(
+                                ui,
+                                drive,
+                                &mut self.tree_expanded,
+                                &mut self.tree_children_cache,
+                                &mut nav_from_panel,
+                                &self.current_path.clone(),
+                                0,
+                                dnd_active,
+                                &dnd_sources,
+                                &dnd_drop_target,
+                                &mut tree_hovered_drop,
+                            );
+                        }
+                    });
+                // Advance the parent ui past the area we used
+                ui.allocate_rect(tree_rect, egui::Sense::hover());
                 if let Some(target) = tree_hovered_drop {
                     self.dnd_drop_target = Some(target);
                 }
