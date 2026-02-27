@@ -2775,6 +2775,7 @@ impl eframe::App for RusplorerApp {
                                 .map(|n| n.to_string_lossy().to_string())
                                 .unwrap_or_else(|| rclick_path.to_string_lossy().to_string());
                             self.show_context_menu = true;
+                            self.show_bg_context_menu = false;
                             self.context_menu_entry = Some(FileEntry {
                                 name,
                                 is_dir: true,
@@ -3586,13 +3587,24 @@ impl eframe::App for RusplorerApp {
                                     }
                                 }
 
-                                if response.secondary_clicked() && !self.dnd_is_right_click {
+                                // Use raw pointer-position check instead of response.secondary_clicked()
+                                // because secondary_clicked() relies on hovered() which returns false
+                                // when a Foreground Area (bg context menu) overlaps this entry.
+                                let raw_secondary = !self.dnd_is_right_click
+                                    && ctx.input(|i| i.pointer.secondary_released())
+                                    && ctx.input(|i| {
+                                        i.pointer.hover_pos()
+                                            .map_or(false, |p| response.rect.contains(p))
+                                    });
+
+                                if raw_secondary {
                                     // Select the right-clicked entry if not already part of selection
                                     if !self.selected_entries.contains(&entry.name) {
                                         self.selected_entries.clear();
                                         self.selected_entries.insert(entry.name.clone());
                                     }
                                     self.show_context_menu = true;
+                                    self.show_bg_context_menu = false;
                                     self.context_menu_entry = Some(entry.clone());
                                     self.context_menu_tree_path = None; // file list: use current_path + name
                                     self.context_menu_position =
@@ -3719,7 +3731,8 @@ impl eframe::App for RusplorerApp {
                     });
 
             // Background right-click: open menu only when no entry was clicked
-            if !entry_right_clicked && !self.dnd_active {
+            // and no context menu was already opened this frame (e.g. from tree panel)
+            if !entry_right_clicked && !self.dnd_active && !self.show_context_menu {
                 if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
                     if !self.tab_bar_rect.contains(pos)
                         && ctx.input(|i| i.pointer.secondary_released())
@@ -4051,10 +4064,21 @@ impl eframe::App for RusplorerApp {
                     .clone()
                     .unwrap_or_else(|| self.current_path.join(&entry.name));
 
+                // Adjust position: clamp so the menu stays within the window.
+                let screen = ctx.screen_rect();
+                const CM_W: f32 = 180.0;
+                const CM_H: f32 = 260.0;
+                let raw = self.context_menu_position;
+                let adj_x = raw.x.min(screen.max.x - CM_W).max(screen.min.x);
+                let adj_y = raw.y.min(screen.max.y - CM_H).max(screen.min.y);
+
                 egui::Area::new(egui::Id::new("context_menu_area"))
                     .order(egui::Order::Foreground)
-                    .fixed_pos(self.context_menu_position)
+                    .fixed_pos(egui::pos2(adj_x, adj_y))
+                    .interactable(true)
                     .show(ctx, |ui| {
+                        ui.set_min_width(0.0);
+                        ui.set_max_width(CM_W);
                         egui::Frame {
                             fill: egui::Color32::from_rgb(200, 220, 255),
                             stroke: egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
@@ -4063,6 +4087,8 @@ impl eframe::App for RusplorerApp {
                             ..Default::default()
                         }
                         .show(ui, |ui| {
+                        // Use non-justified layout so buttons shrink-wrap to text width
+                        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
                         ui.style_mut().spacing.button_padding = egui::vec2(4.0, 2.0);
 
                         // Open with VS Code
@@ -4149,6 +4175,7 @@ impl eframe::App for RusplorerApp {
                             self.show_context_menu = false;
                             self.context_menu_tree_highlight = None;
                         }
+                        }); // end top_down layout
                     });
                     });
             }
@@ -4163,10 +4190,20 @@ impl eframe::App for RusplorerApp {
 
         // ── Background context menu (right-click on empty space) ─────────────
         if self.show_bg_context_menu {
+            let screen = ctx.screen_rect();
+            const BG_W: f32 = 160.0;
+            const BG_H: f32 = 100.0;
+            let raw = self.bg_context_position;
+            let adj_x = raw.x.min(screen.max.x - BG_W).max(screen.min.x);
+            let adj_y = raw.y.min(screen.max.y - BG_H).max(screen.min.y);
+
             egui::Area::new(egui::Id::new("bg_context_menu_area"))
                 .order(egui::Order::Foreground)
-                .fixed_pos(self.bg_context_position)
+                .fixed_pos(egui::pos2(adj_x, adj_y))
+                .interactable(true)
                 .show(ctx, |ui| {
+                    ui.set_min_width(0.0);
+                    ui.set_max_width(BG_W);
                     egui::Frame {
                         fill: egui::Color32::from_rgb(200, 220, 255),
                         stroke: egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
@@ -4175,6 +4212,7 @@ impl eframe::App for RusplorerApp {
                         ..Default::default()
                     }
                     .show(ui, |ui| {
+                    ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
                         ui.style_mut().spacing.button_padding = egui::vec2(4.0, 2.0);
 
                         if ui.button("📁  New folder").clicked() {
@@ -4194,6 +4232,7 @@ impl eframe::App for RusplorerApp {
                             self.refresh_contents();
                             self.show_bg_context_menu = false;
                         }
+                    }); // end top_down layout
                     });
                 });
 
