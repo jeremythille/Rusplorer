@@ -943,6 +943,7 @@ struct RusplorerApp {
     /// Path of the tree node being right-clicked (for visual highlight).
     context_menu_tree_highlight: Option<PathBuf>,
     context_menu_position: egui::Pos2,
+    context_menu_size: egui::Vec2,
     show_rename_dialog: bool,
     rename_buffer: String,
     // New folder / new file dialogs (triggered from background right-click menu)
@@ -951,6 +952,7 @@ struct RusplorerApp {
     new_item_name_buffer: String,
     show_bg_context_menu: bool,
     bg_context_position: egui::Pos2,
+    bg_context_menu_size: egui::Vec2,
     selected_entries: HashSet<String>,
     show_archive_dialog: bool,
     archive_type: usize,      // 0 = 7z, 1 = zip
@@ -1144,6 +1146,7 @@ impl RusplorerApp {
             context_menu_tree_path: None,
             context_menu_tree_highlight: None,
             context_menu_position: egui::Pos2::ZERO,
+            context_menu_size: egui::vec2(100.0, 100.0),
             show_rename_dialog: false,
             rename_buffer: String::new(),
             show_new_item_dialog: false,
@@ -1151,6 +1154,7 @@ impl RusplorerApp {
             new_item_name_buffer: String::new(),
             show_bg_context_menu: false,
             bg_context_position: egui::Pos2::ZERO,
+            bg_context_menu_size: egui::vec2(100.0, 80.0),
             selected_entries: HashSet::new(),
             show_archive_dialog: false,
             archive_type: 0,
@@ -4066,34 +4070,30 @@ impl eframe::App for RusplorerApp {
 
                 // Adjust position: clamp so the menu stays within the window.
                 let screen = ctx.screen_rect();
-                const CM_W: f32 = 180.0;
-                const CM_H: f32 = 260.0;
+                let ms = self.context_menu_size;
                 let raw = self.context_menu_position;
-                let adj_x = raw.x.min(screen.max.x - CM_W).max(screen.min.x);
-                let adj_y = raw.y.min(screen.max.y - CM_H).max(screen.min.y);
+                let adj_x = raw.x.min(screen.max.x - ms.x).max(screen.min.x);
+                let adj_y = raw.y.min(screen.max.y - ms.y).max(screen.min.y);
 
-                egui::Area::new(egui::Id::new("context_menu_area"))
-                    .order(egui::Order::Foreground)
+                let area_resp = egui::Window::new("ctx_menu")
+                    .title_bar(false)
+                    .collapsible(false)
+                    .resizable(false)
+                    .auto_sized()
                     .fixed_pos(egui::pos2(adj_x, adj_y))
-                    .interactable(true)
+                    .frame(egui::Frame {
+                        fill: egui::Color32::from_rgb(200, 220, 255),
+                        stroke: egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
+                        inner_margin: egui::Margin::same(4.0),
+                        rounding: egui::Rounding::same(4.0),
+                        ..Default::default()
+                    })
                     .show(ctx, |ui| {
-                        ui.set_min_width(0.0);
-                        ui.set_max_width(CM_W);
-                        egui::Frame {
-                            fill: egui::Color32::from_rgb(200, 220, 255),
-                            stroke: egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
-                            inner_margin: egui::Margin::same(4.0),
-                            rounding: egui::Rounding::same(4.0),
-                            ..Default::default()
-                        }
-                        .show(ui, |ui| {
-                        // Use non-justified layout so buttons shrink-wrap to text width
-                        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
                         ui.style_mut().spacing.button_padding = egui::vec2(4.0, 2.0);
 
                         // Open with VS Code
                         if (entry.is_dir || Self::is_code_file(&full_path))
-                            && ui.button("Open with VS Code").clicked()
+                            && ui.horizontal(|ui| ui.button("Open with VS Code").clicked()).inner
                         {
                             #[cfg(windows)]
                             let _ = std::process::Command::new("cmd")
@@ -4107,7 +4107,7 @@ impl eframe::App for RusplorerApp {
                         }
 
                         // Extract here
-                        if Self::is_archive(&full_path) && ui.button("Extract here").clicked() {
+                        if Self::is_archive(&full_path) && ui.horizontal(|ui| ui.button("Extract here").clicked()).inner {
                             self.extract_archive_path = full_path.clone();
                             self.show_extract_dialog = true;
                             self.show_context_menu = false;
@@ -4115,7 +4115,7 @@ impl eframe::App for RusplorerApp {
                         }
 
                         // Add to archive
-                        if ui.button("Add to archive").clicked() {
+                        if ui.horizontal(|ui| ui.button("Add to archive").clicked()).inner {
                             self.files_to_archive.clear();
                             if !self.selected_entries.is_empty() {
                                 for name in &self.selected_entries {
@@ -4144,7 +4144,7 @@ impl eframe::App for RusplorerApp {
                         ui.separator();
 
                         // Copy full path
-                        if ui.button("📋 Copy full path").clicked() {
+                        if ui.horizontal(|ui| ui.button("📋 Copy full path").clicked()).inner {
                             if let Ok(mut clipboard) = Clipboard::new() {
                                 let _ = clipboard.set_text(full_path.to_string_lossy().to_string());
                             }
@@ -4153,7 +4153,7 @@ impl eframe::App for RusplorerApp {
                         }
 
                         // Rename
-                        if !entry.name.starts_with("[..]") && ui.button("Rename").clicked() {
+                        if !entry.name.starts_with("[..]") && ui.horizontal(|ui| ui.button("Rename").clicked()).inner {
                             self.rename_buffer = entry.name.clone();
                             self.show_rename_dialog = true;
                             self.show_context_menu = false;
@@ -4161,7 +4161,7 @@ impl eframe::App for RusplorerApp {
                         }
 
                         // Properties
-                        if ui.button("Properties").clicked() {
+                        if ui.horizontal(|ui| ui.button("Properties").clicked()).inner {
                             let _ = std::process::Command::new("explorer")
                                 .args(&["/select,", &full_path.to_string_lossy()])
                                 .spawn();
@@ -4171,13 +4171,16 @@ impl eframe::App for RusplorerApp {
 
                         ui.separator();
 
-                        if ui.button("Cancel").clicked() {
+                        if ui.horizontal(|ui| ui.button("Cancel").clicked()).inner {
                             self.show_context_menu = false;
                             self.context_menu_tree_highlight = None;
                         }
-                        }); // end top_down layout
                     });
-                    });
+
+                // Store actual rendered size for next-frame clamping
+                if let Some(resp) = area_resp {
+                    self.context_menu_size = resp.response.rect.size();
+                }
             }
 
             // Close context menu if clicked elsewhere
@@ -4191,50 +4194,50 @@ impl eframe::App for RusplorerApp {
         // ── Background context menu (right-click on empty space) ─────────────
         if self.show_bg_context_menu {
             let screen = ctx.screen_rect();
-            const BG_W: f32 = 160.0;
-            const BG_H: f32 = 100.0;
+            let ms = self.bg_context_menu_size;
             let raw = self.bg_context_position;
-            let adj_x = raw.x.min(screen.max.x - BG_W).max(screen.min.x);
-            let adj_y = raw.y.min(screen.max.y - BG_H).max(screen.min.y);
+            let adj_x = raw.x.min(screen.max.x - ms.x).max(screen.min.x);
+            let adj_y = raw.y.min(screen.max.y - ms.y).max(screen.min.y);
 
-            egui::Area::new(egui::Id::new("bg_context_menu_area"))
-                .order(egui::Order::Foreground)
+            let bg_area_resp = egui::Window::new("bg_ctx_menu")
+                .title_bar(false)
+                .collapsible(false)
+                .resizable(false)
+                .auto_sized()
                 .fixed_pos(egui::pos2(adj_x, adj_y))
-                .interactable(true)
+                .frame(egui::Frame {
+                    fill: egui::Color32::from_rgb(200, 220, 255),
+                    stroke: egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
+                    inner_margin: egui::Margin::same(4.0),
+                    rounding: egui::Rounding::same(4.0),
+                    ..Default::default()
+                })
                 .show(ctx, |ui| {
-                    ui.set_min_width(0.0);
-                    ui.set_max_width(BG_W);
-                    egui::Frame {
-                        fill: egui::Color32::from_rgb(200, 220, 255),
-                        stroke: egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
-                        inner_margin: egui::Margin::same(4.0),
-                        rounding: egui::Rounding::same(4.0),
-                        ..Default::default()
-                    }
-                    .show(ui, |ui| {
-                    ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
                         ui.style_mut().spacing.button_padding = egui::vec2(4.0, 2.0);
 
-                        if ui.button("📁  New folder").clicked() {
+                        if ui.horizontal(|ui| ui.button("📁  New folder").clicked()).inner {
                             self.new_item_is_dir = true;
                             self.new_item_name_buffer = "New folder".to_string();
                             self.show_new_item_dialog = true;
                             self.show_bg_context_menu = false;
                         }
-                        if ui.button("📄  New text file").clicked() {
+                        if ui.horizontal(|ui| ui.button("📄  New text file").clicked()).inner {
                             self.new_item_is_dir = false;
                             self.new_item_name_buffer = "New file.txt".to_string();
                             self.show_new_item_dialog = true;
                             self.show_bg_context_menu = false;
                         }
                         ui.separator();
-                        if ui.button("🔄  Refresh").clicked() {
+                        if ui.horizontal(|ui| ui.button("🔄  Refresh").clicked()).inner {
                             self.refresh_contents();
                             self.show_bg_context_menu = false;
                         }
-                    }); // end top_down layout
-                    });
                 });
+
+            // Store actual rendered size for next-frame clamping
+            if let Some(resp) = bg_area_resp {
+                self.bg_context_menu_size = resp.response.rect.size();
+            }
 
             if ctx.input(|i| i.pointer.primary_clicked() || i.key_pressed(egui::Key::Escape)) {
                 self.show_bg_context_menu = false;
