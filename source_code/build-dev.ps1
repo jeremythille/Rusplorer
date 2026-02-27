@@ -9,6 +9,7 @@ $process = Get-Process rusplorer-dev -ErrorAction SilentlyContinue
 if ($process) {
     Stop-Process $process -Force
     Write-Host "Closed running Rusplorer-dev instance"
+    Start-Sleep -Milliseconds 300
 }
 
 # Build dev (fast compilation, slower runtime)
@@ -18,9 +19,9 @@ cargo build
 if ($LASTEXITCODE -eq 0) {
     Write-Host "`nBuild successful!"
 
-    # Rename to rusplorer-dev.exe in place
+    # Rename to rusplorer-dev.exe — consuming rusplorer.exe so it can't be locked on the next build
     $debugDir = ".\target\debug"
-    Copy-Item "$debugDir\rusplorer.exe" -Destination "$debugDir\rusplorer-dev.exe" -Force
+    Move-Item "$debugDir\rusplorer.exe" -Destination "$debugDir\rusplorer-dev.exe" -Force
 
     Write-Host "`nLaunching Rusplorer-dev...`n"
     Start-Process "$debugDir\rusplorer-dev.exe"

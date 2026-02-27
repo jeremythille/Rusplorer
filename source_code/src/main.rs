@@ -837,6 +837,11 @@ struct Config {
     sort_ascending: bool,
     #[serde(default)]
     favorites: Vec<String>,
+    /// Auto-saved tabs on exit, restored on next launch.
+    #[serde(default)]
+    tabs: Option<Vec<TabState>>,
+    #[serde(default)]
+    active_tab: Option<usize>,
 }
 
 fn default_sort_column() -> SortColumn {
@@ -869,6 +874,8 @@ impl Config {
             sort_column: SortColumn::Name,
             sort_ascending: true,
             favorites: Vec::new(),
+            tabs: None,
+            active_tab: None,
         }
     }
 
@@ -930,9 +937,20 @@ struct RusplorerApp {
     stop_watcher: Option<Sender<()>>,
     show_context_menu: bool,
     context_menu_entry: Option<FileEntry>,
+    /// When the context menu was opened from the tree panel, holds the full path
+    /// (overrides current_path + name for path resolution).
+    context_menu_tree_path: Option<PathBuf>,
+    /// Path of the tree node being right-clicked (for visual highlight).
+    context_menu_tree_highlight: Option<PathBuf>,
     context_menu_position: egui::Pos2,
     show_rename_dialog: bool,
     rename_buffer: String,
+    // New folder / new file dialogs (triggered from background right-click menu)
+    show_new_item_dialog: bool,
+    new_item_is_dir: bool,
+    new_item_name_buffer: String,
+    show_bg_context_menu: bool,
+    bg_context_position: egui::Pos2,
     selected_entries: HashSet<String>,
     show_archive_dialog: bool,
     archive_type: usize,      // 0 = 7z, 1 = zip
@@ -1000,6 +1018,12 @@ struct RusplorerApp {
     show_save_session_dialog: bool,
     save_session_filename: String,
     save_session_status: Option<String>,
+    // Tab bar drag-reorder
+    tab_drag_index: Option<usize>,
+    tab_drag_start_x: f32,
+    tab_scroll_to_active: bool,
+    tab_scroll_offset: f32,
+    tab_bar_rect: egui::Rect,
 }
 
 #[derive(Clone)]
@@ -1089,6 +1113,10 @@ impl RusplorerApp {
             a_name.cmp(&b_name)
         });
 
+        // Extract saved tabs before config is moved into the app struct.
+        let config_saved_tabs = config.tabs.clone();
+        let config_saved_active_tab = config.active_tab;
+
         let mut app = Self {
             current_path,
             contents: Vec::new(),
@@ -1113,9 +1141,16 @@ impl RusplorerApp {
             stop_watcher: None,
             show_context_menu: false,
             context_menu_entry: None,
+            context_menu_tree_path: None,
+            context_menu_tree_highlight: None,
             context_menu_position: egui::Pos2::ZERO,
             show_rename_dialog: false,
             rename_buffer: String::new(),
+            show_new_item_dialog: false,
+            new_item_is_dir: false,
+            new_item_name_buffer: String::new(),
+            show_bg_context_menu: false,
+            bg_context_position: egui::Pos2::ZERO,
             selected_entries: HashSet::new(),
             show_archive_dialog: false,
             archive_type: 0,
@@ -1172,6 +1207,11 @@ impl RusplorerApp {
             show_save_session_dialog: false,
             save_session_filename: String::new(),
             save_session_status: None,
+            tab_drag_index: None,
+            tab_drag_start_x: 0.0,
+            tab_scroll_to_active: true,
+            tab_scroll_offset: 0.0,
+            tab_bar_rect: egui::Rect::NOTHING,
         };
 
         // Pre-expand the tree down to the current folder so it's visible on startup.
@@ -1199,6 +1239,28 @@ impl RusplorerApp {
                 }
             } else {
                 app.tabs.push(TabState::new(app.current_path.clone()));
+            }
+        } else if let (Some(saved_tabs), saved_active) = (config_saved_tabs, config_saved_active_tab) {
+            if !saved_tabs.is_empty() {
+                app.tabs = saved_tabs;
+                app.active_tab = saved_active.unwrap_or(0).min(app.tabs.len().saturating_sub(1));
+                app.current_path = app.tabs[app.active_tab].path.clone();
+                // Expand tree to the restored active tab's path
+                let ancestors: Vec<PathBuf> = app.current_path.ancestors().map(|p| p.to_path_buf()).collect();
+                for ancestor in ancestors.into_iter().rev() {
+                    let children = read_dir_children(&ancestor);
+                    app.tree_children_cache.insert(ancestor.clone(), children);
+                    app.tree_expanded.insert(ancestor);
+                }
+            } else {
+                app.tabs.push(TabState {
+                    path: app.current_path.clone(),
+                    back_history: Vec::new(),
+                    forward_history: Vec::new(),
+                    filter: app.filter.clone(),
+                    sort_column: app.sort_column.clone(),
+                    sort_ascending: app.sort_ascending,
+                });
             }
         } else {
             app.tabs.push(TabState {
@@ -1698,59 +1760,45 @@ impl RusplorerApp {
 
     fn format_modified_time(time: SystemTime) -> String {
         use std::time::UNIX_EPOCH;
-        if let Ok(duration) = time.duration_since(UNIX_EPOCH) {
-            let secs = duration.as_secs();
-            let days = secs / 86400;
-            let epoch_start = 719163; // Days from year 0 to 1970-01-01
-            let total_days = epoch_start + days as i64;
+        let Ok(dur) = time.duration_since(UNIX_EPOCH) else {
+            return String::new();
+        };
 
-            // Simple date calculation
-            let mut remaining_days = total_days;
+        // Get local UTC offset in seconds via Windows API.
+        // TIME_ZONE_INFORMATION::Bias is in minutes and is positive west of UTC
+        // (e.g. UTC+1 = Bias -60).  We also add DaylightBias when DST is active.
+        #[cfg(windows)]
+        let local_secs: i64 = {
+            use winapi::um::timezoneapi::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
+            let mut tzi: TIME_ZONE_INFORMATION = unsafe { std::mem::zeroed() };
+            let tz_id = unsafe { GetTimeZoneInformation(&mut tzi) };
+            let is_dst = tz_id == 2; // TIME_ZONE_ID_DAYLIGHT
+            let bias_secs = (tzi.Bias + if is_dst { tzi.DaylightBias } else { tzi.StandardBias }) as i64 * 60;
+            dur.as_secs() as i64 - bias_secs
+        };
+        #[cfg(not(windows))]
+        let local_secs: i64 = dur.as_secs() as i64;
 
-            // Find the year
-            let mut year = (remaining_days / 365) as i32;
-            let mut days_in_years = 0i64;
-            for y in 0..=year {
-                let is_leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
-                days_in_years += if is_leap { 366 } else { 365 };
-            }
-            while days_in_years > total_days {
-                year -= 1;
-                let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-                days_in_years -= if is_leap { 366 } else { 365 };
-            }
-            remaining_days = total_days - days_in_years;
+        if local_secs < 0 { return String::new(); }
+        let secs = local_secs as u64;
 
-            // Find month and day
-            let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-            let days_in_months = if is_leap {
-                [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-            } else {
-                [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-            };
+        let time_of_day = secs % 86400;
+        let hour   = time_of_day / 3600;
+        let minute = (time_of_day % 3600) / 60;
 
-            let mut month = 1;
-            for (i, &days_in_month) in days_in_months.iter().enumerate() {
-                if remaining_days < days_in_month as i64 {
-                    month = i + 1;
-                    break;
-                }
-                remaining_days -= days_in_month as i64;
-            }
-            let day = remaining_days + 1;
+        // Euclidean algorithm for Gregorian calendar (Hinnant, public domain)
+        let z = (secs / 86400) as i64 + 719468;
+        let era = if z >= 0 { z } else { z - 146096 } / 146097;
+        let doe = z - era * 146097;
+        let yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+        let y   = yoe + era * 400;
+        let doy = doe - (365*yoe + yoe/4 - yoe/100);
+        let mp  = (5*doy + 2) / 153;
+        let d   = doy - (153*mp + 2)/5 + 1;
+        let m   = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y   = if m <= 2 { y + 1 } else { y };
 
-            // Time calculation
-            let time_secs = secs % 86400;
-            let hour = time_secs / 3600;
-            let minute = (time_secs % 3600) / 60;
-
-            format!(
-                "{:04}-{:02}-{:02} {:02}:{:02}",
-                year, month, day, hour, minute
-            )
-        } else {
-            String::new()
-        }
+        format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, d, hour, minute)
     }
 
     fn copy_files(sources: &[PathBuf], dest: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
@@ -1782,7 +1830,21 @@ impl RusplorerApp {
     fn move_files(sources: &[PathBuf], dest: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         for source in sources {
             let file_name = source.file_name().unwrap();
-            std::fs::rename(source, dest.join(file_name))?;
+            let target = dest.join(file_name);
+            // rename works only within the same drive/filesystem;
+            // fall back to copy+delete for cross-device moves.
+            if std::fs::rename(source, &target).is_err() {
+                if source.is_dir() {
+                    copy_dir_recursive(source, &target)?;
+                } else {
+                    std::fs::copy(source, &target)?;
+                }
+                if source.is_dir() {
+                    std::fs::remove_dir_all(source)?;
+                } else {
+                    std::fs::remove_file(source)?;
+                }
+            }
         }
         Ok(())
     }
@@ -1818,6 +1880,8 @@ fn render_tree_node(
     dnd_sources: &[PathBuf],
     dnd_drop_target: &Option<PathBuf>,
     hovered_drop: &mut Option<PathBuf>,
+    tree_right_clicked: &mut Option<(PathBuf, egui::Pos2)>,
+    highlight_path: &Option<PathBuf>,
 ) {
     let is_expanded = expanded.contains(path);
     let display_name = path
@@ -1829,9 +1893,10 @@ fn render_tree_node(
     let max_w = ui.available_width();
     let is_current = path == current_path;
     let is_ancestor = !is_current && current_path.ancestors().any(|a| a == path.as_path());
+    let is_tree_highlighted = highlight_path.as_ref() == Some(path);
 
     // Truncate display name to fit available width (prevents layout overflow)
-    let font_id = if is_ancestor || is_current {
+    let font_id = if is_ancestor || is_current || is_tree_highlighted {
         egui::FontId::new(11.0, egui::FontFamily::Name("Bold".into()))
     } else {
         egui::FontId::new(11.0, egui::FontFamily::Proportional)
@@ -1876,7 +1941,7 @@ fn render_tree_node(
                 egui::Color32::BLACK
             };
             let base_text = egui::RichText::new(&truncated_name).color(text_color);
-            let label_text = if is_ancestor || is_current {
+            let label_text = if is_ancestor || is_current || is_tree_highlighted {
                 base_text.font(font_id.clone())
             } else {
                 base_text
@@ -1884,6 +1949,10 @@ fn render_tree_node(
             let button = if is_tree_drop_target {
                 egui::Button::new(label_text)
                     .fill(egui::Color32::from_rgb(80, 200, 80))
+                    .frame(false)
+            } else if is_tree_highlighted {
+                egui::Button::new(label_text)
+                    .fill(egui::Color32::from_rgb(180, 200, 255))
                     .frame(false)
             } else if is_current {
                 egui::Button::new(label_text)
@@ -1912,6 +1981,7 @@ fn render_tree_node(
             }
         }
     }
+    let was_secondary_clicked = response.inner.secondary_clicked();
     if response.inner
             .on_hover_text(path.to_string_lossy())
             .clicked()
@@ -1933,10 +2003,16 @@ fn render_tree_node(
             }
         }
 
+    // Right-click on tree node → context menu
+    if was_secondary_clicked {
+        let pos = ui.input(|i| i.pointer.hover_pos().unwrap_or_default());
+        *tree_right_clicked = Some((path.clone(), pos));
+    }
+
     if is_expanded {
         if let Some(children) = children_cache.get(path).cloned() {
             for child in &children {
-                render_tree_node(ui, child, expanded, children_cache, nav, current_path, depth + 1, dnd_active, dnd_sources, dnd_drop_target, hovered_drop);
+                render_tree_node(ui, child, expanded, children_cache, nav, current_path, depth + 1, dnd_active, dnd_sources, dnd_drop_target, hovered_drop, tree_right_clicked, highlight_path);
             }
         }
     }
@@ -2050,11 +2126,23 @@ impl RusplorerApp {
 
         if needs_refresh {
             self.refresh_contents();
+            // Also refresh the tree cache for current_path so newly created/deleted
+            // subdirectories appear (or disappear) in the left-panel tree.
+            let updated_children = read_dir_children(&self.current_path.clone());
+            self.tree_children_cache.insert(self.current_path.clone(), updated_children);
         }
     }
 }
 
 impl eframe::App for RusplorerApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Flush active tab state back into the tabs vec, then persist to config.
+        self.save_active_tab();
+        self.config.tabs = Some(self.tabs.clone());
+        self.config.active_tab = Some(self.active_tab);
+        self.config.save();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Rotate drop target: prev holds last frame's value for color display;
         // current is reset to None so tree / breadcrumbs / table can detect fresh this frame.
@@ -2388,24 +2476,29 @@ impl eframe::App for RusplorerApp {
         if got_paste {
             #[cfg(windows)]
             {
-                // Try to read from Windows clipboard
-                if let Ok(clipboard_files) = read_files_from_clipboard() {
-                    if !clipboard_files.is_empty() {
-                        let dest = self.current_path.clone();
+                let dest = self.current_path.clone();
 
-                        // Check if these are our internal cut files
-                        let is_cut = self.clipboard_mode == Some(ClipboardMode::Cut)
-                            && clipboard_files == self.clipboard_files;
+                if !self.clipboard_files.is_empty() {
+                    // Use our own internal clipboard — reliable cut/copy detection
+                    let files = self.clipboard_files.clone();
+                    let is_cut = self.clipboard_mode == Some(ClipboardMode::Cut);
 
-                        if is_cut {
-                            let _ = RusplorerApp::move_files(&clipboard_files, &dest);
-                            self.clipboard_files.clear();
-                            self.clipboard_mode = None;
-                        } else {
+                    if is_cut {
+                        let _ = RusplorerApp::move_files(&files, &dest);
+                        self.clipboard_files.clear();
+                        self.clipboard_mode = None;
+                    } else {
+                        let _ = RusplorerApp::copy_files(&files, &dest);
+                    }
+                    self.refresh_contents();
+                } else {
+                    // Nothing in our internal clipboard — try Windows clipboard
+                    // (files copied from Explorer / other apps)
+                    if let Ok(clipboard_files) = read_files_from_clipboard() {
+                        if !clipboard_files.is_empty() {
                             let _ = RusplorerApp::copy_files(&clipboard_files, &dest);
+                            self.refresh_contents();
                         }
-
-                        self.refresh_contents();
                     }
                 }
             }
@@ -2658,6 +2751,7 @@ impl eframe::App for RusplorerApp {
                             .iter()
                             .map(PathBuf::from)
                             .collect();
+                        let mut tree_right_clicked: Option<(PathBuf, egui::Pos2)> = None;
                         for drive in &drives {
                             render_tree_node(
                                 ui,
@@ -2671,7 +2765,29 @@ impl eframe::App for RusplorerApp {
                                 &dnd_sources,
                                 &dnd_drop_target,
                                 &mut tree_hovered_drop,
+                                &mut tree_right_clicked,
+                                &self.context_menu_tree_highlight.clone(),
                             );
+                        }
+                        if let Some((rclick_path, rclick_pos)) = tree_right_clicked {
+                            let name = rclick_path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| rclick_path.to_string_lossy().to_string());
+                            self.show_context_menu = true;
+                            self.context_menu_entry = Some(FileEntry {
+                                name,
+                                is_dir: true,
+                                size: 0,
+                                modified: None,
+                            });
+                            // Override current_path so the context menu resolves the full path
+                            // by joining current_path + name. Since rclick_path already IS the
+                            // full path, set current_path to its parent temporarily — or better,
+                            // store the full path directly.
+                            self.context_menu_tree_path = Some(rclick_path.clone());
+                            self.context_menu_tree_highlight = Some(rclick_path);
+                            self.context_menu_position = rclick_pos;
                         }
                     });
                 // Advance the parent ui past the area we used
@@ -2691,70 +2807,159 @@ impl eframe::App for RusplorerApp {
             let mut close_idx: Option<usize> = None;
             let mut open_new_tab = false;
             let mut open_save_session = false;
+            let mut drag_swap: Option<(usize, usize)> = None;
 
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                for i in 0..self.tabs.len() {
-                    let is_active = i == self.active_tab;
-                    let label_text = self.tabs[i].label();
-                    let display = if label_text.len() > 20 {
-                        format!("{}…", &label_text[..19])
-                    } else {
-                        label_text.clone()
-                    };
+            // ── Scrollable tab bar ───────────────────────────────────────
+            let tab_bar_id = egui::Id::new("tab_bar_scroll");
 
-                    let fill = if is_active {
-                        egui::Color32::from_rgb(60, 60, 60)
-                    } else {
-                        egui::Color32::from_rgb(40, 40, 40)
-                    };
+            let tab_bar_resp = ui.horizontal(|ui| {
+                // Tabs in a scroll area (without + and 💾 buttons)
+                let available_w = ui.available_width() - 50.0; // reserve space for + and 💾
+                let scroll_output = egui::ScrollArea::horizontal()
+                    .id_source(tab_bar_id)
+                    .auto_shrink([false, false])
+                    .max_width(available_w)
+                    .max_height(24.0)
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .drag_to_scroll(false)
+                    .scroll_offset(egui::vec2(self.tab_scroll_offset, 0.0))
+                    .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
 
-                    let frame = egui::Frame::none()
-                        .fill(fill)
-                        .inner_margin(egui::Margin::symmetric(6.0, 3.0))
-                        .rounding(egui::Rounding { nw: 4.0, ne: 4.0, sw: 0.0, se: 0.0 });
+                    // Collect tab rects for drag-reorder hit testing
+                    let mut tab_rects: Vec<egui::Rect> = Vec::with_capacity(self.tabs.len());
 
-                    let resp = frame.show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            let text_color = if is_active {
-                                egui::Color32::WHITE
-                            } else {
-                                egui::Color32::GRAY
-                            };
-                            let tab_btn = ui.add(
-                                egui::Button::new(
-                                    egui::RichText::new(&display).color(text_color).small(),
-                                )
-                                .frame(false),
-                            );
-                            if tab_btn.clicked() {
-                                switch_to = Some(i);
-                            }
-                            tab_btn.on_hover_text(self.tabs[i].path.to_string_lossy());
+                    for i in 0..self.tabs.len() {
+                        let is_active = i == self.active_tab;
+                        let label_text = self.tabs[i].label();
+                        let display = if label_text.len() > 20 {
+                            format!("{}…", &label_text[..19])
+                        } else {
+                            label_text.clone()
+                        };
 
-                            // Close button (only when more than 1 tab)
-                            if self.tabs.len() > 1 {
-                                let close = ui.add(
+                        let is_being_dragged = self.tab_drag_index == Some(i);
+
+                        let fill = if is_being_dragged {
+                            egui::Color32::from_rgb(80, 80, 100)
+                        } else if is_active {
+                            egui::Color32::from_rgb(60, 60, 60)
+                        } else {
+                            egui::Color32::from_rgb(40, 40, 40)
+                        };
+
+                        let frame = egui::Frame::none()
+                            .fill(fill)
+                            .inner_margin(egui::Margin::symmetric(6.0, 3.0))
+                            .rounding(egui::Rounding { nw: 4.0, ne: 4.0, sw: 0.0, se: 0.0 });
+
+                        let resp = frame.show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                let text_color = if is_active {
+                                    egui::Color32::WHITE
+                                } else {
+                                    egui::Color32::GRAY
+                                };
+                                let tab_btn = ui.add(
                                     egui::Button::new(
-                                        egui::RichText::new("×").color(text_color).small(),
+                                        egui::RichText::new(&display).color(text_color).small(),
                                     )
                                     .frame(false),
                                 );
-                                if close.clicked() {
-                                    close_idx = Some(i);
+                                if tab_btn.clicked() {
+                                    switch_to = Some(i);
+                                }
+                                tab_btn.on_hover_text(self.tabs[i].path.to_string_lossy());
+
+                                // Close button (only when more than 1 tab)
+                                if self.tabs.len() > 1 {
+                                    let close = ui.add(
+                                        egui::Button::new(
+                                            egui::RichText::new("×").color(text_color).small(),
+                                        )
+                                        .frame(false),
+                                    );
+                                    if close.clicked() {
+                                        close_idx = Some(i);
+                                    }
+                                }
+                            });
+                        });
+
+                        let tab_rect = resp.response.rect;
+                        tab_rects.push(tab_rect);
+
+                        // Middle-click anywhere on the tab to close
+                        if resp.response.middle_clicked() && self.tabs.len() > 1 {
+                            close_idx = Some(i);
+                        }
+
+                        // Drag-reorder: use explicit drag sense (frame response lacks it)
+                        let drag_resp = ui.interact(
+                            tab_rect,
+                            egui::Id::new("tab_drag").with(i),
+                            egui::Sense::drag(),
+                        );
+                        if drag_resp.drag_started() {
+                            self.tab_drag_index = Some(i);
+                            self.tab_drag_start_x = tab_rect.center().x;
+                        }
+                    }
+
+                    // Drag-reorder: detect swap while dragging
+                    if let Some(drag_idx) = self.tab_drag_index {
+                        if let Some(pointer_pos) = ui.input(|i| i.pointer.hover_pos()) {
+                            for (j, rect) in tab_rects.iter().enumerate() {
+                                if j != drag_idx && rect.contains(pointer_pos) {
+                                    drag_swap = Some((drag_idx, j));
+                                    break;
                                 }
                             }
-                        });
-                    });
+                        }
+                        // End drag on release
+                        if !ui.input(|i| i.pointer.primary_down()) {
+                            self.tab_drag_index = None;
+                        }
+                    }
+                    tab_rects  // return so we can use for scroll-to-active
+                    })  // end inner ui.horizontal
+                });  // end ScrollArea
 
-                    // Middle-click anywhere on the tab to close
-                    if resp.response.middle_clicked() && self.tabs.len() > 1 {
-                        close_idx = Some(i);
+                // Sync actual scroll offset (egui may have clamped it)
+                self.tab_scroll_offset = scroll_output.state.offset.x;
+
+                // Scroll-to-active: bring the active tab into the viewport
+                if self.tab_scroll_to_active {
+                    let tab_rects = &scroll_output.inner.inner;
+                    if let Some(active_rect) = tab_rects.get(self.active_tab) {
+                        let viewport_min_x = scroll_output.inner_rect.min.x;
+                        let viewport_w    = scroll_output.inner_rect.width();
+                        // content_x = screen_x - viewport_min_x + current_offset
+                        let content_x = active_rect.min.x - viewport_min_x + self.tab_scroll_offset;
+                        // center the tab in the viewport, clamped to ≥ 0
+                        let target = (content_x - viewport_w / 2.0).max(0.0);
+                        self.tab_scroll_offset = target;
+                    }
+                    self.tab_scroll_to_active = false;
+                    ctx.request_repaint();
+                }
+
+                // Mouse wheel on tab bar → horizontal scroll
+                {
+                    let hover = ctx.input(|i| i.pointer.hover_pos().unwrap_or_default());
+                    if self.tab_bar_rect.contains(hover) || scroll_output.inner_rect.contains(hover) {
+                        let dy = ctx.input(|i| i.raw_scroll_delta.y);
+                        if dy != 0.0 {
+                            self.tab_scroll_offset = (self.tab_scroll_offset - dy * 30.0).max(0.0);
+                            ctx.request_repaint();
+                        }
                     }
                 }
 
-                // "+" button to add a new tab
+                // "+" and save buttons OUTSIDE the scroll area (pinned at end)
+                ui.add_space(4.0);
                 if ui
                     .add(egui::Button::new(egui::RichText::new("+").small()).frame(false))
                     .on_hover_text("New tab")
@@ -2762,8 +2967,6 @@ impl eframe::App for RusplorerApp {
                 {
                     open_new_tab = true;
                 }
-
-                // Save session button
                 ui.add_space(4.0);
                 if ui
                     .add(egui::Button::new(egui::RichText::new("💾").small()).frame(false))
@@ -2772,17 +2975,32 @@ impl eframe::App for RusplorerApp {
                 {
                     open_save_session = true;
                 }
-            });
+            });  // end outer ui.horizontal
+            self.tab_bar_rect = tab_bar_resp.response.rect;
+
             ui.add_space(1.0);
 
             // Process tab actions (after the borrow of self.tabs in the loop ends)
+            if let Some((from, to)) = drag_swap {
+                self.save_active_tab();
+                self.tabs.swap(from, to);
+                // Keep active_tab in sync
+                if self.active_tab == from {
+                    self.active_tab = to;
+                } else if self.active_tab == to {
+                    self.active_tab = from;
+                }
+                self.tab_drag_index = Some(to);
+            }
             if let Some(idx) = close_idx {
                 self.close_tab(idx);
             } else if let Some(idx) = switch_to {
                 self.switch_to_tab(idx);
+                self.tab_scroll_to_active = true;
             }
             if open_new_tab {
                 self.new_tab(None);
+                self.tab_scroll_to_active = true;
             }
             if open_save_session {
                 self.save_session_filename = "session.rsess".to_string();
@@ -2867,28 +3085,7 @@ impl eframe::App for RusplorerApp {
                     ui.text_edit_singleline(&mut self.filter);
                 });
 
-                // Add space and push navigation buttons to the right
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("🔄").on_hover_text("Refresh").clicked() {
-                        self.refresh_contents();
-                    }
 
-                    let forward_enabled = !self.forward_history.is_empty();
-                    if ui
-                        .add_enabled(forward_enabled, egui::Button::new("▶"))
-                        .clicked()
-                    {
-                        self.go_forward();
-                    }
-
-                    let back_enabled = !self.back_history.is_empty();
-                    if ui
-                        .add_enabled(back_enabled, egui::Button::new("◀"))
-                        .clicked()
-                    {
-                        self.go_back();
-                    }
-                });
             });
 
             // Handle drive selection
@@ -3073,6 +3270,9 @@ impl eframe::App for RusplorerApp {
                 18.0
             }; // +20 for X button + padding
             let name_col_w = (available - size_col_w - date_col_w - 15.0).max(50.0);
+
+            // Track whether a right-click was consumed by an entry this frame
+            let mut entry_right_clicked = false;
 
             // Pre-filter entries for the table body
             let filter_lower = self.filter.to_lowercase();
@@ -3394,8 +3594,10 @@ impl eframe::App for RusplorerApp {
                                     }
                                     self.show_context_menu = true;
                                     self.context_menu_entry = Some(entry.clone());
+                                    self.context_menu_tree_path = None; // file list: use current_path + name
                                     self.context_menu_position =
                                         ui.input(|i| i.pointer.hover_pos().unwrap_or_default());
+                                    entry_right_clicked = true;
                                 }
 
                                 if response.double_clicked() {
@@ -3516,11 +3718,26 @@ impl eframe::App for RusplorerApp {
                         });
                     });
 
-            // Handle rectangular selection (only when not dragging files)
-            if !self.dnd_active {
+            // Background right-click: open menu only when no entry was clicked
+            if !entry_right_clicked && !self.dnd_active {
+                if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
+                    if !self.tab_bar_rect.contains(pos)
+                        && ctx.input(|i| i.pointer.secondary_released())
+                    {
+                        self.show_bg_context_menu = true;
+                        self.show_context_menu = false;
+                        self.bg_context_position = pos;
+                    }
+                }
+            }
+
+            // Handle rectangular selection (only when not dragging files or tabs,
+            // and not hovering the tab bar area at the top of the panel)
+            if !self.dnd_active && self.tab_drag_index.is_none() {
             ctx.input(|i| {
                 if let Some(pointer_pos) = i.pointer.hover_pos() {
-                    if i.pointer.primary_pressed() && !self.any_button_hovered {
+                    let in_tab_bar = self.tab_bar_rect.contains(pointer_pos);
+                    if i.pointer.primary_pressed() && !self.any_button_hovered && !in_tab_bar {
                         self.is_dragging_selection = true;
                         self.selection_drag_start = Some(pointer_pos);
                         self.selection_drag_current = Some(pointer_pos);
@@ -3552,7 +3769,7 @@ impl eframe::App for RusplorerApp {
                     }
                 }
             });
-            } // end if !self.dnd_active
+            } // end if !self.dnd_active && tab_drag_index.is_none()
 
             if sort_changed {
                 self.sort_contents();
@@ -3828,28 +4045,39 @@ impl eframe::App for RusplorerApp {
         // Context menu
         if self.show_context_menu {
             if let Some(ref entry) = self.context_menu_entry {
-                let full_path = self.current_path.join(&entry.name);
+                // When opened from the tree, use the full path directly;
+                // when opened from the file list, join current_path + name.
+                let full_path = self.context_menu_tree_path
+                    .clone()
+                    .unwrap_or_else(|| self.current_path.join(&entry.name));
 
-                egui::Window::new("Context Menu")
-                    .collapsible(false)
-                    .resizable(false)
-                    .title_bar(false)
+                egui::Area::new(egui::Id::new("context_menu_area"))
+                    .order(egui::Order::Foreground)
                     .fixed_pos(self.context_menu_position)
-                    .default_width(0.0)
-                    .frame(egui::Frame {
-                        fill: egui::Color32::from_rgb(200, 220, 255),
-                        stroke: egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
-                        ..Default::default()
-                    })
                     .show(ctx, |ui| {
+                        egui::Frame {
+                            fill: egui::Color32::from_rgb(200, 220, 255),
+                            stroke: egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
+                            inner_margin: egui::Margin::same(4.0),
+                            rounding: egui::Rounding::same(4.0),
+                            ..Default::default()
+                        }
+                        .show(ui, |ui| {
                         ui.style_mut().spacing.button_padding = egui::vec2(4.0, 2.0);
 
                         // Open with VS Code
                         if (entry.is_dir || Self::is_code_file(&full_path))
-                            && ui.button("Open with Code").clicked()
+                            && ui.button("Open with VS Code").clicked()
                         {
+                            #[cfg(windows)]
+                            let _ = std::process::Command::new("cmd")
+                                .args(["/C", "code", full_path.to_string_lossy().as_ref()])
+                                .spawn();
+                            #[cfg(not(windows))]
                             let _ = std::process::Command::new("code").arg(&full_path).spawn();
                             self.show_context_menu = false;
+                            self.context_menu_tree_path = None;
+                            self.context_menu_tree_highlight = None;
                         }
 
                         // Extract here
@@ -3857,6 +4085,7 @@ impl eframe::App for RusplorerApp {
                             self.extract_archive_path = full_path.clone();
                             self.show_extract_dialog = true;
                             self.show_context_menu = false;
+                            self.context_menu_tree_highlight = None;
                         }
 
                         // Add to archive
@@ -3883,6 +4112,7 @@ impl eframe::App for RusplorerApp {
                             self.archive_name_buffer = stem;
                             self.show_archive_dialog = true;
                             self.show_context_menu = false;
+                            self.context_menu_tree_highlight = None;
                         }
 
                         ui.separator();
@@ -3893,6 +4123,7 @@ impl eframe::App for RusplorerApp {
                                 let _ = clipboard.set_text(full_path.to_string_lossy().to_string());
                             }
                             self.show_context_menu = false;
+                            self.context_menu_tree_highlight = None;
                         }
 
                         // Rename
@@ -3900,6 +4131,7 @@ impl eframe::App for RusplorerApp {
                             self.rename_buffer = entry.name.clone();
                             self.show_rename_dialog = true;
                             self.show_context_menu = false;
+                            self.context_menu_tree_highlight = None;
                         }
 
                         // Properties
@@ -3908,19 +4140,65 @@ impl eframe::App for RusplorerApp {
                                 .args(&["/select,", &full_path.to_string_lossy()])
                                 .spawn();
                             self.show_context_menu = false;
+                            self.context_menu_tree_highlight = None;
                         }
 
                         ui.separator();
 
                         if ui.button("Cancel").clicked() {
                             self.show_context_menu = false;
+                            self.context_menu_tree_highlight = None;
                         }
+                    });
                     });
             }
 
             // Close context menu if clicked elsewhere
             if ctx.input(|i| i.pointer.primary_clicked() || i.key_pressed(egui::Key::Escape)) {
                 self.show_context_menu = false;
+                self.context_menu_tree_path = None;
+                self.context_menu_tree_highlight = None;
+            }
+        }
+
+        // ── Background context menu (right-click on empty space) ─────────────
+        if self.show_bg_context_menu {
+            egui::Area::new(egui::Id::new("bg_context_menu_area"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(self.bg_context_position)
+                .show(ctx, |ui| {
+                    egui::Frame {
+                        fill: egui::Color32::from_rgb(200, 220, 255),
+                        stroke: egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
+                        inner_margin: egui::Margin::same(4.0),
+                        rounding: egui::Rounding::same(4.0),
+                        ..Default::default()
+                    }
+                    .show(ui, |ui| {
+                        ui.style_mut().spacing.button_padding = egui::vec2(4.0, 2.0);
+
+                        if ui.button("📁  New folder").clicked() {
+                            self.new_item_is_dir = true;
+                            self.new_item_name_buffer = "New folder".to_string();
+                            self.show_new_item_dialog = true;
+                            self.show_bg_context_menu = false;
+                        }
+                        if ui.button("📄  New text file").clicked() {
+                            self.new_item_is_dir = false;
+                            self.new_item_name_buffer = "New file.txt".to_string();
+                            self.show_new_item_dialog = true;
+                            self.show_bg_context_menu = false;
+                        }
+                        ui.separator();
+                        if ui.button("🔄  Refresh").clicked() {
+                            self.refresh_contents();
+                            self.show_bg_context_menu = false;
+                        }
+                    });
+                });
+
+            if ctx.input(|i| i.pointer.primary_clicked() || i.key_pressed(egui::Key::Escape)) {
+                self.show_bg_context_menu = false;
             }
         }
 
@@ -4064,6 +4342,47 @@ impl eframe::App for RusplorerApp {
         }
 
         // Rename dialog
+        // ── New folder / New file dialog ──────────────────────────────────
+        if self.show_new_item_dialog {
+            let title = if self.new_item_is_dir { "New folder" } else { "New text file" };
+            let mut close_dialog = false;
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label("Name:");
+                    let resp = ui.text_edit_singleline(&mut self.new_item_name_buffer);
+
+                    // Auto-focus on first frame
+                    resp.request_focus();
+
+                    let confirmed = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+                    ui.horizontal(|ui| {
+                        if ui.button("OK").clicked() || confirmed {
+                            let name = self.new_item_name_buffer.trim().to_string();
+                            if !name.is_empty() {
+                                let target = self.current_path.join(&name);
+                                if self.new_item_is_dir {
+                                    let _ = std::fs::create_dir(&target);
+                                } else {
+                                    let _ = std::fs::File::create(&target);
+                                }
+                                self.refresh_contents();
+                            }
+                            close_dialog = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close_dialog = true;
+                        }
+                    });
+                });
+            if close_dialog {
+                self.show_new_item_dialog = false;
+            }
+        }
+
         if self.show_rename_dialog {
             if let Some(entry) = self.context_menu_entry.clone() {
                 let entry_name = entry.name.clone();
@@ -4133,12 +4452,14 @@ impl eframe::App for RusplorerApp {
                 });
         }
 
-        // Only repaint if sizes are still being loaded or user is interacting
-        if self.size_receiver.is_some() {
-            ctx.request_repaint();
-        } else {
-            // No active operations, repaint at a lower rate
-            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        // Request repaints only while background work is in-flight.
+        // Otherwise egui repaints on user input automatically — no need
+        // to poll, so the app uses 0% CPU when idle.
+        let has_bg_work = self.size_receiver.is_some()
+            || self.archive_done_receiver.is_some()
+            || self.extract_done_receiver.is_some();
+        if has_bg_work {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
 }
