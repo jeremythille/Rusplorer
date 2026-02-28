@@ -2751,9 +2751,6 @@ impl eframe::App for RusplorerApp {
                 ui.separator();
 
                 // ── Folder tree ──────────────────────────────────────────
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("📁 Tree").small());
-                });
                 let dnd_active = self.dnd_active;
                 let dnd_drop_target = self.dnd_drop_target_prev.clone(); // use prev for display
                 let dnd_sources: Vec<PathBuf> = self.dnd_sources.clone();
@@ -2877,6 +2874,7 @@ impl eframe::App for RusplorerApp {
                             .inner_margin(egui::Margin::symmetric(6.0, 3.0))
                             .rounding(egui::Rounding { nw: 4.0, ne: 4.0, sw: 0.0, se: 0.0 });
 
+                        let mut close_btn_rect = egui::Rect::NOTHING;
                         let resp = frame.show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 4.0;
@@ -2885,28 +2883,22 @@ impl eframe::App for RusplorerApp {
                                 } else {
                                     egui::Color32::GRAY
                                 };
-                                let tab_btn = ui.add(
-                                    egui::Button::new(
+                                ui.add(
+                                    egui::Label::new(
                                         egui::RichText::new(&display).color(text_color).small(),
-                                    )
-                                    .frame(false),
-                                );
-                                if tab_btn.clicked() {
-                                    switch_to = Some(i);
-                                }
-                                tab_btn.on_hover_text(self.tabs[i].path.to_string_lossy());
+                                    ),
+                                ).on_hover_text(self.tabs[i].path.to_string_lossy());
 
-                                // Close button (only when more than 1 tab)
+                                // Close label (only when more than 1 tab) — interaction
+                                // is handled below via the single tab_sense interact so
+                                // there's no competing click-sense widget inside the frame.
                                 if self.tabs.len() > 1 {
-                                    let close = ui.add(
-                                        egui::Button::new(
+                                    let close_resp = ui.add(
+                                        egui::Label::new(
                                             egui::RichText::new("×").color(text_color).small(),
-                                        )
-                                        .frame(false),
+                                        ),
                                     );
-                                    if close.clicked() {
-                                        close_idx = Some(i);
-                                    }
+                                    close_btn_rect = close_resp.rect;
                                 }
                             });
                         });
@@ -2914,20 +2906,44 @@ impl eframe::App for RusplorerApp {
                         let tab_rect = resp.response.rect;
                         tab_rects.push(tab_rect);
 
-                        // Middle-click anywhere on the tab to close
-                        if resp.response.middle_clicked() && self.tabs.len() > 1 {
-                            close_idx = Some(i);
+                        // Single interact over the whole tab rect — no competing widgets inside.
+                        let tab_sense = ui.interact(
+                            tab_rect,
+                            egui::Id::new("tab_click").with(i),
+                            egui::Sense::click(),
+                        );
+                        if tab_sense.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if tab_sense.clicked() {
+                            let pos = tab_sense.interact_pointer_pos().unwrap_or_default();
+                            if close_btn_rect != egui::Rect::NOTHING && close_btn_rect.contains(pos) {
+                                close_idx = Some(i);
+                            } else {
+                                switch_to = Some(i);
+                            }
                         }
 
-                        // Drag-reorder: use explicit drag sense (frame response lacks it)
-                        let drag_resp = ui.interact(
-                            tab_rect,
-                            egui::Id::new("tab_drag").with(i),
-                            egui::Sense::drag(),
-                        );
-                        if drag_resp.drag_started() {
-                            self.tab_drag_index = Some(i);
-                            self.tab_drag_start_x = tab_rect.center().x;
+                        // Middle-click anywhere on the tab to close
+                        if tab_sense.middle_clicked() && self.tabs.len() > 1 {
+                            close_idx = Some(i);
+                        }
+                    }
+
+                    // Drag-reorder: detect drag-start from pointer state + tab rects
+                    // (done outside the per-tab loop to avoid an overlapping ui.interact()
+                    //  that would steal click events from the buttons inside each tab)
+                    if self.tab_drag_index.is_none() {
+                        if let Some(press_origin) = ui.input(|i| i.pointer.press_origin()) {
+                            if ui.input(|i| i.pointer.primary_down()) && ui.input(|i| i.pointer.is_moving()) {
+                                for (i, rect) in tab_rects.iter().enumerate() {
+                                    if rect.contains(press_origin) {
+                                        self.tab_drag_index = Some(i);
+                                        self.tab_drag_start_x = rect.center().x;
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -2949,6 +2965,18 @@ impl eframe::App for RusplorerApp {
                     tab_rects  // return so we can use for scroll-to-active
                     })  // end inner ui.horizontal
                 });  // end ScrollArea
+
+                // Double-click on empty tab-bar space → new tab
+                if ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)) {
+                    if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                        if scroll_output.inner_rect.contains(pos) {
+                            let on_tab = scroll_output.inner.inner.iter().any(|r| r.contains(pos));
+                            if !on_tab {
+                                open_new_tab = true;
+                            }
+                        }
+                    }
+                }
 
                 // Sync actual scroll offset (egui may have clamped it)
                 self.tab_scroll_offset = scroll_output.state.offset.x;
@@ -4123,7 +4151,6 @@ impl eframe::App for RusplorerApp {
                     "📋 Copy full path",
                     "Rename",
                     "Properties",
-                    "Cancel",
                 ];
                 if entry.is_dir || Self::is_code_file(&full_path) {
                     labels.push("Open with VS Code");
@@ -4245,15 +4272,6 @@ impl eframe::App for RusplorerApp {
                                 self.context_menu_tree_highlight = None;
                             }
 
-                            // Thin separator line
-                            let (line_rect, _) = ui.allocate_exact_size(egui::vec2(menu_w, 1.0), egui::Sense::hover());
-                            ui.painter().rect_filled(line_rect, 0.0, egui::Color32::from_gray(160));
-                            ui.add_space(2.0);
-
-                            if ui.add_sized([menu_w, 0.0], egui::Button::new("Cancel")).clicked() {
-                                self.show_context_menu = false;
-                                self.context_menu_tree_highlight = None;
-                            }
                         });
                     });
 
