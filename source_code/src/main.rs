@@ -1025,6 +1025,7 @@ struct RusplorerApp {
     tab_drag_start_x: f32,
     tab_scroll_to_active: bool,
     tab_scroll_offset: f32,
+    tab_scroll_target: f32,
     tab_bar_rect: egui::Rect,
 }
 
@@ -1215,6 +1216,7 @@ impl RusplorerApp {
             tab_drag_start_x: 0.0,
             tab_scroll_to_active: true,
             tab_scroll_offset: 0.0,
+            tab_scroll_target: 0.0,
             tab_bar_rect: egui::Rect::NOTHING,
         };
 
@@ -1835,6 +1837,10 @@ impl RusplorerApp {
         for source in sources {
             let file_name = source.file_name().unwrap();
             let target = dest.join(file_name);
+            // No-op if already in place
+            if source == &target {
+                continue;
+            }
             // rename works only within the same drive/filesystem;
             // fall back to copy+delete for cross-device moves.
             if std::fs::rename(source, &target).is_err() {
@@ -1935,7 +1941,7 @@ fn render_tree_node(
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
             ui.set_max_width(max_w);
-            ui.set_clip_rect(ui.max_rect());
+            ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
             if indent > 0.0 {
                 ui.add_space(indent);
             }
@@ -2444,10 +2450,9 @@ impl eframe::App for RusplorerApp {
 
             #[cfg(windows)]
             {
-                if let Ok(_) = copy_files_to_clipboard(&files) {
-                    self.clipboard_files = files;
-                    self.clipboard_mode = Some(ClipboardMode::Copy);
-                }
+                let _ = copy_files_to_clipboard(&files); // best-effort; internal clipboard always set
+                self.clipboard_files = files;
+                self.clipboard_mode = Some(ClipboardMode::Copy);
             }
             #[cfg(not(windows))]
             {
@@ -2465,10 +2470,9 @@ impl eframe::App for RusplorerApp {
 
             #[cfg(windows)]
             {
-                if let Ok(_) = copy_files_to_clipboard(&files) {
-                    self.clipboard_files = files;
-                    self.clipboard_mode = Some(ClipboardMode::Cut);
-                }
+                let _ = copy_files_to_clipboard(&files); // best-effort; internal clipboard always set
+                self.clipboard_files = files;
+                self.clipboard_mode = Some(ClipboardMode::Cut);
             }
             #[cfg(not(windows))]
             {
@@ -2568,6 +2572,23 @@ impl eframe::App for RusplorerApp {
                         self.selected_entries.clear();
                         self.refresh_contents();
                     }
+                }
+            }
+        }
+
+        // F2 → rename the single selected entry
+        if self.is_focused
+            && !self.show_rename_dialog
+            && ctx.input(|i| i.key_pressed(egui::Key::F2))
+        {
+            if self.selected_entries.len() == 1 {
+                let name = self.selected_entries.iter().next().unwrap().clone();
+                if let Some(entry) = self.contents.iter().find(|e| e.name == name) {
+                    self.rename_buffer = entry.name.clone();
+                    self.context_menu_entry = Some(entry.clone());
+                    self.context_menu_tree_path = None;
+                    self.show_rename_dialog = true;
+                    self.show_context_menu = false;
                 }
             }
         }
@@ -2740,13 +2761,12 @@ impl eframe::App for RusplorerApp {
 
                 // Use a child_ui with a strict clip rect so the tree scroll
                 // area cannot paint over the favorites section above.
-                let tree_rect = ui.available_rect_before_wrap();
-                let mut child_ui = ui.child_ui(tree_rect, egui::Layout::top_down(egui::Align::LEFT));
-                child_ui.set_clip_rect(tree_rect);
+                let tree_available_h = ui.available_height();
                 egui::ScrollArea::vertical()
                     .id_source("tree_scroll")
                     .auto_shrink([false, false])
-                    .show(&mut child_ui, |ui| {
+                    .max_height(tree_available_h)
+                    .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         ui.set_max_width(ui.available_width());
                         ui.spacing_mut().item_spacing.y = 0.0;
@@ -2795,8 +2815,6 @@ impl eframe::App for RusplorerApp {
                             self.context_menu_position = rclick_pos;
                         }
                     });
-                // Advance the parent ui past the area we used
-                ui.allocate_rect(tree_rect, egui::Sense::hover());
                 if let Some(target) = tree_hovered_drop {
                     self.dnd_drop_target = Some(target);
                 }
@@ -2935,6 +2953,10 @@ impl eframe::App for RusplorerApp {
                 // Sync actual scroll offset (egui may have clamped it)
                 self.tab_scroll_offset = scroll_output.state.offset.x;
 
+                // Cap target so we never animate past the real maximum
+                let max_scroll = (scroll_output.content_size.x - scroll_output.inner_rect.width()).max(0.0);
+                self.tab_scroll_target = self.tab_scroll_target.min(max_scroll);
+
                 // Scroll-to-active: bring the active tab into the viewport
                 if self.tab_scroll_to_active {
                     let tab_rects = &scroll_output.inner.inner;
@@ -2945,22 +2967,32 @@ impl eframe::App for RusplorerApp {
                         let content_x = active_rect.min.x - viewport_min_x + self.tab_scroll_offset;
                         // center the tab in the viewport, clamped to ≥ 0
                         let target = (content_x - viewport_w / 2.0).max(0.0);
-                        self.tab_scroll_offset = target;
+                        self.tab_scroll_target = target;
+                        self.tab_scroll_offset = target; // snap immediately on tab switch
                     }
                     self.tab_scroll_to_active = false;
                     ctx.request_repaint();
                 }
 
-                // Mouse wheel on tab bar → horizontal scroll
+                // Mouse wheel on tab bar → horizontal scroll (smooth)
                 {
                     let hover = ctx.input(|i| i.pointer.hover_pos().unwrap_or_default());
                     if self.tab_bar_rect.contains(hover) || scroll_output.inner_rect.contains(hover) {
                         let dy = ctx.input(|i| i.raw_scroll_delta.y);
                         if dy != 0.0 {
-                            self.tab_scroll_offset = (self.tab_scroll_offset - dy * 30.0).max(0.0);
+                            // Each wheel notch scrolls ~60px; accumulate into target
+                            self.tab_scroll_target = (self.tab_scroll_target - dy * 2.0).max(0.0);
                             ctx.request_repaint();
                         }
                     }
+                }
+
+                // Smoothly animate offset toward target (lerp 25% per frame)
+                if (self.tab_scroll_offset - self.tab_scroll_target).abs() > 0.5 {
+                    self.tab_scroll_offset += (self.tab_scroll_target - self.tab_scroll_offset) * 0.25;
+                    ctx.request_repaint();
+                } else {
+                    self.tab_scroll_offset = self.tab_scroll_target;
                 }
 
                 // "+" and save buttons OUTSIDE the scroll area (pinned at end)
@@ -3518,6 +3550,7 @@ impl eframe::App for RusplorerApp {
                                     && any_btn_down
                                     && !self.dnd_active
                                     && !self.dnd_suppress
+                                    && !self.is_dragging_selection
                                     && self.dnd_start_pos.is_none()
                                     && !entry.name.starts_with("[..]")
                                 {
@@ -3538,6 +3571,7 @@ impl eframe::App for RusplorerApp {
                                     && self.dnd_drag_entry.as_deref() == Some(&entry.name);
                                 if is_this_entry_drag
                                     && !self.dnd_active
+                                    && !self.is_dragging_selection
                                     && !entry.name.starts_with("[..]")
                                 {
                                     if let Some(start) = self.dnd_start_pos {
@@ -3749,9 +3783,12 @@ impl eframe::App for RusplorerApp {
             }
 
             // Handle rectangular selection (only when not dragging files or tabs,
-            // and not hovering the tab bar area at the top of the panel)
-            if !self.dnd_active && self.tab_drag_index.is_none() {
-            ctx.input(|i| {
+            // not hovering the tab bar area at the top of the panel,
+            // and no modal dialog is open — e.g. rename suppresses rubber-band)
+            if !self.dnd_active && self.tab_drag_index.is_none()
+                && !self.show_rename_dialog
+                && !self.show_new_item_dialog
+            {            ctx.input(|i| {
                 if let Some(pointer_pos) = i.pointer.hover_pos() {
                     let in_tab_bar = self.tab_bar_rect.contains(pointer_pos);
                     if i.pointer.primary_pressed() && !self.any_button_hovered && !in_tab_bar {
@@ -3759,6 +3796,9 @@ impl eframe::App for RusplorerApp {
                         self.selection_drag_start = Some(pointer_pos);
                         self.selection_drag_current = Some(pointer_pos);
                         self.selection_before_drag = self.selected_entries.clone();
+                        // Cancel any pending DnD start so rubber-band takes priority
+                        self.dnd_start_pos = None;
+                        self.dnd_drag_entry = None;
                     }
                     if self.is_dragging_selection && i.pointer.primary_down() {
                         self.selection_drag_current = Some(pointer_pos);
@@ -3787,6 +3827,13 @@ impl eframe::App for RusplorerApp {
                 }
             });
             } // end if !self.dnd_active && tab_drag_index.is_none()
+
+            // Cancel any active rubber-band if a modal dialog just opened
+            if self.show_rename_dialog || self.show_new_item_dialog {
+                self.is_dragging_selection = false;
+                self.selection_drag_start = None;
+                self.selection_drag_current = None;
+            }
 
             if sort_changed {
                 self.sort_contents();
@@ -4435,8 +4482,8 @@ impl eframe::App for RusplorerApp {
                     .show(ctx, |ui| {
                         ui.label("New name:");
                         let response = ui.text_edit_singleline(&mut self.rename_buffer);
+                        response.request_focus();
 
-                        // Auto-focus the text field
                         if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             // Perform rename
                             let old_path = self.current_path.join(&entry_name);
