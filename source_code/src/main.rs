@@ -4115,119 +4115,150 @@ impl eframe::App for RusplorerApp {
                     .clone()
                     .unwrap_or_else(|| self.current_path.join(&entry.name));
 
+                // Pre-compute required width from all possible button labels
+                let btn_padding = 8.0 + 8.0; // button padding (4+4) × 2 sides + frame inner margin
+                let font_id = egui::TextStyle::Button.resolve(&ctx.style());
+                let mut labels: Vec<&str> = vec![
+                    "Add to archive",
+                    "📋 Copy full path",
+                    "Rename",
+                    "Properties",
+                    "Cancel",
+                ];
+                if entry.is_dir || Self::is_code_file(&full_path) {
+                    labels.push("Open with VS Code");
+                }
+                if Self::is_archive(&full_path) {
+                    labels.push("Extract here");
+                }
+                let max_text_w = labels.iter()
+                    .map(|l| ctx.fonts(|f| f.layout_no_wrap(l.to_string(), font_id.clone(), egui::Color32::WHITE).size().x))
+                    .fold(0.0f32, f32::max);
+                let menu_w = max_text_w + btn_padding;
+
                 // Adjust position: clamp so the menu stays within the window.
                 let screen = ctx.screen_rect();
-                let ms = self.context_menu_size;
+                let ms = egui::vec2(menu_w + 10.0, self.context_menu_size.y);
                 let raw = self.context_menu_position;
                 let adj_x = raw.x.min(screen.max.x - ms.x).max(screen.min.x);
                 let adj_y = raw.y.min(screen.max.y - ms.y).max(screen.min.y);
 
-                let area_resp = egui::Window::new("ctx_menu")
-                    .title_bar(false)
-                    .collapsible(false)
-                    .resizable(false)
-                    .auto_sized()
+                let area_resp = egui::Area::new(egui::Id::new("ctx_menu"))
                     .fixed_pos(egui::pos2(adj_x, adj_y))
-                    .frame(egui::Frame {
-                        fill: egui::Color32::from_rgb(200, 220, 255),
-                        stroke: egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
-                        inner_margin: egui::Margin::same(4.0),
-                        rounding: egui::Rounding::same(4.0),
-                        ..Default::default()
-                    })
+                    .order(egui::Order::Foreground)
+                    .interactable(true)
                     .show(ctx, |ui| {
-                        ui.style_mut().spacing.button_padding = egui::vec2(4.0, 2.0);
-
-                        // Open with VS Code
-                        if (entry.is_dir || Self::is_code_file(&full_path))
-                            && ui.horizontal(|ui| ui.button("Open with VS Code").clicked()).inner
-                        {
-                            #[cfg(windows)]
-                            let _ = std::process::Command::new("cmd")
-                                .args(["/C", "code", full_path.to_string_lossy().as_ref()])
-                                .spawn();
-                            #[cfg(not(windows))]
-                            let _ = std::process::Command::new("code").arg(&full_path).spawn();
-                            self.show_context_menu = false;
-                            self.context_menu_tree_path = None;
-                            self.context_menu_tree_highlight = None;
+                        egui::Frame {
+                            fill: egui::Color32::from_rgb(200, 220, 255),
+                            stroke: egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
+                            inner_margin: egui::Margin::same(4.0),
+                            rounding: egui::Rounding::same(4.0),
+                            ..Default::default()
                         }
+                        .show(ui, |ui| {
+                            ui.set_max_width(menu_w);
+                            ui.set_min_width(menu_w);
+                            ui.style_mut().spacing.button_padding = egui::vec2(4.0, 2.0);
 
-                        // Extract here
-                        if Self::is_archive(&full_path) && ui.horizontal(|ui| ui.button("Extract here").clicked()).inner {
-                            self.extract_archive_path = full_path.clone();
-                            self.show_extract_dialog = true;
-                            self.show_context_menu = false;
-                            self.context_menu_tree_highlight = None;
-                        }
+                            // Open with VS Code
+                            if (entry.is_dir || Self::is_code_file(&full_path))
+                                && ui.add_sized([menu_w, 0.0], egui::Button::new("Open with VS Code")).clicked()
+                            {
+                                #[cfg(windows)]
+                                let _ = std::process::Command::new("cmd")
+                                    .args(["/C", "code", full_path.to_string_lossy().as_ref()])
+                                    .spawn();
+                                #[cfg(not(windows))]
+                                let _ = std::process::Command::new("code").arg(&full_path).spawn();
+                                self.show_context_menu = false;
+                                self.context_menu_tree_path = None;
+                                self.context_menu_tree_highlight = None;
+                            }
 
-                        // Add to archive
-                        if ui.horizontal(|ui| ui.button("Add to archive").clicked()).inner {
-                            self.files_to_archive.clear();
-                            if !self.selected_entries.is_empty() {
-                                for name in &self.selected_entries {
-                                    self.files_to_archive.push(self.current_path.join(name));
+                            // Extract here
+                            if Self::is_archive(&full_path)
+                                && ui.add_sized([menu_w, 0.0], egui::Button::new("Extract here")).clicked()
+                            {
+                                self.extract_archive_path = full_path.clone();
+                                self.show_extract_dialog = true;
+                                self.show_context_menu = false;
+                                self.context_menu_tree_highlight = None;
+                            }
+
+                            // Add to archive
+                            if ui.add_sized([menu_w, 0.0], egui::Button::new("Add to archive")).clicked() {
+                                self.files_to_archive.clear();
+                                if !self.selected_entries.is_empty() {
+                                    for name in &self.selected_entries {
+                                        self.files_to_archive.push(self.current_path.join(name));
+                                    }
+                                } else {
+                                    self.files_to_archive.push(full_path.clone());
                                 }
-                            } else {
-                                self.files_to_archive.push(full_path.clone());
+
+                                // Default archive name based on first item
+                                let stem = if let Some(first) = self.files_to_archive.first() {
+                                    first
+                                        .file_stem()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .to_string()
+                                } else {
+                                    "archive".to_string()
+                                };
+                                self.archive_name_buffer = stem;
+                                self.show_archive_dialog = true;
+                                self.show_context_menu = false;
+                                self.context_menu_tree_highlight = None;
                             }
 
-                            // Default archive name based on first item
-                            let stem = if let Some(first) = self.files_to_archive.first() {
-                                first
-                                    .file_stem()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .to_string()
-                            } else {
-                                "archive".to_string()
-                            };
-                            self.archive_name_buffer = stem;
-                            self.show_archive_dialog = true;
-                            self.show_context_menu = false;
-                            self.context_menu_tree_highlight = None;
-                        }
+                            // Thin separator line (fixed width, no stretch)
+                            let (line_rect, _) = ui.allocate_exact_size(egui::vec2(menu_w, 1.0), egui::Sense::hover());
+                            ui.painter().rect_filled(line_rect, 0.0, egui::Color32::from_gray(160));
+                            ui.add_space(2.0);
 
-                        ui.separator();
-
-                        // Copy full path
-                        if ui.horizontal(|ui| ui.button("📋 Copy full path").clicked()).inner {
-                            if let Ok(mut clipboard) = Clipboard::new() {
-                                let _ = clipboard.set_text(full_path.to_string_lossy().to_string());
+                            // Copy full path
+                            if ui.add_sized([menu_w, 0.0], egui::Button::new("📋 Copy full path")).clicked() {
+                                if let Ok(mut clipboard) = Clipboard::new() {
+                                    let _ = clipboard.set_text(full_path.to_string_lossy().to_string());
+                                }
+                                self.show_context_menu = false;
+                                self.context_menu_tree_highlight = None;
                             }
-                            self.show_context_menu = false;
-                            self.context_menu_tree_highlight = None;
-                        }
 
-                        // Rename
-                        if !entry.name.starts_with("[..]") && ui.horizontal(|ui| ui.button("Rename").clicked()).inner {
-                            self.rename_buffer = entry.name.clone();
-                            self.show_rename_dialog = true;
-                            self.show_context_menu = false;
-                            self.context_menu_tree_highlight = None;
-                        }
+                            // Rename
+                            if !entry.name.starts_with("[..]")
+                                && ui.add_sized([menu_w, 0.0], egui::Button::new("Rename")).clicked()
+                            {
+                                self.rename_buffer = entry.name.clone();
+                                self.show_rename_dialog = true;
+                                self.show_context_menu = false;
+                                self.context_menu_tree_highlight = None;
+                            }
 
-                        // Properties
-                        if ui.horizontal(|ui| ui.button("Properties").clicked()).inner {
-                            let _ = std::process::Command::new("explorer")
-                                .args(&["/select,", &full_path.to_string_lossy()])
-                                .spawn();
-                            self.show_context_menu = false;
-                            self.context_menu_tree_highlight = None;
-                        }
+                            // Properties
+                            if ui.add_sized([menu_w, 0.0], egui::Button::new("Properties")).clicked() {
+                                let _ = std::process::Command::new("explorer")
+                                    .args(&["/select,", &full_path.to_string_lossy()])
+                                    .spawn();
+                                self.show_context_menu = false;
+                                self.context_menu_tree_highlight = None;
+                            }
 
-                        ui.separator();
+                            // Thin separator line
+                            let (line_rect, _) = ui.allocate_exact_size(egui::vec2(menu_w, 1.0), egui::Sense::hover());
+                            ui.painter().rect_filled(line_rect, 0.0, egui::Color32::from_gray(160));
+                            ui.add_space(2.0);
 
-                        if ui.horizontal(|ui| ui.button("Cancel").clicked()).inner {
-                            self.show_context_menu = false;
-                            self.context_menu_tree_highlight = None;
-                        }
+                            if ui.add_sized([menu_w, 0.0], egui::Button::new("Cancel")).clicked() {
+                                self.show_context_menu = false;
+                                self.context_menu_tree_highlight = None;
+                            }
+                        });
                     });
 
                 // Store actual rendered size for next-frame clamping
-                if let Some(resp) = area_resp {
-                    self.context_menu_size = resp.response.rect.size();
-                }
+                self.context_menu_size = area_resp.response.rect.size();
             }
 
             // Close context menu if clicked elsewhere
@@ -4240,51 +4271,63 @@ impl eframe::App for RusplorerApp {
 
         // ── Background context menu (right-click on empty space) ─────────────
         if self.show_bg_context_menu {
+            // Pre-compute required width from button labels
+            let btn_padding = 8.0 + 8.0;
+            let font_id = egui::TextStyle::Button.resolve(&ctx.style());
+            let bg_labels = ["📁  New folder", "📄  New text file", "🔄  Refresh"];
+            let max_text_w = bg_labels.iter()
+                .map(|l| ctx.fonts(|f| f.layout_no_wrap(l.to_string(), font_id.clone(), egui::Color32::WHITE).size().x))
+                .fold(0.0f32, f32::max);
+            let menu_w = max_text_w + btn_padding;
+
             let screen = ctx.screen_rect();
-            let ms = self.bg_context_menu_size;
+            let ms = egui::vec2(menu_w + 10.0, self.bg_context_menu_size.y);
             let raw = self.bg_context_position;
             let adj_x = raw.x.min(screen.max.x - ms.x).max(screen.min.x);
             let adj_y = raw.y.min(screen.max.y - ms.y).max(screen.min.y);
 
-            let bg_area_resp = egui::Window::new("bg_ctx_menu")
-                .title_bar(false)
-                .collapsible(false)
-                .resizable(false)
-                .auto_sized()
+            let bg_area_resp = egui::Area::new(egui::Id::new("bg_ctx_menu"))
                 .fixed_pos(egui::pos2(adj_x, adj_y))
-                .frame(egui::Frame {
-                    fill: egui::Color32::from_rgb(200, 220, 255),
-                    stroke: egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
-                    inner_margin: egui::Margin::same(4.0),
-                    rounding: egui::Rounding::same(4.0),
-                    ..Default::default()
-                })
+                .order(egui::Order::Foreground)
+                .interactable(true)
                 .show(ctx, |ui| {
+                    egui::Frame {
+                        fill: egui::Color32::from_rgb(200, 220, 255),
+                        stroke: egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
+                        inner_margin: egui::Margin::same(4.0),
+                        rounding: egui::Rounding::same(4.0),
+                        ..Default::default()
+                    }
+                    .show(ui, |ui| {
+                        ui.set_max_width(menu_w);
+                        ui.set_min_width(menu_w);
                         ui.style_mut().spacing.button_padding = egui::vec2(4.0, 2.0);
 
-                        if ui.horizontal(|ui| ui.button("📁  New folder").clicked()).inner {
+                        if ui.add_sized([menu_w, 0.0], egui::Button::new("📁  New folder")).clicked() {
                             self.new_item_is_dir = true;
                             self.new_item_name_buffer = "New folder".to_string();
                             self.show_new_item_dialog = true;
                             self.show_bg_context_menu = false;
                         }
-                        if ui.horizontal(|ui| ui.button("📄  New text file").clicked()).inner {
+                        if ui.add_sized([menu_w, 0.0], egui::Button::new("📄  New text file")).clicked() {
                             self.new_item_is_dir = false;
                             self.new_item_name_buffer = "New file.txt".to_string();
                             self.show_new_item_dialog = true;
                             self.show_bg_context_menu = false;
                         }
-                        ui.separator();
-                        if ui.horizontal(|ui| ui.button("🔄  Refresh").clicked()).inner {
+                        // Thin separator line
+                        let (line_rect, _) = ui.allocate_exact_size(egui::vec2(menu_w, 1.0), egui::Sense::hover());
+                        ui.painter().rect_filled(line_rect, 0.0, egui::Color32::from_gray(160));
+                        ui.add_space(2.0);
+                        if ui.add_sized([menu_w, 0.0], egui::Button::new("🔄  Refresh")).clicked() {
                             self.refresh_contents();
                             self.show_bg_context_menu = false;
                         }
+                    });
                 });
 
             // Store actual rendered size for next-frame clamping
-            if let Some(resp) = bg_area_resp {
-                self.bg_context_menu_size = resp.response.rect.size();
-            }
+            self.bg_context_menu_size = bg_area_resp.response.rect.size();
 
             if ctx.input(|i| i.pointer.primary_clicked() || i.key_pressed(egui::Key::Escape)) {
                 self.show_bg_context_menu = false;
