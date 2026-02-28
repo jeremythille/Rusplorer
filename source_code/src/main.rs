@@ -28,9 +28,11 @@ use winapi::um::winuser::{
     OpenClipboard, SetClipboardData,
 };
 
-/// Copy files to Windows clipboard in HDROP format so they can be pasted in Explorer
+/// Copy files to Windows clipboard in HDROP format so they can be pasted in Explorer.
+/// When `is_cut` is true, also sets the Preferred DropEffect to MOVE so that other
+/// applications (including other Rusplorer instances) know this is a cut operation.
 #[cfg(windows)]
-fn copy_files_to_clipboard(files: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
+fn copy_files_to_clipboard(files: &[PathBuf], is_cut: bool) -> Result<(), Box<dyn std::error::Error>> {
     use winapi::um::winuser::CF_HDROP;
 
     // DROPFILES structure: 20 bytes total
@@ -108,10 +110,69 @@ fn copy_files_to_clipboard(files: &[PathBuf]) -> Result<(), Box<dyn std::error::
             return Err("Failed to set clipboard data".into());
         }
 
+        // Write Preferred DropEffect so other processes know cut vs copy.
+        // DROPEFFECT_MOVE = 2, DROPEFFECT_COPY = 1
+        let drop_effect_name: Vec<u16> = OsStr::new("Preferred DropEffect")
+            .encode_wide()
+            .chain(std::iter::once(0u16))
+            .collect();
+        let cf_drop_effect = winapi::um::winuser::RegisterClipboardFormatW(drop_effect_name.as_ptr());
+        if cf_drop_effect != 0 {
+            let hmem = winapi::um::winbase::GlobalAlloc(
+                winapi::um::winbase::GMEM_MOVEABLE | winapi::um::winbase::GMEM_ZEROINIT,
+                4,
+            );
+            if !hmem.is_null() {
+                let p = winapi::um::winbase::GlobalLock(hmem) as *mut u32;
+                if !p.is_null() {
+                    *p = if is_cut { 2u32 } else { 1u32 }; // DROPEFFECT_MOVE / COPY
+                    winapi::um::winbase::GlobalUnlock(hmem);
+                    SetClipboardData(cf_drop_effect, hmem as *mut winapi::ctypes::c_void);
+                }
+            }
+        }
+
         CloseClipboard();
     }
 
     Ok(())
+}
+
+/// Read the Preferred DropEffect from the Windows clipboard.
+/// Returns true if the clipboard indicates a CUT (move) operation.
+/// Must be called while the clipboard is NOT already open.
+#[cfg(windows)]
+fn read_clipboard_drop_effect_is_cut() -> bool {
+    unsafe {
+        let drop_effect_name: Vec<u16> = OsStr::new("Preferred DropEffect")
+            .encode_wide()
+            .chain(std::iter::once(0u16))
+            .collect();
+        let cf_drop_effect = winapi::um::winuser::RegisterClipboardFormatW(drop_effect_name.as_ptr());
+        if cf_drop_effect == 0 {
+            return false;
+        }
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return false;
+        }
+        let result = {
+            let hdata = GetClipboardData(cf_drop_effect);
+            if hdata.is_null() {
+                false
+            } else {
+                let p = winapi::um::winbase::GlobalLock(hdata as *mut winapi::ctypes::c_void) as *const u32;
+                let is_move = if !p.is_null() {
+                    (*p & 2) != 0 // DROPEFFECT_MOVE = 2
+                } else {
+                    false
+                };
+                winapi::um::winbase::GlobalUnlock(hdata as *mut winapi::ctypes::c_void);
+                is_move
+            }
+        };
+        CloseClipboard();
+        result
+    }
 }
 
 /// Read files from Windows clipboard in HDROP format
@@ -533,6 +594,36 @@ fn find_rusplorer_desktop_guid() -> Option<windows::core::GUID> {
     None
 }
 
+/// Find the top-level window belonging to the current thread.
+/// Unlike FindWindowW, this never returns another process's window.
+#[cfg(windows)]
+fn find_own_hwnd() -> Option<winapi::shared::windef::HWND> {
+    use winapi::um::processthreadsapi::GetCurrentThreadId;
+    use winapi::um::winuser::EnumThreadWindows;
+    use winapi::shared::windef::HWND;
+    use winapi::shared::minwindef::{BOOL, LPARAM, TRUE};
+
+    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        // Check if this is a visible, top-level window
+        if unsafe { winapi::um::winuser::IsWindowVisible(hwnd) } != 0 {
+            let out = lparam as *mut HWND;
+            unsafe { *out = hwnd };
+            return 0; // stop enumerating
+        }
+        TRUE
+    }
+
+    unsafe {
+        let mut result: HWND = std::ptr::null_mut();
+        EnumThreadWindows(
+            GetCurrentThreadId(),
+            Some(callback),
+            &mut result as *mut HWND as LPARAM,
+        );
+        if result.is_null() { None } else { Some(result) }
+    }
+}
+
 /// Move own window to the "Rusplorer" virtual desktop.
 /// Uses the public IVirtualDesktopManager COM API — works in-process (no E_ACCESSDENIED).
 /// Returns true if the move succeeded OR if no "Rusplorer" desktop exists (no point retrying).
@@ -550,16 +641,11 @@ fn try_move_to_rusplorer_desktop() -> bool {
         None => return true, // No "Rusplorer" desktop — nothing to do, stop retrying
     };
 
-    let wide_title: Vec<u16> = OsStr::new("Rusplorer")
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-
     unsafe {
-        let hwnd_raw = winapi::um::winuser::FindWindowW(std::ptr::null(), wide_title.as_ptr());
-        if hwnd_raw.is_null() {
-            return false; // Window not visible yet — retry later
-        }
+        let hwnd_raw = match find_own_hwnd() {
+            Some(h) => h,
+            None => return false, // Window not visible yet — retry later
+        };
         let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
 
         let coin_hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -1807,7 +1893,8 @@ impl RusplorerApp {
         format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, d, hour, minute)
     }
 
-    fn copy_files(sources: &[PathBuf], dest: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    fn copy_files(sources: &[PathBuf], dest: &PathBuf) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let mut pasted_names = Vec::new();
         for source in sources {
             let file_name = source.file_name().unwrap();
             let mut target = dest.join(file_name);
@@ -1829,11 +1916,15 @@ impl RusplorerApp {
             } else {
                 std::fs::copy(source, &target)?;
             }
+            if let Some(name) = target.file_name() {
+                pasted_names.push(name.to_string_lossy().to_string());
+            }
         }
-        Ok(())
+        Ok(pasted_names)
     }
 
-    fn move_files(sources: &[PathBuf], dest: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    fn move_files(sources: &[PathBuf], dest: &PathBuf) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let mut pasted_names = Vec::new();
         for source in sources {
             let file_name = source.file_name().unwrap();
             let target = dest.join(file_name);
@@ -1855,8 +1946,11 @@ impl RusplorerApp {
                     std::fs::remove_file(source)?;
                 }
             }
+            if let Some(name) = target.file_name() {
+                pasted_names.push(name.to_string_lossy().to_string());
+            }
         }
-        Ok(())
+        Ok(pasted_names)
     }
 }
 
@@ -2205,28 +2299,20 @@ impl eframe::App for RusplorerApp {
         if !self.drop_target_registered {
             if let Some(tx) = self.ole_drop_sender.take() {
                 let rc_tx = self.ole_rclick_drop_sender.take();
-                let wide_title: Vec<u16> = OsStr::new("Rusplorer")
-                    .encode_wide()
-                    .chain(std::iter::once(0))
-                    .collect();
-                unsafe {
-                    let hwnd_raw = winapi::um::winuser::FindWindowW(
-                        std::ptr::null(), wide_title.as_ptr());
-                    if !hwnd_raw.is_null() {
-                        let hwnd_ptr = hwnd_raw as *mut _;
-                        let rc = rc_tx.unwrap_or_else(|| std::sync::mpsc::channel().0);
-                        if let Some(target) = register_ole_drop_target(hwnd_ptr, tx, rc) {
-                            self._ole_drop_target = Some(target);
-                            self.drop_target_registered = true;
-                        } else {
-                            // Registration failed — don't retry (probably no OLE)
-                            self.drop_target_registered = true;
-                        }
+                if let Some(hwnd_raw) = find_own_hwnd() {
+                    let hwnd_ptr = hwnd_raw as *mut _;
+                    let rc = rc_tx.unwrap_or_else(|| std::sync::mpsc::channel().0);
+                    if let Some(target) = register_ole_drop_target(hwnd_ptr, tx, rc) {
+                        self._ole_drop_target = Some(target);
+                        self.drop_target_registered = true;
                     } else {
-                        // HWND not ready yet — put senders back
-                        self.ole_drop_sender = Some(tx);
-                        self.ole_rclick_drop_sender = rc_tx;
+                        // Registration failed — don't retry (probably no OLE)
+                        self.drop_target_registered = true;
                     }
+                } else {
+                    // HWND not ready yet — put senders back
+                    self.ole_drop_sender = Some(tx);
+                    self.ole_rclick_drop_sender = rc_tx;
                 }
             }
         }
@@ -2422,9 +2508,9 @@ impl eframe::App for RusplorerApp {
 
                 // Only fire actions when Rusplorer actually has focus
                 if self.is_focused {
-                    let copy_pressed   = c_down   && !prev_c;
-                    let paste_pressed  = v_down   && !prev_v;
                     let cut_pressed    = x_down   && !prev_x;
+                    let copy_pressed   = c_down   && !prev_c && !cut_pressed;
+                    let paste_pressed  = v_down   && !prev_v;
                     let delete_pressed = del_down && !prev_d;
                     (copy_pressed, cut_pressed, paste_pressed, delete_pressed)
                 } else {
@@ -2450,7 +2536,7 @@ impl eframe::App for RusplorerApp {
 
             #[cfg(windows)]
             {
-                let _ = copy_files_to_clipboard(&files); // best-effort; internal clipboard always set
+                let _ = copy_files_to_clipboard(&files, false); // best-effort; internal clipboard always set
                 self.clipboard_files = files;
                 self.clipboard_mode = Some(ClipboardMode::Copy);
             }
@@ -2470,7 +2556,7 @@ impl eframe::App for RusplorerApp {
 
             #[cfg(windows)]
             {
-                let _ = copy_files_to_clipboard(&files); // best-effort; internal clipboard always set
+                let _ = copy_files_to_clipboard(&files, true); // best-effort; internal clipboard always set
                 self.clipboard_files = files;
                 self.clipboard_mode = Some(ClipboardMode::Cut);
             }
@@ -2491,21 +2577,35 @@ impl eframe::App for RusplorerApp {
                     let files = self.clipboard_files.clone();
                     let is_cut = self.clipboard_mode == Some(ClipboardMode::Cut);
 
-                    if is_cut {
-                        let _ = RusplorerApp::move_files(&files, &dest);
+                    let pasted_names = if is_cut {
+                        let names = RusplorerApp::move_files(&files, &dest).unwrap_or_default();
                         self.clipboard_files.clear();
                         self.clipboard_mode = None;
+                        names
                     } else {
-                        let _ = RusplorerApp::copy_files(&files, &dest);
-                    }
+                        RusplorerApp::copy_files(&files, &dest).unwrap_or_default()
+                    };
                     self.refresh_contents();
+                    self.selected_entries.clear();
+                    for name in pasted_names {
+                        self.selected_entries.insert(name);
+                    }
                 } else {
                     // Nothing in our internal clipboard — try Windows clipboard
                     // (files copied from Explorer / other apps)
                     if let Ok(clipboard_files) = read_files_from_clipboard() {
                         if !clipboard_files.is_empty() {
-                            let _ = RusplorerApp::copy_files(&clipboard_files, &dest);
+                            let is_cut = read_clipboard_drop_effect_is_cut();
+                            let pasted_names = if is_cut {
+                                RusplorerApp::move_files(&clipboard_files, &dest).unwrap_or_default()
+                            } else {
+                                RusplorerApp::copy_files(&clipboard_files, &dest).unwrap_or_default()
+                            };
                             self.refresh_contents();
+                            self.selected_entries.clear();
+                            for name in pasted_names {
+                                self.selected_entries.insert(name);
+                            }
                         }
                     }
                 }
@@ -2517,18 +2617,22 @@ impl eframe::App for RusplorerApp {
                         let files = self.clipboard_files.clone();
                         let dest = self.current_path.clone();
 
-                        match mode {
+                        let pasted_names = match mode {
                             ClipboardMode::Copy => {
-                                let _ = RusplorerApp::copy_files(&files, &dest);
+                                RusplorerApp::copy_files(&files, &dest).unwrap_or_default()
                             }
                             ClipboardMode::Cut => {
-                                let _ = RusplorerApp::move_files(&files, &dest);
+                                let names = RusplorerApp::move_files(&files, &dest).unwrap_or_default();
                                 self.clipboard_files.clear();
                                 self.clipboard_mode = None;
+                                names
                             }
-                        }
-
+                        };
                         self.refresh_contents();
+                        self.selected_entries.clear();
+                        for name in pasted_names {
+                            self.selected_entries.insert(name);
+                        }
                     }
                 }
             }
