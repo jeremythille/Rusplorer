@@ -62,8 +62,12 @@ pub fn calculate_dir_size_progressive(
                 accumulated,
             );
         } else if let Ok(metadata) = entry.metadata() {
+            let prev = *accumulated;
             *accumulated += metadata.len();
-            let _ = tx.send((root_path.to_path_buf(), *accumulated));
+            // Throttle: send roughly every 64 KB of new data
+            if *accumulated >> 16 != prev >> 16 {
+                let _ = tx.send((root_path.to_path_buf(), *accumulated));
+            }
         }
     }
     true

@@ -8,7 +8,7 @@ use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -62,7 +62,7 @@ fn main() -> Result<(), eframe::Error> {
         .and_then(|s| s.window_pos)
         .map(|[x, y]| egui::pos2(x, y));
     options.viewport.icon = {
-        let icon_bytes = include_bytes!("../Logo/Rustplorer logo.png");
+        let icon_bytes = include_bytes!("../logo/rusplorer_logo_512.png");
         let image = image::load_from_memory(icon_bytes).expect("Failed to load icon");
         let rgba = image.to_rgba8();
         let (width, height) = rgba.dimensions();
@@ -530,64 +530,26 @@ impl RusplorerApp {
             tab_bar_rect: egui::Rect::NOTHING,
         };
 
-        // Pre-expand the tree down to the current folder so it's visible on startup.
-        // Walk every ancestor (including current_path itself) from root downward.
-        let ancestors: Vec<PathBuf> = app.current_path.ancestors().map(|p| p.to_path_buf()).collect();
-        for ancestor in ancestors.into_iter().rev() {
-            let children = read_dir_children(&ancestor);
-            app.tree_children_cache.insert(ancestor.clone(), children);
-            app.tree_expanded.insert(ancestor);
-        }
-
-        // Initialise tabs — from session if provided, otherwise single tab at current path
+        // Initialise tabs — from session if provided, then config, then single default
         if let Some(sess) = session {
             if !sess.tabs.is_empty() {
                 app.tabs = sess.tabs;
                 app.active_tab = sess.active_tab.min(app.tabs.len().saturating_sub(1));
-                // Set current_path from the active tab
                 app.current_path = app.tabs[app.active_tab].path.clone();
-                // Expand tree to the active tab's path
-                let ancestors: Vec<PathBuf> = app.current_path.ancestors().map(|p| p.to_path_buf()).collect();
-                for ancestor in ancestors.into_iter().rev() {
-                    let children = read_dir_children(&ancestor);
-                    app.tree_children_cache.insert(ancestor.clone(), children);
-                    app.tree_expanded.insert(ancestor);
-                }
             } else {
                 app.tabs.push(TabState::new(app.current_path.clone()));
             }
-        } else if let (Some(saved_tabs), saved_active) = (config_saved_tabs, config_saved_active_tab) {
-            if !saved_tabs.is_empty() {
-                app.tabs = saved_tabs;
-                app.active_tab = saved_active.unwrap_or(0).min(app.tabs.len().saturating_sub(1));
-                app.current_path = app.tabs[app.active_tab].path.clone();
-                // Expand tree to the restored active tab's path
-                let ancestors: Vec<PathBuf> = app.current_path.ancestors().map(|p| p.to_path_buf()).collect();
-                for ancestor in ancestors.into_iter().rev() {
-                    let children = read_dir_children(&ancestor);
-                    app.tree_children_cache.insert(ancestor.clone(), children);
-                    app.tree_expanded.insert(ancestor);
-                }
-            } else {
-                app.tabs.push(TabState {
-                    path: app.current_path.clone(),
-                    back_history: Vec::new(),
-                    forward_history: Vec::new(),
-                    filter: app.filter.clone(),
-                    sort_column: app.sort_column.clone(),
-                    sort_ascending: app.sort_ascending,
-                });
-            }
+        } else if let Some(saved_tabs) = config_saved_tabs.filter(|t| !t.is_empty()) {
+            app.tabs = saved_tabs;
+            app.active_tab = config_saved_active_tab.unwrap_or(0).min(app.tabs.len().saturating_sub(1));
+            app.current_path = app.tabs[app.active_tab].path.clone();
         } else {
-            app.tabs.push(TabState {
-                path: app.current_path.clone(),
-                back_history: Vec::new(),
-                forward_history: Vec::new(),
-                filter: app.filter.clone(),
-                sort_column: app.sort_column.clone(),
-                sort_ascending: app.sort_ascending,
-            });
+            app.tabs.push(TabState::new(app.current_path.clone()));
         }
+
+        // Expand tree to current path (single call covers all branches above)
+        let path_snap = app.current_path.clone();
+        app.expand_tree_to(&path_snap);
 
         app.refresh_contents();
         app.start_file_watcher();
@@ -1074,27 +1036,15 @@ impl RusplorerApp {
         }
     }
 
-    fn format_modified_time(time: SystemTime) -> String {
+    /// Format a `SystemTime` as a local-time string.
+    /// `tz_bias_secs` is the UTC offset (computed once per frame, not per row).
+    fn format_modified_time(time: SystemTime, tz_bias_secs: i64) -> String {
         use std::time::UNIX_EPOCH;
         let Ok(dur) = time.duration_since(UNIX_EPOCH) else {
             return String::new();
         };
 
-        // Get local UTC offset in seconds via Windows API.
-        // TIME_ZONE_INFORMATION::Bias is in minutes and is positive west of UTC
-        // (e.g. UTC+1 = Bias -60).  We also add DaylightBias when DST is active.
-        #[cfg(windows)]
-        let local_secs: i64 = {
-            use winapi::um::timezoneapi::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
-            let mut tzi: TIME_ZONE_INFORMATION = unsafe { std::mem::zeroed() };
-            let tz_id = unsafe { GetTimeZoneInformation(&mut tzi) };
-            let is_dst = tz_id == 2; // TIME_ZONE_ID_DAYLIGHT
-            let bias_secs = (tzi.Bias + if is_dst { tzi.DaylightBias } else { tzi.StandardBias }) as i64 * 60;
-            dur.as_secs() as i64 - bias_secs
-        };
-        #[cfg(not(windows))]
-        let local_secs: i64 = dur.as_secs() as i64;
-
+        let local_secs = dur.as_secs() as i64 - tz_bias_secs;
         if local_secs < 0 { return String::new(); }
         let secs = local_secs as u64;
 
@@ -1115,6 +1065,39 @@ impl RusplorerApp {
         let y   = if m <= 2 { y + 1 } else { y };
 
         format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, d, hour, minute)
+    }
+
+    /// Returns a background color for the date column based on how old the file is.
+    /// Light green (very recent) → darker green → light orange → orange (>1 week).
+    fn age_color(modified: SystemTime, now: SystemTime) -> egui::Color32 {
+        let age = now
+            .duration_since(modified)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(f64::MAX);
+
+        // (age_threshold_secs, r, g, b)
+        const STOPS: &[(f64, u8, u8, u8)] = &[
+            (0.0,          200, 240, 200),  // light green  — just now
+            (300.0,        150, 218, 150),  // green        — 5 min
+            (3_600.0,       90, 180,  90),  // medium green — 1 hour
+            (86_400.0,     180, 210, 130),  // yellow-green — 1 day
+            (604_800.0,    255, 200, 140),  // light orange — 1 week
+        ];
+        const ORANGE: egui::Color32 = egui::Color32::from_rgb(255, 175, 100);
+
+        if age >= 604_800.0 {
+            return ORANGE;
+        }
+        for w in STOPS.windows(2) {
+            let (t0, r0, g0, b0) = w[0];
+            let (t1, r1, g1, b1) = w[1];
+            if age <= t1 {
+                let t = ((age - t0) / (t1 - t0)) as f32;
+                let lerp = |a: u8, b: u8| (a as f32 + t * (b as f32 - a as f32)).round() as u8;
+                return egui::Color32::from_rgb(lerp(r0, r1), lerp(g0, g1), lerp(b0, b1));
+            }
+        }
+        ORANGE
     }
 
     fn copy_files(sources: &[PathBuf], dest: &PathBuf) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -2029,7 +2012,7 @@ impl eframe::App for RusplorerApp {
                                 ui.add(
                                     egui::Label::new(
                                         egui::RichText::new(&display).color(text_color).small(),
-                                    ),
+                                    ).selectable(false),
                                 ).on_hover_text(self.tabs[i].path.to_string_lossy());
 
                                 // Close label (only when more than 1 tab) — interaction
@@ -2039,7 +2022,7 @@ impl eframe::App for RusplorerApp {
                                     let close_resp = ui.add(
                                         egui::Label::new(
                                             egui::RichText::new("×").color(text_color).small(),
-                                        ),
+                                        ).selectable(false),
                                     );
                                     close_btn_rect = close_resp.rect;
                                 }
@@ -2373,6 +2356,19 @@ impl eframe::App for RusplorerApp {
                 .copied()
                 .unwrap_or(false);
             let mut sort_changed = false;
+
+            // Pre-compute time values once per frame (avoids per-row Windows API calls)
+            let now = SystemTime::now();
+            #[cfg(windows)]
+            let tz_bias_secs: i64 = {
+                use winapi::um::timezoneapi::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
+                let mut tzi: TIME_ZONE_INFORMATION = unsafe { std::mem::zeroed() };
+                let tz_id = unsafe { GetTimeZoneInformation(&mut tzi) };
+                let is_dst = tz_id == 2;
+                (tzi.Bias + if is_dst { tzi.DaylightBias } else { tzi.StandardBias }) as i64 * 60
+            };
+            #[cfg(not(windows))]
+            let tz_bias_secs: i64 = 0;
 
             // Same-frame DnD detection for file-table entries
             if self.dnd_active {
@@ -2917,18 +2913,23 @@ impl eframe::App for RusplorerApp {
                             row.col(|ui| {
                                 if show_dates && !entry.name.starts_with("[..]") {
                                     let date_text = if let Some(modified) = entry.modified {
-                                        Self::format_modified_time(modified)
+                                        Self::format_modified_time(modified, tz_bias_secs)
                                     } else {
                                         String::new()
                                     };
                                     if !date_text.is_empty() {
+                                        // Paint age-based background color
+                                        if let Some(modified) = entry.modified {
+                                            let bg = Self::age_color(modified, now);
+                                            ui.painter().rect_filled(ui.max_rect(), 0.0, bg);
+                                        }
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
                                                 let label = if is_in_clipboard {
-                                                    egui::RichText::new(&date_text).weak().italics()
+                                                    egui::RichText::new(&date_text).color(egui::Color32::from_rgb(60, 60, 60)).italics()
                                                 } else {
-                                                    egui::RichText::new(&date_text).weak()
+                                                    egui::RichText::new(&date_text).color(egui::Color32::from_rgb(60, 60, 60))
                                                 };
                                                 ui.label(label);
                                             },
@@ -3688,32 +3689,26 @@ impl eframe::App for RusplorerApp {
                         let response = ui.text_edit_singleline(&mut self.rename_buffer);
                         response.request_focus();
 
-                        if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            // Perform rename
-                            let old_path = self.current_path.join(&entry_name);
-                            let new_path = self.current_path.join(&self.rename_buffer);
-                            if let Err(_) = std::fs::rename(&old_path, &new_path) {
-                                // Error handling could be improved
-                            }
-                            self.show_rename_dialog = false;
-                            self.refresh_contents();
-                        }
+                        let enter_confirmed = response.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
+                        let mut do_rename = enter_confirmed;
                         ui.horizontal(|ui| {
                             if ui.button("OK").clicked() {
-                                let old_path = self.current_path.join(&entry_name);
-                                let new_path = self.current_path.join(&self.rename_buffer);
-                                if let Err(_) = std::fs::rename(&old_path, &new_path) {
-                                    // Error handling could be improved
-                                }
-                                self.show_rename_dialog = false;
-                                self.refresh_contents();
+                                do_rename = true;
                             }
-
                             if ui.button("Cancel").clicked() {
                                 self.show_rename_dialog = false;
                             }
                         });
+
+                        if do_rename {
+                            let old_path = self.current_path.join(&entry_name);
+                            let new_path = self.current_path.join(&self.rename_buffer);
+                            let _ = std::fs::rename(&old_path, &new_path);
+                            self.show_rename_dialog = false;
+                            self.refresh_contents();
+                        }
                     });
             }
         }
