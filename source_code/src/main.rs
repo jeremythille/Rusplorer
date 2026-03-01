@@ -264,6 +264,8 @@ struct RusplorerApp {
     bg_context_position: egui::Pos2,
     bg_context_menu_size: egui::Vec2,
     selected_entries: HashSet<String>,
+    /// Paths of the files/folders deleted in the last delete operation (for undo).
+    last_deleted_paths: Vec<PathBuf>,
     show_archive_dialog: bool,
     archive_type: usize,      // 0 = 7z, 1 = zip
     compression_level: usize, // 0 = store, 1 = medium, 2 = high
@@ -321,6 +323,9 @@ struct RusplorerApp {
     ole_rclick_drop_receiver: Option<std::sync::mpsc::Receiver<Vec<PathBuf>>>,
     ole_rclick_drop_sender: Option<std::sync::mpsc::Sender<Vec<PathBuf>>>,
     drop_target_registered: bool,
+    /// True while an OLE drag-in from another app (e.g. Explorer) is in progress.
+    /// Prevents the internal DnD system from activating on the same pointer press.
+    ole_drag_in_active: Arc<AtomicBool>,
     // Keep the COM IDropTarget alive for the lifetime of the app
     #[cfg(windows)]
     _ole_drop_target: Option<windows::Win32::System::Ole::IDropTarget>,
@@ -518,8 +523,10 @@ impl RusplorerApp {
             ole_rclick_drop_receiver: Some(ole_rc_rx),
             ole_rclick_drop_sender: Some(ole_rc_tx),
             drop_target_registered: false,
+            ole_drag_in_active: Arc::new(AtomicBool::new(false)),
             _ole_drop_target: None,
             show_save_session_dialog: false,
+            last_deleted_paths: Vec::new(),
             save_session_filename: String::new(),
             save_session_status: None,
             tab_drag_index: None,
@@ -1258,6 +1265,123 @@ impl RusplorerApp {
             self.tree_children_cache.insert(self.current_path.clone(), updated_children);
         }
     }
+
+    /// Restore files from the Windows Recycle Bin by matching against their original paths.
+    /// Returns `true` if all items were restored successfully.
+    #[cfg(windows)]
+    fn restore_from_recycle_bin(paths: &[PathBuf]) -> bool {
+        let mut restored = 0usize;
+        let total = paths.len();
+
+        for original_path in paths {
+            // Derive the drive root (e.g.  C:\)
+            let drive = match original_path.components().next() {
+                Some(c) => PathBuf::from(c.as_os_str()),
+                None => continue,
+            };
+            let recycle_bin = drive.join("$Recycle.Bin");
+
+            // Iterate all SID subdirectories inside $Recycle.Bin
+            let sid_entries = match std::fs::read_dir(&recycle_bin) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            'sid_loop: for sid_entry in sid_entries.flatten() {
+                let sid_path = sid_entry.path();
+                if !sid_path.is_dir() {
+                    continue;
+                }
+
+                let items = match std::fs::read_dir(&sid_path) {
+                    Ok(i) => i,
+                    Err(_) => continue,
+                };
+
+                for item in items.flatten() {
+                    let item_path = item.path();
+                    let file_name = item_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    // Only look at $I metadata files
+                    if !file_name.starts_with("$I") {
+                        continue;
+                    }
+
+                    let data = match std::fs::read(&item_path) {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    };
+
+                    if data.len() < 28 {
+                        continue;
+                    }
+
+                    // Parse the original path from the $I file.
+                    // Version stored at byte 0 (i64): 1 = Vista/7 (fixed 260-char slot),
+                    // 2 = Windows 10+ (length-prefixed).
+                    let version = i64::from_le_bytes(
+                        data[0..8].try_into().unwrap_or([0; 8]),
+                    );
+
+                    let orig_path_opt: Option<PathBuf> = if version == 1 {
+                        // Fixed-size slot: up to 260 UTF-16 chars starting at offset 24
+                        if data.len() >= 26 {
+                            let utf16: Vec<u16> = data[24..]
+                                .chunks_exact(2)
+                                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                                .take_while(|&c| c != 0)
+                                .collect();
+                            String::from_utf16(&utf16).ok().map(PathBuf::from)
+                        } else {
+                            None
+                        }
+                    } else {
+                        // Version 2: path length (i32) at offset 24, UTF-16 path at offset 28
+                        let path_len = i32::from_le_bytes(
+                            data[24..28].try_into().unwrap_or([0; 4]),
+                        ) as usize;
+                        let end = 28 + path_len * 2;
+                        if data.len() >= end {
+                            let utf16: Vec<u16> = data[28..end]
+                                .chunks_exact(2)
+                                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                                .collect();
+                            String::from_utf16(&utf16)
+                                .ok()
+                                .map(|s| PathBuf::from(s.trim_end_matches('\0')))
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some(orig) = orig_path_opt {
+                        if orig == *original_path {
+                            // The $R file has the same random suffix as $I
+                            let r_name = format!("$R{}", &file_name[2..]);
+                            let r_path = sid_path.join(&r_name);
+
+                            if r_path.exists() {
+                                if let Some(parent) = original_path.parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                if std::fs::rename(&r_path, original_path).is_ok() {
+                                    let _ = std::fs::remove_file(&item_path);
+                                    restored += 1;
+                                    break 'sid_loop;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        restored == total
+    }
 }
 
 impl eframe::App for RusplorerApp {
@@ -1324,7 +1448,8 @@ impl eframe::App for RusplorerApp {
                 if let Some(hwnd_raw) = find_own_hwnd() {
                     let hwnd_ptr = hwnd_raw as *mut _;
                     let rc = rc_tx.unwrap_or_else(|| std::sync::mpsc::channel().0);
-                    if let Some(target) = register_ole_drop_target(hwnd_ptr, tx, rc) {
+                    let drag_in_flag = self.ole_drag_in_active.clone();
+                    if let Some(target) = register_ole_drop_target(hwnd_ptr, tx, rc, drag_in_flag) {
                         self._ole_drop_target = Some(target);
                         self.drop_target_registered = true;
                     } else {
@@ -1377,6 +1502,13 @@ impl eframe::App for RusplorerApp {
                 .unwrap_or_default();
             for files in incoming {
                 if !files.is_empty() {
+                    // Cancel any internal DnD that may have been triggered by the
+                    // same pointer-down (egui sees the button held while OLE drags in).
+                    self.dnd_active = false;
+                    self.dnd_sources.clear();
+                    self.dnd_start_pos = None;
+                    self.dnd_drag_entry = None;
+                    self.dnd_suppress = true;
                     let dest = self.current_path.clone();
                     let _ = Self::move_files(&files, &dest);
                     self.refresh_contents();
@@ -1394,6 +1526,13 @@ impl eframe::App for RusplorerApp {
                 .unwrap_or_default();
             for files in incoming {
                 if !files.is_empty() {
+                    // Cancel any internal DnD that may have been triggered by the
+                    // same pointer-down (egui sees the button held while OLE drags in).
+                    self.dnd_active = false;
+                    self.dnd_sources.clear();
+                    self.dnd_start_pos = None;
+                    self.dnd_drag_entry = None;
+                    self.dnd_suppress = true;
                     let dest = self.current_path.clone();
                     let drop_pos = ctx.input(|i| i.pointer.hover_pos().unwrap_or(egui::pos2(300.0, 300.0)));
                     self.dnd_right_drop_menu = Some((files, dest, drop_pos));
@@ -1695,6 +1834,7 @@ impl eframe::App for RusplorerApp {
 
                     let result = SHFileOperationW(&mut file_op);
                     if result == 0 {
+                        self.last_deleted_paths = files_to_delete.clone();
                         self.selected_entries.clear();
                         self.refresh_contents();
                     }
@@ -2720,6 +2860,7 @@ impl eframe::App for RusplorerApp {
                                     && !self.is_dragging_selection
                                     && self.dnd_start_pos.is_none()
                                     && !entry.name.starts_with("[..]")
+                                    && !self.ole_drag_in_active.load(Ordering::SeqCst)
                                 {
                                     self.dnd_start_pos = ui.input(|i| i.pointer.hover_pos());
                                     self.dnd_drag_entry = Some(entry.name.clone());
@@ -3433,10 +3574,14 @@ impl eframe::App for RusplorerApp {
 
         // ── Background context menu (right-click on empty space) ─────────────
         if self.show_bg_context_menu {
+            let can_undo = !self.last_deleted_paths.is_empty();
             // Pre-compute required width from button labels
             let btn_padding = 8.0 + 8.0;
             let font_id = egui::TextStyle::Button.resolve(&ctx.style());
-            let bg_labels = ["📁  New folder", "📄  New text file", "🔄  Refresh"];
+            let mut bg_labels = vec!["📁  New folder", "📄  New text file", "🔄  Refresh"];
+            if can_undo {
+                bg_labels.push("↩  Undo delete");
+            }
             let max_text_w = bg_labels.iter()
                 .map(|l| ctx.fonts(|f| f.layout_no_wrap(l.to_string(), font_id.clone(), egui::Color32::WHITE).size().x))
                 .fold(0.0f32, f32::max);
@@ -3484,6 +3629,23 @@ impl eframe::App for RusplorerApp {
                         if ui.add_sized([menu_w, 0.0], egui::Button::new("🔄  Refresh")).clicked() {
                             self.refresh_contents();
                             self.show_bg_context_menu = false;
+                        }
+                        if can_undo {
+                            // Separator
+                            let (line_rect2, _) = ui.allocate_exact_size(egui::vec2(menu_w, 1.0), egui::Sense::hover());
+                            ui.painter().rect_filled(line_rect2, 0.0, egui::Color32::from_gray(160));
+                            ui.add_space(2.0);
+                            if ui.add_sized([menu_w, 0.0], egui::Button::new("↩  Undo delete")).clicked() {
+                                #[cfg(windows)]
+                                {
+                                    let paths = self.last_deleted_paths.clone();
+                                    if Self::restore_from_recycle_bin(&paths) {
+                                        self.last_deleted_paths.clear();
+                                    }
+                                    self.refresh_contents();
+                                }
+                                self.show_bg_context_menu = false;
+                            }
                         }
                     });
                 });

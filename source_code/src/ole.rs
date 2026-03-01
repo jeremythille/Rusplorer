@@ -326,6 +326,7 @@ pub fn register_ole_drop_target(
     hwnd_raw: *mut std::ffi::c_void,
     sender: std::sync::mpsc::Sender<Vec<PathBuf>>,
     right_click_sender: std::sync::mpsc::Sender<Vec<PathBuf>>,
+    drag_in_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<windows::Win32::System::Ole::IDropTarget> {
     use windows::core::implement;
     use windows::Win32::Foundation::{HWND, POINTL, S_OK};
@@ -345,6 +346,7 @@ pub fn register_ole_drop_target(
         sender: std::sync::mpsc::Sender<Vec<PathBuf>>,
         right_click_sender: std::sync::mpsc::Sender<Vec<PathBuf>>,
         last_key_state: std::cell::Cell<u32>,
+        drag_in_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl IDropTarget_Impl for DropTarget_Impl {
@@ -356,6 +358,7 @@ pub fn register_ole_drop_target(
             pdweffect: *mut DROPEFFECT,
         ) -> windows::core::Result<()> {
             self.last_key_state.set(grfkeystate.0);
+            self.drag_in_active.store(true, std::sync::atomic::Ordering::SeqCst);
             unsafe {
                 let ok = if let Some(obj) = pdataobj {
                     let fmt = FORMATETC {
@@ -386,6 +389,7 @@ pub fn register_ole_drop_target(
         }
 
         fn DragLeave(&self) -> windows::core::Result<()> {
+            self.drag_in_active.store(false, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
 
@@ -430,6 +434,7 @@ pub fn register_ole_drop_target(
                 }
                 let _ = GlobalUnlock(hmem);
 
+                self.drag_in_active.store(false, std::sync::atomic::Ordering::SeqCst);
                 if !files.is_empty() {
                     if self.last_key_state.get() & MK_RBUTTON != 0 {
                         let _ = self.right_click_sender.send(files);
@@ -447,6 +452,7 @@ pub fn register_ole_drop_target(
         sender,
         right_click_sender,
         last_key_state: std::cell::Cell::new(0),
+        drag_in_active,
     }.into();
     unsafe {
         let hwnd = HWND(hwnd_raw);
