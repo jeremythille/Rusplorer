@@ -264,6 +264,8 @@ struct RusplorerApp {
     bg_context_position: egui::Pos2,
     bg_context_menu_size: egui::Vec2,
     selected_entries: HashSet<String>,
+    /// Anchor entry name for shift-click range selection.
+    last_clicked_entry: Option<String>,
     /// Paths of the files/folders deleted in the last delete operation (for undo).
     last_deleted_paths: Vec<PathBuf>,
     show_archive_dialog: bool,
@@ -472,6 +474,7 @@ impl RusplorerApp {
             bg_context_position: egui::Pos2::ZERO,
             bg_context_menu_size: egui::vec2(100.0, 80.0),
             selected_entries: HashSet::new(),
+            last_clicked_entry: None,
             show_archive_dialog: false,
             archive_type: 0,
             compression_level: 2,
@@ -1275,10 +1278,17 @@ impl RusplorerApp {
 
         for original_path in paths {
             // Derive the drive root (e.g.  C:\)
-            let drive = match original_path.components().next() {
-                Some(c) => PathBuf::from(c.as_os_str()),
-                None => continue,
-            };
+            // We need both the Prefix and RootDir components to get "C:\"
+            let mut drive = PathBuf::new();
+            let mut comp_count = 0;
+            for comp in original_path.components() {
+                drive.push(comp);
+                comp_count += 1;
+                if comp_count >= 2 { break; } // Prefix + RootDir
+            }
+            if comp_count < 2 {
+                continue;
+            }
             let recycle_bin = drive.join("$Recycle.Bin");
 
             // Iterate all SID subdirectories inside $Recycle.Bin
@@ -1668,7 +1678,21 @@ impl eframe::App for RusplorerApp {
                 self.prev_del_down = del_down;
 
                 // Only fire actions when Rusplorer actually has focus
-                if self.is_focused {
+                // and no modal text input is active (rename / new-item dialog).
+                // Use GetForegroundWindow for reliable check — egui's viewport().focused
+                // can return None (defaulting to true), causing false positives when
+                // the user presses shortcuts in another window while GetAsyncKeyState
+                // reports global key state.
+                let dialog_open = self.show_rename_dialog || self.show_new_item_dialog;
+                let really_focused = self.is_focused && {
+                    match find_own_hwnd() {
+                        Some(hwnd) => unsafe {
+                            winapi::um::winuser::GetForegroundWindow() == hwnd
+                        },
+                        None => false,
+                    }
+                };
+                if really_focused && !dialog_open {
                     let cut_pressed    = x_down   && !prev_x;
                     let copy_pressed   = c_down   && !prev_c && !cut_pressed;
                     let paste_pressed  = v_down   && !prev_v;
@@ -1733,7 +1757,32 @@ impl eframe::App for RusplorerApp {
             {
                 let dest = self.current_path.clone();
 
-                if !self.clipboard_files.is_empty() {
+                // Always try the Windows clipboard first — it may have
+                // been updated by another app (Explorer, another Rusplorer
+                // instance, etc.) since we last set our internal clipboard.
+                let win_clipboard = read_files_from_clipboard().unwrap_or_default();
+                let win_is_cut = if !win_clipboard.is_empty() {
+                    read_clipboard_drop_effect_is_cut()
+                } else {
+                    false
+                };
+
+                // Determine which clipboard to use:
+                // - If Windows clipboard has files AND they differ from our
+                //   internal clipboard → prefer Windows (external copy).
+                // - Otherwise use internal clipboard (preserves reliable
+                //   cut/copy tracking within this instance).
+                let use_internal = !self.clipboard_files.is_empty()
+                    && (win_clipboard.is_empty()
+                        || {
+                            let mut sorted_win = win_clipboard.clone();
+                            sorted_win.sort();
+                            let mut sorted_int = self.clipboard_files.clone();
+                            sorted_int.sort();
+                            sorted_win == sorted_int
+                        });
+
+                if use_internal {
                     // Use our own internal clipboard — reliable cut/copy detection
                     let files = self.clipboard_files.clone();
                     let is_cut = self.clipboard_mode == Some(ClipboardMode::Cut);
@@ -1751,23 +1800,29 @@ impl eframe::App for RusplorerApp {
                     for name in pasted_names {
                         self.selected_entries.insert(name);
                     }
-                } else {
-                    // Nothing in our internal clipboard — try Windows clipboard
-                    // (files copied from Explorer / other apps)
-                    if let Ok(clipboard_files) = read_files_from_clipboard() {
-                        if !clipboard_files.is_empty() {
-                            let is_cut = read_clipboard_drop_effect_is_cut();
-                            let pasted_names = if is_cut {
-                                RusplorerApp::move_files(&clipboard_files, &dest).unwrap_or_default()
-                            } else {
-                                RusplorerApp::copy_files(&clipboard_files, &dest).unwrap_or_default()
-                            };
-                            self.refresh_contents();
-                            self.selected_entries.clear();
-                            for name in pasted_names {
-                                self.selected_entries.insert(name);
-                            }
-                        }
+                } else if !win_clipboard.is_empty() {
+                    // Use Windows clipboard (files from another app)
+                    let pasted_names = if win_is_cut {
+                        RusplorerApp::move_files(&win_clipboard, &dest).unwrap_or_default()
+                    } else {
+                        RusplorerApp::copy_files(&win_clipboard, &dest).unwrap_or_default()
+                    };
+                    // Sync internal clipboard so subsequent paste in
+                    // same session (if copy) re-pastes the same files.
+                    self.clipboard_files = win_clipboard;
+                    self.clipboard_mode = Some(if win_is_cut {
+                        ClipboardMode::Cut
+                    } else {
+                        ClipboardMode::Copy
+                    });
+                    if win_is_cut {
+                        self.clipboard_files.clear();
+                        self.clipboard_mode = None;
+                    }
+                    self.refresh_contents();
+                    self.selected_entries.clear();
+                    for name in pasted_names {
+                        self.selected_entries.insert(name);
                     }
                 }
             }
@@ -2921,15 +2976,43 @@ impl eframe::App for RusplorerApp {
 
                                 if response.clicked() {
                                     let is_ctrl = ui.input(|i| i.modifiers.ctrl);
-                                    if is_ctrl {
+                                    let is_shift = ui.input(|i| i.modifiers.shift);
+                                    if is_shift {
+                                        // Range select: from last_clicked_entry to this entry
+                                        if let Some(ref anchor) = self.last_clicked_entry {
+                                            let anchor_idx = filtered_entries.iter().position(|e| e.name == *anchor);
+                                            let click_idx = filtered_entries.iter().position(|e| e.name == entry.name);
+                                            if let (Some(a), Some(b)) = (anchor_idx, click_idx) {
+                                                let lo = a.min(b);
+                                                let hi = a.max(b);
+                                                if !is_ctrl {
+                                                    self.selected_entries.clear();
+                                                }
+                                                for i in lo..=hi {
+                                                    let name = &filtered_entries[i].name;
+                                                    if !name.starts_with("[..]") {
+                                                        self.selected_entries.insert(name.clone());
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            // No anchor yet — treat as normal click
+                                            self.selected_entries.clear();
+                                            self.selected_entries.insert(entry.name.clone());
+                                            self.last_clicked_entry = Some(entry.name.clone());
+                                        }
+                                        // Don't update anchor on shift-click (allows extending)
+                                    } else if is_ctrl {
                                         if self.selected_entries.contains(&entry.name) {
                                             self.selected_entries.remove(&entry.name);
                                         } else {
                                             self.selected_entries.insert(entry.name.clone());
                                         }
+                                        self.last_clicked_entry = Some(entry.name.clone());
                                     } else {
                                         self.selected_entries.clear();
                                         self.selected_entries.insert(entry.name.clone());
+                                        self.last_clicked_entry = Some(entry.name.clone());
                                     }
                                 }
 
