@@ -11,7 +11,9 @@ A lightweight, blazingly-fast file explorer written in Rust for Windows.
 ## Disclaimer
 
 I custom-made this file explorer specifically for my needs, as I like it. That's why there are next to no options or configuration. Consequently, you may like it too, or you may not.  
-**It is not intended to be pretty, but fast as hell, minimalist, and practical.** I couldn't care less about it being pretty.
+**It is not intended to be pretty, but fast as hell, minimalist, and practical.** Everything must be pretty first these days, who cares about optimization or usability! I couldn't care less about Rusplorer being pretty. It must WORK and BE QUICK.
+
+
 
 <div align="center">
 
@@ -25,8 +27,8 @@ I custom-made this file explorer specifically for my needs, as I like it. That's
 
 ### Speed & Performance
 - **Super lightweight** - 7 MB self-contained executable, 2 MB of which are due to embedded font (Iosevka Aile)
+- **All folders and file sizes** - Computed lazily and multithreaded, 0 impact on speed and reactivity
 - **Instant directory listing** - Displays folder contents immediately without waiting for file size calculations
-- **Lazy loading** - File sizes load in the background while you browse
 - **Background threading** - No UI blocking, ever smooth interaction
 - **Minimal overhead** - Built with `egui` and `eframe` for efficient rendering
 

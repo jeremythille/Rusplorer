@@ -254,6 +254,9 @@ struct RusplorerApp {
     context_menu_tree_highlight: Option<PathBuf>,
     context_menu_position: egui::Pos2,
     context_menu_size: egui::Vec2,
+    /// Snapshot of the selected files at the moment the context menu was opened.
+    /// Used by menu actions so that a click-through to the table can't clobber the selection.
+    context_menu_selection: Vec<PathBuf>,
     show_rename_dialog: bool,
     rename_buffer: String,
     // New folder / new file dialogs (triggered from background right-click menu)
@@ -465,6 +468,7 @@ impl RusplorerApp {
             context_menu_tree_highlight: None,
             context_menu_position: egui::Pos2::ZERO,
             context_menu_size: egui::vec2(100.0, 100.0),
+            context_menu_selection: Vec::new(),
             show_rename_dialog: false,
             rename_buffer: String::new(),
             show_new_item_dialog: false,
@@ -2129,8 +2133,10 @@ impl eframe::App for RusplorerApp {
                             // full path, set current_path to its parent temporarily — or better,
                             // store the full path directly.
                             self.context_menu_tree_path = Some(rclick_path.clone());
-                            self.context_menu_tree_highlight = Some(rclick_path);
+                            self.context_menu_tree_highlight = Some(rclick_path.clone());
                             self.context_menu_position = rclick_pos;
+                            // Snapshot: just this one tree path
+                            self.context_menu_selection = vec![rclick_path];
                         }
                     });
                 if let Some(target) = tree_hovered_drop {
@@ -3032,6 +3038,12 @@ impl eframe::App for RusplorerApp {
                                         self.selected_entries.clear();
                                         self.selected_entries.insert(entry.name.clone());
                                     }
+                                    // Snapshot the selection NOW before any click-through can clear it
+                                    self.context_menu_selection = self
+                                        .selected_entries
+                                        .iter()
+                                        .map(|n| self.current_path.join(n))
+                                        .collect();
                                     self.show_context_menu = true;
                                     self.show_bg_context_menu = false;
                                     self.context_menu_entry = Some(entry.clone());
@@ -3583,10 +3595,10 @@ impl eframe::App for RusplorerApp {
                             // Add to archive
                             if ui.add_sized([menu_w, 0.0], egui::Button::new("Add to archive")).clicked() {
                                 self.files_to_archive.clear();
-                                if !self.selected_entries.is_empty() {
-                                    for name in &self.selected_entries {
-                                        self.files_to_archive.push(self.current_path.join(name));
-                                    }
+                                // Use the snapshot taken at right-click time so that any
+                                // click-through to the table can't clear our selection.
+                                if !self.context_menu_selection.is_empty() {
+                                    self.files_to_archive = self.context_menu_selection.clone();
                                 } else {
                                     self.files_to_archive.push(full_path.clone());
                                 }
@@ -3633,9 +3645,26 @@ impl eframe::App for RusplorerApp {
 
                             // Properties
                             if ui.add_sized([menu_w, 0.0], egui::Button::new("Properties")).clicked() {
-                                let _ = std::process::Command::new("explorer")
-                                    .args(&["/select,", &full_path.to_string_lossy()])
-                                    .spawn();
+                                #[cfg(windows)]
+                                {
+                                    use std::ffi::OsStr;
+                                    use std::os::windows::ffi::OsStrExt;
+                                    use winapi::um::shellapi::{ShellExecuteExW, SHELLEXECUTEINFOW, SEE_MASK_INVOKEIDLIST};
+                                    use winapi::um::winuser::SW_SHOW;
+                                    let verb: Vec<u16> = OsStr::new("properties")
+                                        .encode_wide().chain(std::iter::once(0)).collect();
+                                    let file: Vec<u16> = OsStr::new(full_path.to_str().unwrap_or(""))
+                                        .encode_wide().chain(std::iter::once(0)).collect();
+                                    unsafe {
+                                        let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
+                                        info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+                                        info.fMask = SEE_MASK_INVOKEIDLIST;
+                                        info.lpVerb = verb.as_ptr();
+                                        info.lpFile = file.as_ptr();
+                                        info.nShow = SW_SHOW as i32;
+                                        ShellExecuteExW(&mut info);
+                                    }
+                                }
                                 self.show_context_menu = false;
                                 self.context_menu_tree_highlight = None;
                             }
@@ -3652,6 +3681,7 @@ impl eframe::App for RusplorerApp {
                 self.show_context_menu = false;
                 self.context_menu_tree_path = None;
                 self.context_menu_tree_highlight = None;
+                self.context_menu_selection.clear();
             }
         }
 
@@ -3779,8 +3809,9 @@ impl eframe::App for RusplorerApp {
                     ui.add_space(4.0);
 
                     ui.label(format!(
-                        "{} item(s) to archive",
-                        self.files_to_archive.len()
+                        "{} {} to archive",
+                        self.files_to_archive.len(),
+                        if self.files_to_archive.len() == 1 { "item" } else { "items" }
                     ));
 
                     ui.add_space(4.0);
