@@ -77,7 +77,11 @@ fn main() -> Result<(), eframe::Error> {
         .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_lowercase()))
         .map(|name| name.contains("dev"))
         .unwrap_or(false);
-    let window_title = if is_dev { "Rusplorer (dev)" } else { "Rusplorer" };
+    let window_title = if is_dev {
+        concat!("Rusplorer (dev) (", env!("GIT_COMMIT_DATE"), ")")
+    } else {
+        concat!("Rusplorer (", env!("GIT_COMMIT_DATE"), ")")
+    };
 
     eframe::run_native(
         window_title,
