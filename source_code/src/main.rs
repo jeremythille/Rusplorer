@@ -124,13 +124,19 @@ fn run_app() -> Result<(), eframe::Error> {
         other => return other,
     };
 
-    // 3. Last resort: try wgpu with the GL (GLES) backend + PowerPreference::None so
-    //    software adapters like WARP can be selected. Covers RDP/Hyper-V/thin-client
-    //    machines where DX12 and Vulkan hardware acceleration are unavailable.
+    // 3. Last resort: force Microsoft WARP — the Windows built-in software rasterizer.
+    //    Always present on Windows 10/11, covers AWS WorkSpaces, Hyper-V, and any
+    //    environment where there is no GPU or the driver exposes no 3D adapter at all.
+    //    We tell wgpu which adapter to pick via the WGPU_ADAPTER_NAME env var that
+    //    wgpu reads inside initialize_adapter_from_env_or_default().
     match result {
         Err(ref e) if format!("{:?}", e).contains("NoSuitableAdapterFound") => {
+            // "Microsoft Basic Render Driver" is the exact adapter name for WARP on Windows.
+            // SAFETY: single-threaded at this point; no other thread reads this var.
+            unsafe { std::env::set_var("WGPU_ADAPTER_NAME", "Microsoft Basic Render Driver"); }
             let mut wgpu_config = egui_wgpu::WgpuConfiguration::default();
-            wgpu_config.supported_backends = eframe::wgpu::Backends::all();
+            // WARP is a DX12 software device — keep DX12 as the backend.
+            wgpu_config.supported_backends = eframe::wgpu::Backends::DX12;
             wgpu_config.power_preference = eframe::wgpu::PowerPreference::None;
             launch(eframe::Renderer::Wgpu, Some(wgpu_config), session, window_title)
         }
