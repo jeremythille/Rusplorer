@@ -40,6 +40,56 @@ use shortcuts::{create_lnk_shortcut, resolve_lnk};
 use tree::render_tree_node;
 
 fn main() -> Result<(), eframe::Error> {
+    // In release mode the console is hidden (windows_subsystem = "windows").
+    // Catch panics and eframe errors and write them to a log file next to the
+    // exe so startup failures are diagnosable on restricted corporate machines.
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("PANIC: {}\n", info);
+        let log_path = std::env::current_exe()
+            .ok()
+            .map(|p| p.with_file_name("rusplorer_error.log"))
+            .unwrap_or_else(|| std::path::PathBuf::from("rusplorer_error.log"));
+        let _ = std::fs::write(&log_path, &msg);
+        // Also show a message box so the user knows something went wrong
+        #[cfg(windows)]
+        unsafe {
+            use std::ffi::CString;
+            let title = CString::new("Rusplorer crashed").unwrap_or_default();
+            let body  = CString::new(format!("Rusplorer encountered a fatal error.\nDetails written to:\n{}", log_path.display())).unwrap_or_default();
+            winapi::um::winuser::MessageBoxA(
+                std::ptr::null_mut(),
+                body.as_ptr(),
+                title.as_ptr(),
+                winapi::um::winuser::MB_OK | winapi::um::winuser::MB_ICONERROR,
+            );
+        }
+    }));
+
+    let result = run_app();
+    if let Err(ref e) = result {
+        let msg = format!("eframe error: {:?}\n", e);
+        let log_path = std::env::current_exe()
+            .ok()
+            .map(|p| p.with_file_name("rusplorer_error.log"))
+            .unwrap_or_else(|| std::path::PathBuf::from("rusplorer_error.log"));
+        let _ = std::fs::write(&log_path, &msg);
+        #[cfg(windows)]
+        unsafe {
+            use std::ffi::CString;
+            let title = CString::new("Rusplorer failed to start").unwrap_or_default();
+            let body  = CString::new(format!("Rusplorer could not initialise the graphics window.\nDetails written to:\n{}", log_path.display())).unwrap_or_default();
+            winapi::um::winuser::MessageBoxA(
+                std::ptr::null_mut(),
+                body.as_ptr(),
+                title.as_ptr(),
+                winapi::um::winuser::MB_OK | winapi::um::winuser::MB_ICONERROR,
+            );
+        }
+    }
+    result
+}
+
+fn run_app() -> Result<(), eframe::Error> {
     // Initialise OLE on the main thread so DoDragDrop works
     #[cfg(windows)]
     unsafe {
@@ -52,6 +102,9 @@ fn main() -> Result<(), eframe::Error> {
         .and_then(|arg| SessionData::load_from_file(std::path::Path::new(&arg)));
 
     let mut options = eframe::NativeOptions::default();
+    // Disable multisampling — required on some corporate/VM environments
+    // where the GPU driver does not expose MSAA sample counts.
+    options.multisampling = 0;
     options.viewport.inner_size = session
         .as_ref()
         .and_then(|s| s.window_size)
@@ -3530,6 +3583,12 @@ impl eframe::App for RusplorerApp {
                 // Pre-compute required width from all possible button labels
                 let btn_padding = 8.0 + 8.0; // button padding (4+4) × 2 sides + frame inner margin
                 let font_id = egui::TextStyle::Button.resolve(&ctx.style());
+                let archive_stem = full_path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                let extract_label = format!("Extract to ./{}", archive_stem);
                 let mut labels: Vec<&str> = vec![
                     "Add to archive",
                     "📋 Copy full path",
@@ -3540,7 +3599,7 @@ impl eframe::App for RusplorerApp {
                     labels.push("Open with VS Code");
                 }
                 if Self::is_archive(&full_path) {
-                    labels.push("Extract here");
+                    labels.push(extract_label.as_str());
                 }
                 let max_text_w = labels.iter()
                     .map(|l| ctx.fonts(|f| f.layout_no_wrap(l.to_string(), font_id.clone(), egui::Color32::WHITE).size().x))
@@ -3586,9 +3645,9 @@ impl eframe::App for RusplorerApp {
                                 self.context_menu_tree_highlight = None;
                             }
 
-                            // Extract here
+                            // Extract to ./<archive name>
                             if Self::is_archive(&full_path)
-                                && ui.add_sized([menu_w, 0.0], egui::Button::new("Extract here")).clicked()
+                                && ui.add_sized([menu_w, 0.0], egui::Button::new(extract_label.as_str())).clicked()
                             {
                                 self.extract_archive_path = full_path.clone();
                                 self.show_extract_dialog = true;
@@ -3890,7 +3949,13 @@ impl eframe::App for RusplorerApp {
         // Start extraction if dialog was shown (one-time trigger)
         if self.show_extract_dialog && self.extract_done_receiver.is_none() {
             let archive_path = self.extract_archive_path.clone();
-            let dest = self.current_path.clone();
+            let stem = archive_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let dest = self.current_path.join(&stem);
+            let _ = std::fs::create_dir_all(&dest);
             let (done_tx, done_rx) = channel();
 
             std::thread::spawn(move || {

@@ -36,4 +36,6 @@ codegen-units = 256
 opt-level = 3
 lto = true
 codegen-units = 1
-strip = true
+# strip = "debuginfo" keeps symbols needed for 64-bit exception unwinding (.pdata);
+# strip = true ("symbols") removes them and can cause silent crashes on Windows.
+strip = "debuginfo"
