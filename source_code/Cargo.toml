@@ -6,6 +6,9 @@ edition = "2024"
 [dependencies]
 egui = "0.27"
 eframe = { version = "0.27", default-features = false, features = ["default_fonts", "glow", "wgpu"] }
+# Direct dep to enable the `angle` feature (ANGLE = OpenGL ES on D3D11, works on
+# AWS WorkSpaces and other environments with no hardware DX12/Vulkan adapter).
+wgpu = { version = "0.19", features = ["angle"] }
 egui-winit = "0.27"
 egui_extras = "0.27"
 arboard = "3.6"
