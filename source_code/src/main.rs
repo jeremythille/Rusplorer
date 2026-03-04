@@ -101,7 +101,36 @@ fn run_app() -> Result<(), eframe::Error> {
         .nth(1)
         .and_then(|arg| SessionData::load_from_file(std::path::Path::new(&arg)));
 
+    let is_dev = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_lowercase()))
+        .map(|name| name.contains("dev"))
+        .unwrap_or(false);
+    let window_title: &'static str = if is_dev {
+        concat!("Rusplorer (dev) (", env!("GIT_COMMIT_DATE"), ")")
+    } else {
+        concat!("Rusplorer (", env!("GIT_COMMIT_DATE"), ")")
+    };
+
+    // Prefer glow (OpenGL) — lower CPU overhead and faster on hardware that
+    // supports it. Fall back to wgpu (Direct3D 11 on Windows) only when
+    // OpenGL 2.0 is unavailable (e.g. corporate thin-clients, RDP sessions).
+    let result = launch(eframe::Renderer::Glow, session.clone(), window_title);
+    match result {
+        Err(ref e) if format!("{:?}", e).to_lowercase().contains("opengl") => {
+            launch(eframe::Renderer::Wgpu, session, window_title)
+        }
+        other => other,
+    }
+}
+
+fn launch(
+    renderer: eframe::Renderer,
+    session: Option<SessionData>,
+    window_title: &'static str,
+) -> Result<(), eframe::Error> {
     let mut options = eframe::NativeOptions::default();
+    options.renderer = renderer;
     // Disable multisampling — required on some corporate/VM environments
     // where the GPU driver does not expose MSAA sample counts.
     options.multisampling = 0;
@@ -124,16 +153,6 @@ fn run_app() -> Result<(), eframe::Error> {
             width,
             height,
         }))
-    };
-    let is_dev = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_lowercase()))
-        .map(|name| name.contains("dev"))
-        .unwrap_or(false);
-    let window_title = if is_dev {
-        concat!("Rusplorer (dev) (", env!("GIT_COMMIT_DATE"), ")")
-    } else {
-        concat!("Rusplorer (", env!("GIT_COMMIT_DATE"), ")")
     };
 
     eframe::run_native(
