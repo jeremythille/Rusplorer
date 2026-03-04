@@ -2,6 +2,7 @@
 
 use arboard::Clipboard;
 use eframe::egui;
+use eframe::egui_wgpu;
 use egui_extras::{Column, TableBuilder};
 use notify::recommended_watcher;
 use notify::{RecursiveMode, Watcher};
@@ -112,13 +113,26 @@ fn run_app() -> Result<(), eframe::Error> {
         concat!("Rusplorer (", env!("GIT_COMMIT_DATE"), ")")
     };
 
-    // Prefer glow (OpenGL) — lower CPU overhead and faster on hardware that
-    // supports it. Fall back to wgpu (Direct3D 11 on Windows) only when
-    // OpenGL 2.0 is unavailable (e.g. corporate thin-clients, RDP sessions).
-    let result = launch(eframe::Renderer::Glow, session.clone(), window_title);
-    match result {
+    // 1. Glow (OpenGL) — fastest on machines that support it.
+    let result = launch(eframe::Renderer::Glow, None, session.clone(), window_title);
+
+    // 2. If OpenGL 2.0 is unavailable, try wgpu with primary backends (DX12 / Vulkan).
+    let result = match result {
         Err(ref e) if format!("{:?}", e).to_lowercase().contains("opengl") => {
-            launch(eframe::Renderer::Wgpu, session, window_title)
+            launch(eframe::Renderer::Wgpu, None, session.clone(), window_title)
+        }
+        other => return other,
+    };
+
+    // 3. Last resort: try wgpu with the GL (GLES) backend + PowerPreference::None so
+    //    software adapters like WARP can be selected. Covers RDP/Hyper-V/thin-client
+    //    machines where DX12 and Vulkan hardware acceleration are unavailable.
+    match result {
+        Err(ref e) if format!("{:?}", e).contains("NoSuitableAdapterFound") => {
+            let mut wgpu_config = egui_wgpu::WgpuConfiguration::default();
+            wgpu_config.supported_backends = eframe::wgpu::Backends::all();
+            wgpu_config.power_preference = eframe::wgpu::PowerPreference::None;
+            launch(eframe::Renderer::Wgpu, Some(wgpu_config), session, window_title)
         }
         other => other,
     }
@@ -126,11 +140,15 @@ fn run_app() -> Result<(), eframe::Error> {
 
 fn launch(
     renderer: eframe::Renderer,
+    wgpu_config_override: Option<egui_wgpu::WgpuConfiguration>,
     session: Option<SessionData>,
     window_title: &'static str,
 ) -> Result<(), eframe::Error> {
     let mut options = eframe::NativeOptions::default();
     options.renderer = renderer;
+    if let Some(wgpu_config) = wgpu_config_override {
+        options.wgpu_options = wgpu_config;
+    }
     // Disable multisampling — required on some corporate/VM environments
     // where the GPU driver does not expose MSAA sample counts.
     options.multisampling = 0;
