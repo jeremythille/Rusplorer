@@ -86,8 +86,15 @@ pub fn render_tree_node(
             }
             let text_color = if is_current || is_tree_drop_target {
                 egui::Color32::WHITE
+            } else if is_ancestor {
+                // Yellow/orange ancestor background — force dark text regardless of theme
+                egui::Color32::from_gray(20)
+            } else if is_tree_highlighted {
+                // Light blue highlight — force dark text regardless of theme
+                egui::Color32::from_gray(20)
             } else {
-                egui::Color32::BLACK
+                // Yellow background — force dark text regardless of dark mode
+                egui::Color32::from_gray(20)
             };
             let base_text = egui::RichText::new(&truncated_name).color(text_color);
             let label_text = if is_ancestor || is_current || is_tree_highlighted {

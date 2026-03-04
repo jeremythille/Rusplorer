@@ -9,7 +9,6 @@ eframe = { version = "0.27", default-features = false, features = ["default_font
 # Direct dep to enable the `angle` feature (ANGLE = OpenGL ES on D3D11, works on
 # AWS WorkSpaces and other environments with no hardware DX12/Vulkan adapter).
 wgpu = { version = "0.19", features = ["angle"] }
-egui-winit = "0.27"
 egui_extras = "0.27"
 arboard = "3.6"
 serde = { version = "1.0", features = ["derive"] }
@@ -37,8 +36,9 @@ codegen-units = 256
 
 [profile.release]
 opt-level = 3
-lto = true
+lto = "fat"
 codegen-units = 1
-# strip = "debuginfo" keeps symbols needed for 64-bit exception unwinding (.pdata);
-# strip = true ("symbols") removes them and can cause silent crashes on Windows.
-strip = "debuginfo"
+panic = "abort"
+# strip = "symbols" removes all symbol tables. The .pdata section (64-bit exception
+# unwinding in C++ code) is separate and unaffected on Windows.
+strip = "symbols"

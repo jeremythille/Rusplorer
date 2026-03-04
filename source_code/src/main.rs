@@ -2973,7 +2973,7 @@ impl eframe::App for RusplorerApp {
                                     .fill(egui::Color32::from_rgb(100, 150, 255))
                                     .frame(false)
                                 } else if is_in_clipboard && entry.is_dir {
-                                    egui::Button::new(egui::RichText::new(&entry.name).italics())
+                                    egui::Button::new(egui::RichText::new(&entry.name).italics().color(egui::Color32::from_gray(20)))
                                         .fill(egui::Color32::from_rgb(255, 245, 150))
                                         .frame(false)
                                 } else if is_in_clipboard {
@@ -2984,7 +2984,7 @@ impl eframe::App for RusplorerApp {
                                         .fill(egui::Color32::TRANSPARENT)
                                         .frame(false)
                                 } else if entry.is_dir {
-                                    egui::Button::new(&entry.name)
+                                    egui::Button::new(egui::RichText::new(&entry.name).color(egui::Color32::from_gray(20)))
                                         .fill(egui::Color32::from_rgb(255, 245, 150))
                                         .frame(false)
                                 } else {
