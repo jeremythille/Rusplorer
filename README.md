@@ -11,7 +11,7 @@ A lightweight, blazingly-fast file explorer written in Rust / egui for Windows.
 ## Disclaimer
 
 I custom-made this file explorer specifically for my needs, as I like it. That's why there are next to no options or configuration. Consequently, you may like it too, or you may not.  
-**It is not intended to be pretty, but fast as hell, minimalist, and practical.** Everything must be pretty first these days, who cares about optimization or usability! I couldn't care less about Rusplorer being pretty. It must WORK and BE QUICK.
+**It is not intended to be pretty, but fast as hell, minimalist, and practical.** Everything must be pretty first these days, who cares about optimization or usability! But I couldn't care less about Rusplorer being pretty. It must WORK and BE QUICK.
 
 
 

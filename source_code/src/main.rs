@@ -449,6 +449,9 @@ struct RusplorerApp {
     dnd_tab_hover: Option<(usize, std::time::Instant)>,
     /// Cached drive kind per drive root (e.g. "C:\\").
     drive_types: HashMap<String, DriveKind>,
+    /// Detailed info cached for the Drives overview page.
+    drives_info: Vec<DriveInfo>,
+    show_drives_page: bool,
 }
 
 #[derive(Clone)]
@@ -471,6 +474,37 @@ enum DriveKind {
     Network,
     CdRom,
     Unknown,
+}
+
+impl DriveKind {
+    fn label(self) -> &'static str {
+        match self {
+            DriveKind::Ssd      => "SSD",
+            DriveKind::Hdd      => "HDD",
+            DriveKind::Removable => "USB",
+            DriveKind::Network  => "Network",
+            DriveKind::CdRom    => "CD-ROM",
+            DriveKind::Unknown  => "Unknown",
+        }
+    }
+    fn color(self) -> egui::Color32 {
+        match self {
+            DriveKind::Ssd      => egui::Color32::from_rgb(0, 130, 0),
+            DriveKind::Hdd      => egui::Color32::from_gray(130),
+            DriveKind::Removable => egui::Color32::from_rgb(220, 150, 170),
+            DriveKind::Network  => egui::Color32::from_rgb(100, 160, 220),
+            DriveKind::CdRom    => egui::Color32::from_rgb(200, 160, 80),
+            DriveKind::Unknown  => egui::Color32::TRANSPARENT,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct DriveInfo {
+    drive: String,   // e.g. "C:\\"
+    kind: DriveKind,
+    free_bytes: u64,
+    total_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -657,6 +691,8 @@ impl RusplorerApp {
             dnd_tab_rects: Vec::new(),
             dnd_tab_hover: None,
             drive_types: HashMap::new(),
+            drives_info: Vec::new(),
+            show_drives_page: false,
         };
 
         // Initialise tabs — from session if provided, then config, then single default
@@ -686,7 +722,10 @@ impl RusplorerApp {
         // Classify each available drive (best-effort, cached once at startup)
         for drive in app.available_drives.clone() {
             let letter = drive.chars().next().unwrap_or('C');
-            app.drive_types.insert(drive, Self::classify_drive(letter));
+            let kind = Self::classify_drive(letter);
+            let (free_bytes, total_bytes) = Self::get_drive_space(&drive);
+            app.drive_types.insert(drive.clone(), kind);
+            app.drives_info.push(DriveInfo { drive, kind, free_bytes, total_bytes });
         }
 
         app
@@ -899,6 +938,43 @@ impl RusplorerApp {
     fn classify_drive(_drive_letter: char) -> DriveKind { DriveKind::Unknown }
     #[cfg(not(windows))]
     fn query_bus_type(_: char) -> Option<u32> { None }
+
+    /// Returns (free_bytes, total_bytes) for the given drive root (e.g. "C:\\").
+    #[cfg(windows)]
+    fn get_drive_space(drive: &str) -> (u64, u64) {
+        use winapi::um::fileapi::GetDiskFreeSpaceExW;
+        let path: Vec<u16> = drive.encode_utf16().chain(std::iter::once(0)).collect();
+        // ULARGE_INTEGER is a union that is exactly 8 bytes; u64 is layout-compatible
+        let mut free_caller: u64 = 0;
+        let mut total: u64       = 0;
+        let mut free_total: u64  = 0;
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(
+                path.as_ptr(),
+                &mut free_caller as *mut u64 as *mut _,
+                &mut total       as *mut u64 as *mut _,
+                &mut free_total  as *mut u64 as *mut _,
+            )
+        };
+        if ok != 0 { (free_total, total) } else { (0, 0) }
+    }
+    #[cfg(not(windows))]
+    fn get_drive_space(_drive: &str) -> (u64, u64) { (0, 0) }
+
+    fn format_bytes(bytes: u64) -> String {
+        const TB: u64 = 1 << 40;
+        const GB: u64 = 1 << 30;
+        const MB: u64 = 1 << 20;
+        if bytes >= TB {
+            format!("{:.2} TB", bytes as f64 / TB as f64)
+        } else if bytes >= GB {
+            format!("{:.1} GB", bytes as f64 / GB as f64)
+        } else if bytes >= MB {
+            format!("{:.0} MB", bytes as f64 / MB as f64)
+        } else {
+            format!("{} KB", bytes / 1024)
+        }
+    }
 
     /// Collapse the entire tree, then expand only the ancestors of `path`.
     /// This ensures unrelated drives/folders are hidden after every navigation.
@@ -2764,35 +2840,36 @@ impl eframe::App for RusplorerApp {
             // Drive selector with filter and navigation buttons
             let mut selected_drive: Option<PathBuf> = None;
             ui.horizontal(|ui| {
-                ui.label("Drive:");
+                // "Drives" toggle button
+                let drives_btn_label = if self.show_drives_page { "Drives ▲" } else { "Drives ▼" };
+                if ui.button(drives_btn_label).clicked() {
+                    self.show_drives_page = !self.show_drives_page;
+                    if self.show_drives_page {
+                        // Refresh space info each time the page is opened
+                        self.drives_info.clear();
+                        for drive in self.available_drives.clone() {
+                            let letter = drive.chars().next().unwrap_or('C');
+                            let kind = Self::classify_drive(letter);
+                            let (free_bytes, total_bytes) = Self::get_drive_space(&drive);
+                            self.drives_info.push(DriveInfo { drive, kind, free_bytes, total_bytes });
+                        }
+                    }
+                }
+                // Drive letter mini-buttons
                 for drive in &self.available_drives {
                     let current_drive = self.current_path.to_string_lossy();
                     let is_current = current_drive.starts_with(drive);
-                    let drive_display = drive.trim_end_matches(|c| c == '\\' || c == '/').to_string();
-
-                    let border_color = match self.drive_types.get(drive).copied().unwrap_or(DriveKind::Unknown) {
-                        DriveKind::Ssd      => egui::Color32::from_rgb(0, 130, 0),
-                        DriveKind::Hdd      => egui::Color32::from_gray(130),
-                        DriveKind::Removable => egui::Color32::from_rgb(220, 150, 170),
-                        DriveKind::Network  => egui::Color32::from_rgb(100, 160, 220),
-                        DriveKind::CdRom    => egui::Color32::from_rgb(200, 160, 80),
-                        DriveKind::Unknown  => egui::Color32::TRANSPARENT,
-                    };
-
-                    // Measure text size so we can allocate the exact bordered rect
+                    let drive_display = drive.trim_end_matches(|c: char| c == '\\' || c == '/').to_string();
+                    let border_color = self.drive_types.get(drive).copied().unwrap_or(DriveKind::Unknown).color();
                     let font_id = egui::FontId::proportional(11.0);
                     let text_size = ui.fonts(|f| {
                         f.layout_no_wrap(drive_display.clone(), font_id.clone(), egui::Color32::WHITE).size()
                     });
                     let pad = egui::vec2(6.0, 3.0);
                     let desired = text_size + pad * 2.0;
-
                     let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
-
                     if ui.is_rect_visible(rect) {
                         let painter = ui.painter();
-
-                        // Background: blue if active, subtle white if hovered
                         let bg = if is_current {
                             egui::Color32::from_rgb(60, 120, 220)
                         } else if resp.hovered() {
@@ -2801,33 +2878,16 @@ impl eframe::App for RusplorerApp {
                             egui::Color32::TRANSPARENT
                         };
                         painter.rect_filled(rect, 3.0, bg);
-
-                        // Border
                         if border_color != egui::Color32::TRANSPARENT {
                             painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.5, border_color));
                         }
-
-                        // Text
-                        let text_color = if is_current {
-                            egui::Color32::WHITE
-                        } else {
-                            ui.visuals().text_color()
-                        };
-                        painter.text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            &drive_display,
-                            font_id,
-                            text_color,
-                        );
+                        let text_color = if is_current { egui::Color32::WHITE } else { ui.visuals().text_color() };
+                        painter.text(rect.center(), egui::Align2::CENTER_CENTER, &drive_display, font_id, text_color);
                     }
-
                     if resp.clicked() {
                         selected_drive = Some(PathBuf::from(drive));
                     }
                 }
-
-                // Filter in the middle
                 ui.label("Filter:");
                 ui.allocate_ui(egui::vec2(70.0, 20.0), |ui| {
                     ui.text_edit_singleline(&mut self.filter);
@@ -2842,6 +2902,129 @@ impl eframe::App for RusplorerApp {
             }
 
             ui.separator();
+
+            if self.show_drives_page {
+                // Fixed column offsets (inside the row rect, after 12px left pad)
+                // Fixed layout constants
+                const ROW_H:  f32 = 36.0;
+                const PAD_X:  f32 = 12.0;
+                const PAD_Y:  f32 = 6.0;
+
+                let mut navigate_to_drive: Option<PathBuf> = None;
+                egui::ScrollArea::vertical()
+                    .id_source("drives_overview")
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        let avail_w = ui.available_width() - 8.0;
+                        for info in &self.drives_info {
+                            let border_color = info.kind.color();
+                            let used  = info.total_bytes.saturating_sub(info.free_bytes);
+                            let fraction = if info.total_bytes > 0 {
+                                used as f32 / info.total_bytes as f32
+                            } else { 0.0 };
+                            let size_text = if info.total_bytes > 0 {
+                                format!("{} free  /  {} total",
+                                    Self::format_bytes(info.free_bytes),
+                                    Self::format_bytes(info.total_bytes))
+                            } else {
+                                "No media".to_string()
+                            };
+                            let drive_label = info.drive
+                                .trim_end_matches(|c: char| c == '\\' || c == '/')
+                                .to_string();
+
+                            let (row_rect, resp) = ui.allocate_exact_size(
+                                egui::vec2(avail_w, ROW_H + PAD_Y * 2.0),
+                                egui::Sense::click(),
+                            );
+
+                            if ui.is_rect_visible(row_rect) {
+                                let p = ui.painter();
+                                let inner = row_rect.shrink2(egui::vec2(0.0, PAD_Y / 2.0));
+
+                                // Background
+                                let bg = if resp.hovered() {
+                                    egui::Color32::from_white_alpha(18)
+                                } else {
+                                    egui::Color32::from_white_alpha(5)
+                                };
+                                p.rect_filled(inner, 4.0, bg);
+
+                                // Border
+                                if border_color != egui::Color32::TRANSPARENT {
+                                    p.rect_stroke(inner, 4.0, egui::Stroke::new(1.5, border_color));
+                                }
+
+                                let content_x = inner.min.x + PAD_X;
+                                let bar_right  = inner.max.x - PAD_X;
+                                let cy = inner.center().y;
+
+                                let fid_big = egui::FontId::new(13.0, egui::FontFamily::Proportional);
+                                let fid_sm  = egui::FontId::proportional(11.0);
+
+                                // Measure widths up front (no rendering yet)
+                                let letter_w = ui.fonts(|f| f.layout_no_wrap(
+                                    drive_label.clone(), fid_big.clone(), egui::Color32::WHITE).size().x);
+                                let type_w = ui.fonts(|f| f.layout_no_wrap(
+                                    info.kind.label().to_string(), fid_sm.clone(), egui::Color32::WHITE).size().x);
+                                let size_w = ui.fonts(|f| f.layout_no_wrap(
+                                    size_text.clone(), fid_sm.clone(), egui::Color32::WHITE).size().x);
+
+                                let type_color = if border_color != egui::Color32::TRANSPARENT {
+                                    border_color
+                                } else {
+                                    egui::Color32::from_gray(160)
+                                };
+
+                                // Col 1 — drive letter
+                                p.text(egui::pos2(content_x, cy),
+                                    egui::Align2::LEFT_CENTER, &drive_label,
+                                    fid_big, ui.visuals().text_color());
+
+                                // Col 2 — type badge, immediately after drive letter
+                                let type_x = content_x + letter_w + 8.0;
+                                p.text(egui::pos2(type_x, cy),
+                                    egui::Align2::LEFT_CENTER, info.kind.label(),
+                                    fid_sm.clone(), type_color);
+
+                                // Col 3 — progress bar then size text right-aligned
+                                let bar_x = type_x + type_w + 10.0;
+                                p.text(egui::pos2(bar_right, cy),
+                                    egui::Align2::RIGHT_CENTER, &size_text,
+                                    fid_sm, egui::Color32::from_gray(180));
+
+                                let bar_max_w = (bar_right - size_w - 10.0 - bar_x).max(20.0);
+                                let bar_rect = egui::Rect::from_min_size(
+                                    egui::pos2(bar_x, cy - 5.0),
+                                    egui::vec2(bar_max_w, 10.0),
+                                );
+                                // Track
+                                p.rect_filled(bar_rect, 3.0, egui::Color32::from_gray(60));
+                                // Fill
+                                let fill_color = if fraction > 0.9 {
+                                    egui::Color32::from_rgb(200, 60, 60)
+                                } else {
+                                    egui::Color32::from_rgb(60, 140, 220)
+                                };
+                                let mut fill_rect = bar_rect;
+                                fill_rect.set_right(bar_rect.left() + bar_rect.width() * fraction.clamp(0.0, 1.0));
+                                p.rect_filled(fill_rect, 3.0, fill_color);
+                            }
+
+                            if resp.hovered() {
+                                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if resp.clicked() {
+                                navigate_to_drive = Some(PathBuf::from(&info.drive));
+                            }
+                            ui.add_space(4.0);
+                        }
+                    });
+                if let Some(drive) = navigate_to_drive {
+                    self.navigate_to(drive);
+                    self.show_drives_page = false;
+                }
+            } else {
 
             // Breadcrumbs
             let breadcrumbs = self.get_breadcrumbs();
@@ -3610,6 +3793,7 @@ impl eframe::App for RusplorerApp {
                     .collect();
                 self.config.save();
             }
+            } // end else !show_drives_page
 
             // Draw selection rectangle if dragging
             if let (Some(start), Some(current)) =
