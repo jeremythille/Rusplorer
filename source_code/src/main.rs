@@ -444,6 +444,11 @@ struct RusplorerApp {
     tab_scroll_offset: f32,
     tab_scroll_target: f32,
     tab_bar_rect: egui::Rect,
+    // DnD over tab bar: persisted rects + hover-to-switch tracking
+    dnd_tab_rects: Vec<egui::Rect>,
+    dnd_tab_hover: Option<(usize, std::time::Instant)>,
+    /// Cached drive kind per drive root (e.g. "C:\\").
+    drive_types: HashMap<String, DriveKind>,
 }
 
 #[derive(Clone)]
@@ -456,6 +461,16 @@ enum FileAction {
 enum ClipboardMode {
     Copy,
     Cut,
+}
+
+#[derive(Clone, Debug, Copy, PartialEq)]
+enum DriveKind {
+    Ssd,
+    Hdd,
+    Removable,  // USB / SD card
+    Network,
+    CdRom,
+    Unknown,
 }
 
 #[derive(Clone)]
@@ -639,6 +654,9 @@ impl RusplorerApp {
             tab_scroll_offset: 0.0,
             tab_scroll_target: 0.0,
             tab_bar_rect: egui::Rect::NOTHING,
+            dnd_tab_rects: Vec::new(),
+            dnd_tab_hover: None,
+            drive_types: HashMap::new(),
         };
 
         // Initialise tabs — from session if provided, then config, then single default
@@ -664,6 +682,13 @@ impl RusplorerApp {
 
         app.refresh_contents();
         app.start_file_watcher();
+
+        // Classify each available drive (best-effort, cached once at startup)
+        for drive in app.available_drives.clone() {
+            let letter = drive.chars().next().unwrap_or('C');
+            app.drive_types.insert(drive, Self::classify_drive(letter));
+        }
+
         app
     }
 }
@@ -700,6 +725,180 @@ impl RusplorerApp {
 
         drives
     }
+
+    /// Returns `Some(true)` = SSD, `Some(false)` = HDD, `None` = unknown.
+    /// Uses IOCTL_STORAGE_QUERY_PROPERTY / StorageDeviceSeekPenaltyProperty.
+    #[cfg(windows)]
+    fn query_is_ssd(drive_letter: char) -> Option<bool> {
+        use winapi::um::fileapi::CreateFileW;
+        use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+        use winapi::um::ioapiset::DeviceIoControl;
+        use winapi::shared::minwindef::{DWORD, LPVOID};
+
+        const OPEN_EXISTING: DWORD = 3;
+        const FILE_SHARE_READ: DWORD = 0x0000_0001;
+        const FILE_SHARE_WRITE: DWORD = 0x0000_0002;
+        const IOCTL_STORAGE_QUERY_PROPERTY: DWORD = 0x002D_1400;
+
+        #[repr(C)]
+        struct StoragePropertyQuery {
+            property_id: u32,        // 7 = StorageDeviceSeekPenaltyProperty
+            query_type: u32,         // 0 = PropertyStandardQuery
+            additional_parameters: [u8; 1],
+        }
+
+        #[repr(C)]
+        struct DeviceSeekPenaltyDescriptor {
+            version: u32,
+            size: u32,
+            incurs_seek_penalty: u8, // 0 = SSD (no seek penalty)
+        }
+
+        let path: Vec<u16> = format!("\\\\.\\{}:", drive_letter)
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+
+        if handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+
+        let query = StoragePropertyQuery {
+            property_id: 7,
+            query_type: 0,
+            additional_parameters: [0],
+        };
+        let mut desc: DeviceSeekPenaltyDescriptor = unsafe { std::mem::zeroed() };
+        let mut bytes_returned: DWORD = 0;
+
+        let result = unsafe {
+            DeviceIoControl(
+                handle,
+                IOCTL_STORAGE_QUERY_PROPERTY,
+                &query as *const _ as LPVOID,
+                std::mem::size_of::<StoragePropertyQuery>() as DWORD,
+                &mut desc as *mut _ as LPVOID,
+                std::mem::size_of::<DeviceSeekPenaltyDescriptor>() as DWORD,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        };
+
+        unsafe { CloseHandle(handle); }
+
+        if result != 0 { Some(desc.incurs_seek_penalty == 0) } else { None }
+    }
+
+    #[cfg(not(windows))]
+    fn query_is_ssd(_drive_letter: char) -> Option<bool> { None }
+
+    #[cfg(windows)]
+    fn classify_drive(drive_letter: char) -> DriveKind {
+        use winapi::um::fileapi::GetDriveTypeW;
+        const DRIVE_REMOVABLE: u32 = 2;
+        const DRIVE_FIXED:     u32 = 3;
+        const DRIVE_REMOTE:    u32 = 4;
+        const DRIVE_CDROM:     u32 = 5;
+        const BUS_TYPE_USB:    u32 = 7;
+        let path: Vec<u16> = format!("{}:\\", drive_letter)
+            .encode_utf16().chain(std::iter::once(0)).collect();
+        let kind = unsafe { GetDriveTypeW(path.as_ptr()) };
+        match kind {
+            DRIVE_REMOVABLE => DriveKind::Removable,
+            DRIVE_REMOTE    => DriveKind::Network,
+            DRIVE_CDROM     => DriveKind::CdRom,
+            DRIVE_FIXED     => {
+                // Some USB drives (especially high-capacity ones) self-report as
+                // DRIVE_FIXED.  Check the actual bus type to catch them.
+                if Self::query_bus_type(drive_letter) == Some(BUS_TYPE_USB) {
+                    return DriveKind::Removable;
+                }
+                match Self::query_is_ssd(drive_letter) {
+                    Some(true)  => DriveKind::Ssd,
+                    Some(false) => DriveKind::Hdd,
+                    // Drive asleep / IOCTL failed → assume HDD so a border is shown
+                    None        => DriveKind::Hdd,
+                }
+            },
+            _               => DriveKind::Unknown,
+        }
+    }
+
+    /// Returns the bus type constant from `STORAGE_DEVICE_DESCRIPTOR.BusType`.
+    /// 7 = BusTypeUsb.
+    #[cfg(windows)]
+    fn query_bus_type(drive_letter: char) -> Option<u32> {
+        use winapi::um::fileapi::CreateFileW;
+        use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+        use winapi::um::ioapiset::DeviceIoControl;
+        use winapi::shared::minwindef::{DWORD, LPVOID};
+        const OPEN_EXISTING: DWORD = 3;
+        const FILE_SHARE_READ:  DWORD = 0x0000_0001;
+        const FILE_SHARE_WRITE: DWORD = 0x0000_0002;
+        const IOCTL_STORAGE_QUERY_PROPERTY: DWORD = 0x002D_1400;
+
+        #[repr(C)]
+        struct StoragePropertyQuery {
+            property_id: u32,        // 0 = StorageDeviceProperty
+            query_type:  u32,        // 0 = PropertyStandardQuery
+            additional_parameters: [u8; 1],
+        }
+        // Only the fields we care about; layout matches Windows SDK struct.
+        #[repr(C)]
+        struct StorageDeviceDescriptor {
+            version:                  u32,
+            size:                     u32,
+            device_type:              u8,
+            device_type_modifier:     u8,
+            removable_media:          u8,
+            command_queueing:         u8,
+            vendor_id_offset:         u32,
+            product_id_offset:        u32,
+            product_revision_offset:  u32,
+            serial_number_offset:     u32,
+            bus_type:                 u32,
+        }
+
+        let path: Vec<u16> = format!("\\\\.\\{}:", drive_letter)
+            .encode_utf16().chain(std::iter::once(0)).collect();
+        let handle = unsafe {
+            CreateFileW(path.as_ptr(), 0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null_mut(),
+                OPEN_EXISTING, 0, std::ptr::null_mut())
+        };
+        if handle == INVALID_HANDLE_VALUE { return None; }
+
+        let query = StoragePropertyQuery { property_id: 0, query_type: 0, additional_parameters: [0] };
+        let mut desc: StorageDeviceDescriptor = unsafe { std::mem::zeroed() };
+        let mut bytes: DWORD = 0;
+        let ok = unsafe {
+            DeviceIoControl(handle, IOCTL_STORAGE_QUERY_PROPERTY,
+                &query as *const _ as LPVOID,
+                std::mem::size_of::<StoragePropertyQuery>() as DWORD,
+                &mut desc as *mut _ as LPVOID,
+                std::mem::size_of::<StorageDeviceDescriptor>() as DWORD,
+                &mut bytes, std::ptr::null_mut())
+        };
+        unsafe { CloseHandle(handle); }
+        if ok != 0 { Some(desc.bus_type) } else { None }
+    }
+
+    #[cfg(not(windows))]
+    fn classify_drive(_drive_letter: char) -> DriveKind { DriveKind::Unknown }
+    #[cfg(not(windows))]
+    fn query_bus_type(_: char) -> Option<u32> { None }
 
     /// Collapse the entire tree, then expand only the ancestors of `path`.
     /// This ensures unrelated drives/folders are hidden after every navigation.
@@ -2148,7 +2347,7 @@ impl eframe::App for RusplorerApp {
                         };
                         if ui
                             .add(btn)
-                            .on_hover_text(fav.to_string_lossy())
+                            .on_hover_text(Self::format_path_display(fav))
                             .clicked()
                         {
                             nav_from_panel = Some(fav.clone());
@@ -2284,9 +2483,13 @@ impl eframe::App for RusplorerApp {
                         };
 
                         let is_being_dragged = self.tab_drag_index == Some(i);
+                        let is_dnd_hover = self.dnd_active
+                            && self.dnd_tab_hover.map(|(idx, _)| idx == i).unwrap_or(false);
 
                         let fill = if is_being_dragged {
                             egui::Color32::from_rgb(80, 80, 100)
+                        } else if is_dnd_hover {
+                            egui::Color32::from_rgb(50, 110, 50) // green: drop zone active
                         } else if is_active {
                             egui::Color32::from_rgb(60, 60, 60)
                         } else {
@@ -2311,7 +2514,7 @@ impl eframe::App for RusplorerApp {
                                     egui::Label::new(
                                         egui::RichText::new(&display).color(text_color).small(),
                                     ).selectable(false),
-                                ).on_hover_text(self.tabs[i].path.to_string_lossy());
+                                ).on_hover_text(Self::format_path_display(&self.tabs[i].path));
 
                                 // Close label (only when more than 1 tab) — interaction
                                 // is handled below via the single tab_sense interact so
@@ -2401,6 +2604,9 @@ impl eframe::App for RusplorerApp {
                         }
                     }
                 }
+
+                // Persist tab rects for DnD-over-tab hit-testing (screen coordinates)
+                self.dnd_tab_rects = scroll_output.inner.inner.to_vec();
 
                 // Sync actual scroll offset (egui may have clamped it)
                 self.tab_scroll_offset = scroll_output.state.offset.x;
@@ -2562,8 +2768,61 @@ impl eframe::App for RusplorerApp {
                 for drive in &self.available_drives {
                     let current_drive = self.current_path.to_string_lossy();
                     let is_current = current_drive.starts_with(drive);
+                    let drive_display = drive.trim_end_matches(|c| c == '\\' || c == '/').to_string();
 
-                    if ui.selectable_label(is_current, drive).clicked() {
+                    let border_color = match self.drive_types.get(drive).copied().unwrap_or(DriveKind::Unknown) {
+                        DriveKind::Ssd      => egui::Color32::from_rgb(0, 130, 0),
+                        DriveKind::Hdd      => egui::Color32::from_gray(130),
+                        DriveKind::Removable => egui::Color32::from_rgb(220, 150, 170),
+                        DriveKind::Network  => egui::Color32::from_rgb(100, 160, 220),
+                        DriveKind::CdRom    => egui::Color32::from_rgb(200, 160, 80),
+                        DriveKind::Unknown  => egui::Color32::TRANSPARENT,
+                    };
+
+                    // Measure text size so we can allocate the exact bordered rect
+                    let font_id = egui::FontId::proportional(11.0);
+                    let text_size = ui.fonts(|f| {
+                        f.layout_no_wrap(drive_display.clone(), font_id.clone(), egui::Color32::WHITE).size()
+                    });
+                    let pad = egui::vec2(6.0, 3.0);
+                    let desired = text_size + pad * 2.0;
+
+                    let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
+
+                    if ui.is_rect_visible(rect) {
+                        let painter = ui.painter();
+
+                        // Background: blue if active, subtle white if hovered
+                        let bg = if is_current {
+                            egui::Color32::from_rgb(60, 120, 220)
+                        } else if resp.hovered() {
+                            egui::Color32::from_white_alpha(30)
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        };
+                        painter.rect_filled(rect, 3.0, bg);
+
+                        // Border
+                        if border_color != egui::Color32::TRANSPARENT {
+                            painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.5, border_color));
+                        }
+
+                        // Text
+                        let text_color = if is_current {
+                            egui::Color32::WHITE
+                        } else {
+                            ui.visuals().text_color()
+                        };
+                        painter.text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            &drive_display,
+                            font_id,
+                            text_color,
+                        );
+                    }
+
+                    if resp.clicked() {
                         selected_drive = Some(PathBuf::from(drive));
                     }
                 }
@@ -3384,6 +3643,32 @@ impl eframe::App for RusplorerApp {
                 let pointer_down = if self.dnd_is_right_click { right_down } else { left_down };
                 let hover_pos = ctx.input(|i| i.pointer.hover_pos());
 
+                // Hover-to-switch: auto-switch to a tab when dragging over it for ≥500 ms
+                {
+                    let hovered_tab = hover_pos.and_then(|pos| {
+                        self.dnd_tab_rects.iter().enumerate()
+                            .find_map(|(i, r)| if r.contains(pos) { Some(i) } else { None })
+                    });
+                    match hovered_tab {
+                        Some(idx) if idx != self.active_tab => {
+                            let now = std::time::Instant::now();
+                            let reset = self.dnd_tab_hover.map(|(prev, _)| prev != idx).unwrap_or(true);
+                            if reset {
+                                self.dnd_tab_hover = Some((idx, now));
+                            }
+                            if let Some((_, started)) = self.dnd_tab_hover {
+                                if started.elapsed().as_millis() >= 500 {
+                                    self.switch_to_tab(idx);
+                                    self.tab_scroll_to_active = true;
+                                    self.dnd_tab_hover = Some((idx, std::time::Instant::now()));
+                                }
+                            }
+                            ctx.request_repaint();
+                        }
+                        _ => { self.dnd_tab_hover = None; }
+                    }
+                }
+
                 // Cursor left the window while dragging → OLE drag-and-drop to Explorer / other apps
                 #[cfg(windows)]
                 {
@@ -3416,6 +3701,16 @@ impl eframe::App for RusplorerApp {
                 }
 
                 if !pointer_down && self.dnd_active {
+                    // If releasing over a tab, use that tab's folder as the drop destination
+                    let drop_tab_idx = ctx.input(|i| i.pointer.latest_pos().or(i.pointer.hover_pos()))
+                        .and_then(|pos| {
+                            self.dnd_tab_rects.iter().enumerate()
+                                .find_map(|(i, r)| if r.contains(pos) { Some(i) } else { None })
+                        });
+                    if let Some(tab_idx) = drop_tab_idx {
+                        self.dnd_drop_target = Some(self.tabs[tab_idx].path.clone());
+                    }
+
                     // Fallback: if no specific folder target, use current directory
                     let dest = self.dnd_drop_target.take()
                         .filter(|d| d.is_dir())
@@ -3440,11 +3735,17 @@ impl eframe::App for RusplorerApp {
                             let _ = Self::move_files(&sources, &dest);
                             self.selected_entries.clear();
                             self.refresh_contents();
+                            // Switch to destination tab so user sees where the files landed
+                            if let Some(tab_idx) = drop_tab_idx {
+                                self.switch_to_tab(tab_idx);
+                                self.tab_scroll_to_active = true;
+                            }
                         }
                     }
 
                     self.dnd_active = false;
                     self.dnd_is_right_click = false;
+                    self.dnd_tab_hover = None;
                     self.dnd_sources.clear();
                     self.dnd_label.clear();
                     self.dnd_start_pos = None;
@@ -3730,7 +4031,7 @@ impl eframe::App for RusplorerApp {
                             // Copy full path
                             if ui.add_sized([menu_w, 0.0], egui::Button::new("📋 Copy full path")).clicked() {
                                 if let Ok(mut clipboard) = Clipboard::new() {
-                                    let _ = clipboard.set_text(full_path.to_string_lossy().to_string());
+                                    let _ = clipboard.set_text(full_path.to_string_lossy().replace("\\", "/"));
                                 }
                                 self.show_context_menu = false;
                                 self.context_menu_tree_highlight = None;

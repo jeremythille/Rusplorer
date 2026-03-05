@@ -30,7 +30,7 @@ pub fn render_tree_node(
     let display_name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.to_string_lossy().to_string());
+        .unwrap_or_else(|| path.to_string_lossy().trim_end_matches(|c| c == '\\' || c == '/').to_string());
 
     let indent = depth as f32 * 10.0;
     let max_w = ui.available_width();
@@ -141,7 +141,10 @@ pub fn render_tree_node(
     let was_secondary_clicked = response.inner.secondary_clicked();
     if response
         .inner
-        .on_hover_text(path.to_string_lossy())
+        .on_hover_text({
+            let s = path.to_string_lossy().replace("\\", "/");
+            s.trim_end_matches('/').to_string()
+        })
         .clicked()
     {
         // Toggle expand / collapse
