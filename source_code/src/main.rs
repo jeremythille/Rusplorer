@@ -452,6 +452,12 @@ struct RusplorerApp {
     /// Detailed info cached for the Drives overview page.
     drives_info: Vec<DriveInfo>,
     show_drives_page: bool,
+    /// Set while asynchronously waiting for a slow drive (HDD/USB/Network) to spin up.
+    /// Holds the target path being navigated to.
+    loading_path: Option<PathBuf>,
+    /// Receives a signal from the background spin-up probe thread.
+    /// `true`  = path is accessible and ready; `false` = path not accessible.
+    dir_load_receiver: Option<std::sync::mpsc::Receiver<bool>>,
 }
 
 #[derive(Clone)]
@@ -693,6 +699,8 @@ impl RusplorerApp {
             drive_types: HashMap::new(),
             drives_info: Vec::new(),
             show_drives_page: false,
+            loading_path: None,
+            dir_load_receiver: None,
         };
 
         // Initialise tabs — from session if provided, then config, then single default
@@ -1266,55 +1274,77 @@ impl RusplorerApp {
         });
     }
 
+    /// Returns true when `path` lives on a drive kind that may need to spin up
+    /// (HDD, removable USB/SD, or Network) and would therefore block the UI.
+    fn is_slow_drive(&self, path: &std::path::Path) -> bool {
+        // Extract the drive root component (e.g. "C:\\").
+        let root = path.components().next().map(|c| {
+            let mut s = c.as_os_str().to_string_lossy().to_string();
+            if !s.ends_with('\\') { s.push('\\'); }
+            s
+        });
+        if let Some(root) = root {
+            matches!(
+                self.drive_types.get(&root).copied().unwrap_or(DriveKind::Unknown),
+                DriveKind::Hdd | DriveKind::Removable | DriveKind::Network
+            )
+        } else {
+            false
+        }
+    }
+
     fn navigate_to(&mut self, path: PathBuf) {
-        if path.exists() && path.is_dir() {
-            // Only add to history if it's different from current path
-            if path != self.current_path {
-                self.back_history.push(self.current_path.clone());
-                self.forward_history.clear(); // Clear forward history on new navigation
-            }
-            self.current_path = path;
+        if path != self.current_path {
+            self.back_history.push(self.current_path.clone());
+            self.forward_history.clear();
+        }
+        self.commit_navigation(path);
+    }
 
-            // Save the current path to config
-            self.config.last_path = self.current_path.to_string_lossy().to_string();
-            self.config.show_date_columns = self
-                .show_date_columns
-                .iter()
-                .map(|(k, v)| (k.to_string_lossy().to_string(), *v))
-                .collect();
-            self.config.save();
+    /// Shared "point the UI at `path` and load it, respecting spin-up for slow drives".
+    /// History manipulation is handled by the *callers*; this only does the load.
+    fn commit_navigation(&mut self, path: PathBuf) {
+        self.current_path = path.clone();
+        self.config.last_path = self.current_path.to_string_lossy().to_string();
+        self.config.show_date_columns = self
+            .show_date_columns
+            .iter()
+            .map(|(k, v)| (k.to_string_lossy().to_string(), *v))
+            .collect();
+        self.config.save();
+        let path_snap = self.current_path.clone();
+        self.expand_tree_to(&path_snap);
+        self.save_active_tab();
 
+        if self.is_slow_drive(&path) {
+            self.contents.clear();
+            self.cancel_token.store(true, Ordering::SeqCst);
+            self.loading_path = Some(path.clone());
+            let (tx, rx) = std::sync::mpsc::channel::<bool>();
+            self.dir_load_receiver = Some(rx);
+            std::thread::spawn(move || {
+                let ok = path.exists() && path.is_dir();
+                let _ = tx.send(ok);
+            });
+        } else {
+            self.loading_path = None;
+            self.dir_load_receiver = None;
             self.refresh_contents();
-            // Restart watcher for the new directory
             self.start_file_watcher();
-
-            // Collapse everything unrelated, expand only ancestors of new path
-            let path_snap = self.current_path.clone();
-            self.expand_tree_to(&path_snap);
-
-            self.save_active_tab();
         }
     }
 
     fn go_back(&mut self) {
         if let Some(previous) = self.back_history.pop() {
             self.forward_history.push(self.current_path.clone());
-            self.current_path = previous;
-            let path_snap = self.current_path.clone();
-            self.expand_tree_to(&path_snap);
-            self.refresh_contents();
-            self.save_active_tab();
+            self.commit_navigation(previous);
         }
     }
 
     fn go_forward(&mut self) {
         if let Some(next) = self.forward_history.pop() {
             self.back_history.push(self.current_path.clone());
-            self.current_path = next;
-            let path_snap = self.current_path.clone();
-            self.expand_tree_to(&path_snap);
-            self.refresh_contents();
-            self.save_active_tab();
+            self.commit_navigation(next);
         }
     }
 
@@ -1973,6 +2003,29 @@ impl eframe::App for RusplorerApp {
             while let Ok(path) = rx.try_recv() {
                 self.dirs_done.insert(path);
             }
+        }
+
+        // Poll the spin-up probe for slow (HDD/USB/Network) drives.
+        // The background thread unblocks as soon as the drive is accessible.
+        let spin_done = if let Some(ref rx) = self.dir_load_receiver {
+            rx.try_recv().ok()
+        } else {
+            None
+        };
+        if let Some(accessible) = spin_done {
+            self.loading_path = None;
+            self.dir_load_receiver = None;
+            if accessible {
+                // Drive is now spinning — read_dir will be fast.
+                self.refresh_contents();
+                self.start_file_watcher();
+            }
+            // If not accessible (e.g. drive removed), leave the empty listing.
+            ctx.request_repaint();
+        }
+        // Keep repainting while we are waiting so the spinner animates.
+        if self.loading_path.is_some() {
+            ctx.request_repaint();
         }
 
         // Re-sort when sizes arrive and we're sorting by size
@@ -3088,6 +3141,39 @@ impl eframe::App for RusplorerApp {
             }
 
             ui.separator();
+
+            // ── Spin-up indicator ────────────────────────────────────────────────
+            // When we navigated to a slow (HDD / USB / Network) drive that was idle,
+            // the content is loaded in a background thread.  While we wait, show a
+            // friendly message instead of a frozen / blank window.
+            if self.loading_path.is_some() {
+                let t = ctx.input(|i| i.time);
+                // Simple 8-frame braille spinner that cycles at ~4 fps
+                let spinners = ["⣾","⣽","⣻","⢿","⡿","⣟","⣯","⣷"];
+                let frame = ((t * 8.0) as usize) % spinners.len();
+                let spinner = spinners[frame];
+                ui.add_space(50.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{} Spinning up…", spinner))
+                            .color(egui::Color32::from_gray(210))
+                            .size(15.0),
+                    );
+                    ui.add_space(6.0);
+                    let drive = self.current_path.components().next()
+                        .map(|c| {
+                            let s = c.as_os_str().to_string_lossy().to_string();
+                            s.trim_end_matches(['\\', '/']).to_string()
+                        })
+                        .unwrap_or_default();
+                    ui.label(
+                        egui::RichText::new(format!("Waiting for {}  to respond…", drive))
+                            .color(egui::Color32::from_gray(130))
+                            .size(11.0),
+                    );
+                });
+                return; // skip table rendering until entries are ready
+            }
 
             // Table with proper column alignment
             let show_dates = self
@@ -4635,7 +4721,8 @@ impl eframe::App for RusplorerApp {
         // to poll, so the app uses 0% CPU when idle.
         let has_bg_work = self.size_receiver.is_some()
             || self.archive_done_receiver.is_some()
-            || self.extract_done_receiver.is_some();
+            || self.extract_done_receiver.is_some()
+            || self.dir_load_receiver.is_some();
         if has_bg_work {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
