@@ -3877,6 +3877,25 @@ impl eframe::App for RusplorerApp {
                         self.dnd_suppress = true;
                         // Blocking OLE drag — pumps Windows messages until drop/cancel
                         let was_move = ole_drag_files_out(&sources, is_right);
+                        // DoDragDrop is blocking; the user released the mouse button inside the
+                        // drop-target window (e.g. Chrome), so WM_LBUTTONUP was sent there and
+                        // winit/egui never received it.  egui therefore believes the button is
+                        // still held, which triggers a phantom drag on the very next frame
+                        // (dnd_suppress clears because GetAsyncKeyState sees the hardware state,
+                        // but egui's primary_down remains true → drag-detection fires immediately
+                        // on whatever entry the cursor happens to be over, then move_files() runs
+                        // permanently deleting the file). Fix: post a synthetic button-up to our
+                        // own message queue so winit processes it and clears primary_down before
+                        // the next update() frame runs the drag-detection code.
+                        if let Some(hwnd) = crate::ole::find_own_hwnd() {
+                            use winapi::um::winuser::{PostMessageW, WM_LBUTTONUP, WM_RBUTTONUP};
+                            let msg = if is_right { WM_RBUTTONUP } else { WM_LBUTTONUP };
+                            unsafe { PostMessageW(hwnd, msg, 0, 0); }
+                        }
+                        // Belt-and-suspenders: re-clear drag tracking fields that may have been
+                        // populated by the Windows message-pump inside DoDragDrop.
+                        self.dnd_start_pos = None;
+                        self.dnd_drag_entry = None;
                         if was_move {
                             self.selected_entries.clear();
                         }
@@ -4583,16 +4602,8 @@ impl eframe::App for RusplorerApp {
             }
         }
 
-        // Extract dialog
+        // Extraction status strip — shown at bottom while running, disappears when done
         if self.show_extract_dialog {
-            // Draw semi-transparent backdrop
-            let screen_rect = ctx.screen_rect();
-            let painter = ctx.layer_painter(egui::LayerId::new(
-                egui::Order::PanelResizeLine,
-                egui::Id::new("extract_backdrop"),
-            ));
-            painter.rect_filled(screen_rect, 0.0, egui::Color32::from_black_alpha(128));
-
             let archive_name = self
                 .extract_archive_path
                 .file_name()
@@ -4600,13 +4611,22 @@ impl eframe::App for RusplorerApp {
                 .to_string_lossy()
                 .to_string();
 
-            egui::Window::new("Extracting...")
+            egui::Window::new("##extract_strip")
+                .title_bar(false)
                 .collapsible(false)
                 .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -8.0))
+                .frame(egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(40, 80, 140))
+                    .inner_margin(egui::Margin::symmetric(16.0, 6.0))
+                    .rounding(egui::Rounding::same(6.0)))
                 .show(ctx, |ui| {
-                    ui.label(format!("Extracting: {}", archive_name));
-                    ui.label("Please wait...");
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(egui::RichText::new(
+                            format!("Extracting {}…", archive_name))
+                            .color(egui::Color32::WHITE).size(12.0));
+                    });
                 });
         }
 
