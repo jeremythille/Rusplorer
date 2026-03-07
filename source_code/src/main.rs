@@ -356,6 +356,10 @@ struct RusplorerApp {
     context_menu_selection: Vec<PathBuf>,
     show_rename_dialog: bool,
     rename_buffer: String,
+    /// The file extension (e.g. ".txt") stored separately while renaming.
+    rename_ext: String,
+    /// Whether the extension is shown in the rename text field.
+    rename_show_ext: bool,
     // New folder / new file dialogs (triggered from background right-click menu)
     show_new_item_dialog: bool,
     new_item_is_dir: bool,
@@ -623,6 +627,8 @@ impl RusplorerApp {
             context_menu_selection: Vec::new(),
             show_rename_dialog: false,
             rename_buffer: String::new(),
+            rename_ext: String::new(),
+            rename_show_ext: false,
             show_new_item_dialog: false,
             new_item_is_dir: false,
             new_item_name_buffer: String::new(),
@@ -2334,7 +2340,15 @@ impl eframe::App for RusplorerApp {
             if self.selected_entries.len() == 1 {
                 let name = self.selected_entries.iter().next().unwrap().clone();
                 if let Some(entry) = self.contents.iter().find(|e| e.name == name) {
-                    self.rename_buffer = entry.name.clone();
+                    self.rename_ext = std::path::Path::new(&entry.name)
+                        .extension()
+                        .map(|e| format!(".{}", e.to_string_lossy()))
+                        .unwrap_or_default();
+                    self.rename_buffer = std::path::Path::new(&entry.name)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| entry.name.clone());
+                    self.rename_show_ext = false;
                     self.context_menu_entry = Some(entry.clone());
                     self.context_menu_tree_path = None;
                     self.show_rename_dialog = true;
@@ -4330,7 +4344,15 @@ impl eframe::App for RusplorerApp {
                             if !entry.name.starts_with("[..]")
                                 && ui.add_sized([menu_w, 0.0], egui::Button::new("Rename")).clicked()
                             {
-                                self.rename_buffer = entry.name.clone();
+                                self.rename_ext = std::path::Path::new(&entry.name)
+                                    .extension()
+                                    .map(|e| format!(".{}", e.to_string_lossy()))
+                                    .unwrap_or_default();
+                                self.rename_buffer = std::path::Path::new(&entry.name)
+                                    .file_stem()
+                                    .map(|s| s.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| entry.name.clone());
+                                self.rename_show_ext = false;
                                 self.show_rename_dialog = true;
                                 self.show_context_menu = false;
                                 self.context_menu_tree_highlight = None;
@@ -4655,36 +4677,81 @@ impl eframe::App for RusplorerApp {
         if self.show_rename_dialog {
             if let Some(entry) = self.context_menu_entry.clone() {
                 let entry_name = entry.name.clone();
+                let has_ext = !self.rename_ext.is_empty();
+                let mut close_dialog = false;
+                let mut do_rename = false;
                 egui::Window::new("Rename")
                     .collapsible(false)
                     .resizable(false)
+                    .min_width(280.0)
                     .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                     .show(ctx, |ui| {
-                        ui.label("New name:");
-                        let response = ui.text_edit_singleline(&mut self.rename_buffer);
+                        // ESC closes without renaming
+                        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            close_dialog = true;
+                        }
+
+                        // Label shows current full name as hint
+                        ui.label(format!("Renaming: {}", &entry_name));
+                        ui.add_space(4.0);
+
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut self.rename_buffer)
+                                .desired_width(f32::INFINITY)
+                        );
                         response.request_focus();
 
-                        let enter_confirmed = response.lost_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        // Extension toggle (only shown for files that have an extension)
+                        if has_ext {
+                            let prev = self.rename_show_ext;
+                            ui.checkbox(&mut self.rename_show_ext,
+                                format!("Show extension ({})", self.rename_ext));
+                            if self.rename_show_ext != prev {
+                                if self.rename_show_ext {
+                                    // unchecked → checked: append stored extension
+                                    let ext = self.rename_ext.clone();
+                                    self.rename_buffer.push_str(&ext);
+                                } else {
+                                    // checked → unchecked: strip stored extension from end
+                                    let ext = self.rename_ext.clone();
+                                    if !ext.is_empty() && self.rename_buffer.ends_with(&ext) {
+                                        let new_len = self.rename_buffer.len() - ext.len();
+                                        self.rename_buffer.truncate(new_len);
+                                    }
+                                }
+                            }
+                        }
 
-                        let mut do_rename = enter_confirmed;
+                        ui.add_space(4.0);
                         ui.horizontal(|ui| {
-                            if ui.button("OK").clicked() {
+                            if ui.button("OK").clicked()
+                                || ui.input(|i| i.key_pressed(egui::Key::Enter))
+                            {
                                 do_rename = true;
                             }
                             if ui.button("Cancel").clicked() {
-                                self.show_rename_dialog = false;
+                                close_dialog = true;
                             }
                         });
-
-                        if do_rename {
-                            let old_path = self.current_path.join(&entry_name);
-                            let new_path = self.current_path.join(&self.rename_buffer);
-                            let _ = std::fs::rename(&old_path, &new_path);
-                            self.show_rename_dialog = false;
-                            self.refresh_contents();
-                        }
                     });
+
+                if do_rename {
+                    let stem = self.rename_buffer.trim().to_string();
+                    if !stem.is_empty() {
+                        let final_name = if self.rename_show_ext || !has_ext {
+                            stem
+                        } else {
+                            format!("{}{}", stem, self.rename_ext)
+                        };
+                        let old_path = self.current_path.join(&entry_name);
+                        let new_path = self.current_path.join(&final_name);
+                        let _ = std::fs::rename(&old_path, &new_path);
+                        self.refresh_contents();
+                    }
+                    self.show_rename_dialog = false;
+                } else if close_dialog {
+                    self.show_rename_dialog = false;
+                }
             }
         }
 
