@@ -33,7 +33,8 @@ mod tree;
 #[cfg(windows)]
 use clipboard::{copy_files_to_clipboard, read_clipboard_drop_effect_is_cut, read_files_from_clipboard};
 #[cfg(windows)]
-use fs_ops::{calculate_dir_size_progressive, copy_dir_recursive, read_dir_children};
+use fs_ops::{calculate_dir_size_progressive, read_dir_children};
+use fs_ops::{CopyJobState, ConflictChoice, ConflictInfo, spawn_copy_job};
 #[cfg(windows)]
 use ole::{find_own_hwnd, ole_drag_files_out, register_ole_drop_target, try_move_to_rusplorer_desktop};
 #[cfg(windows)]
@@ -159,7 +160,7 @@ fn launch(
         .as_ref()
         .and_then(|s| s.window_size)
         .map(|[w, h]| egui::vec2(w, h))
-        .or(Some(egui::vec2(660.0, 600.0)));
+        .or(Some(egui::vec2(700.0, 600.0)));
     options.viewport.position = session
         .as_ref()
         .and_then(|s| s.window_pos)
@@ -238,6 +239,8 @@ enum SortColumn {
 struct Config {
     last_path: String,
     show_date_columns: HashMap<String, bool>,
+    #[serde(default)]
+    thumb_view: HashMap<String, bool>,
     #[serde(default = "default_sort_column")]
     sort_column: SortColumn,
     #[serde(default = "default_sort_ascending")]
@@ -278,6 +281,7 @@ impl Config {
         Config {
             last_path: "C:\\".to_string(),
             show_date_columns: HashMap::new(),
+            thumb_view: HashMap::new(),
             sort_column: SortColumn::Name,
             sort_ascending: true,
             favorites: Vec::new(),
@@ -393,6 +397,7 @@ struct RusplorerApp {
     is_dragging_selection: bool,
     selection_before_drag: HashSet<String>,
     any_button_hovered: bool,
+    filter_edit_rect: egui::Rect,    // rect of the filter TextEdit — excluded from rubber-band
     // Internal drag-and-drop
     dnd_active: bool,
     dnd_sources: Vec<PathBuf>,
@@ -402,7 +407,7 @@ struct RusplorerApp {
     dnd_drop_target: Option<PathBuf>,
     dnd_drop_target_prev: Option<PathBuf>, // previous frame's value, used for color display
     dnd_is_right_click: bool,
-    dnd_suppress: bool, // suppress new drag detection until all buttons are released
+    dnd_suppress: u8, // frame counter: suppresses new drag/context-menu detection while > 0
     // Pending right-click drop menu: (sources, destination, screen position)
     dnd_right_drop_menu: Option<(Vec<PathBuf>, PathBuf, egui::Pos2)>,
     dirs_done: HashSet<PathBuf>,
@@ -462,6 +467,20 @@ struct RusplorerApp {
     /// Receives a signal from the background spin-up probe thread.
     /// `true`  = path is accessible and ready; `false` = path not accessible.
     dir_load_receiver: Option<std::sync::mpsc::Receiver<bool>>,
+    /// Timestamp of the last drive-list refresh (for hotplug detection).
+    last_drive_check: std::time::Instant,
+    /// Per-folder thumbnail view toggle.
+    thumb_view: HashMap<PathBuf, bool>,
+    /// Cached egui textures for image thumbnails.
+    thumb_cache: HashMap<PathBuf, egui::TextureHandle>,
+    /// Paths currently being loaded in the background (prevents duplicate spawns).
+    thumb_loading: HashSet<PathBuf>,
+    /// Send half of the thumbnail loader channel, cloned into each loader thread.
+    thumb_loader_tx: std::sync::mpsc::Sender<(PathBuf, egui::ColorImage)>,
+    /// Receive half of the thumbnail loader channel.
+    thumb_loader_rx: std::sync::mpsc::Receiver<(PathBuf, egui::ColorImage)>,
+    /// Active background copy/move jobs.
+    copy_jobs: Vec<Arc<CopyJobState>>,
 }
 
 #[derive(Clone)]
@@ -581,9 +600,15 @@ impl RusplorerApp {
             .iter()
             .map(|(k, v)| (PathBuf::from(k), *v))
             .collect();
+        let thumb_view: HashMap<PathBuf, bool> = config
+            .thumb_view
+            .iter()
+            .map(|(k, v)| (PathBuf::from(k), *v))
+            .collect();
         let sort_column = config.sort_column.clone();
         let (ole_tx, ole_rx) = std::sync::mpsc::channel::<Vec<PathBuf>>();
         let (ole_rc_tx, ole_rc_rx) = std::sync::mpsc::channel::<Vec<PathBuf>>();
+        let (thumb_tx, thumb_rx) = std::sync::mpsc::channel::<(PathBuf, egui::ColorImage)>();
         let sort_ascending = config.sort_ascending;
         let mut favorites: Vec<PathBuf> = config.favorites.iter().map(PathBuf::from).collect();
         favorites.sort_by(|a, b| {
@@ -658,6 +683,7 @@ impl RusplorerApp {
             is_dragging_selection: false,
             selection_before_drag: HashSet::new(),
             any_button_hovered: false,
+            filter_edit_rect: egui::Rect::NOTHING,
             dnd_active: false,
             dnd_sources: Vec::new(),
             dnd_label: String::new(),
@@ -666,7 +692,7 @@ impl RusplorerApp {
             dnd_drop_target: None,
             dnd_drop_target_prev: None,
             dnd_is_right_click: false,
-            dnd_suppress: false,
+            dnd_suppress: 0,
             dnd_right_drop_menu: None,
             dirs_done: HashSet::new(),
             dirs_done_receiver: None,
@@ -707,6 +733,13 @@ impl RusplorerApp {
             show_drives_page: false,
             loading_path: None,
             dir_load_receiver: None,
+            last_drive_check: std::time::Instant::now(),
+            thumb_view,
+            thumb_cache: HashMap::new(),
+            thumb_loading: HashSet::new(),
+            thumb_loader_tx: thumb_tx,
+            thumb_loader_rx: thumb_rx,
+            copy_jobs: Vec::new(),
         };
 
         // Initialise tabs — from session if provided, then config, then single default
@@ -1063,18 +1096,16 @@ impl RusplorerApp {
         if self.tabs.len() <= 1 {
             return;
         }
+        let was_active = index == self.active_tab;
         self.tabs.remove(index);
         if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len() - 1;
         } else if index < self.active_tab {
             self.active_tab -= 1;
-        } else if index == self.active_tab {
-            // We removed the active tab — restore whichever tab is now at this index
-            self.active_tab = self.active_tab.min(self.tabs.len() - 1);
-            self.restore_tab(self.active_tab);
-            return;
         }
-        // No restore needed here — active tab didn't change identity
+        if was_active {
+            self.restore_tab(self.active_tab);
+        }
     }
 
     fn refresh_contents(&mut self) {
@@ -1441,6 +1472,22 @@ impl RusplorerApp {
         }
     }
 
+    /// Returns true if the file extension indicates an image that can be thumbnailed.
+    fn is_image_file(name: &str) -> bool {
+        matches!(
+            name.rsplit('.').next().map(|e| e.to_ascii_lowercase()).as_deref(),
+            Some("jpg" | "jpeg" | "png" | "bmp" | "gif" | "webp")
+        )
+    }
+
+    /// Returns true if the file extension indicates a video.
+    fn is_video_file(name: &str) -> bool {
+        matches!(
+            name.rsplit('.').next().map(|e| e.to_ascii_lowercase()).as_deref(),
+            Some("mp4" | "avi" | "mkv" | "mov" | "wmv" | "flv" | "webm" | "m4v")
+        )
+    }
+
     fn format_file_size(bytes: u64) -> String {
         const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
         let mut size = bytes as f64;
@@ -1489,9 +1536,135 @@ impl RusplorerApp {
         format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, d, hour, minute)
     }
 
+    /// Returns a color for a file extension group, adapted to light vs dark mode.
+    /// Returns `None` for unknown / unclassified extensions (use default text color).
+    fn ext_color(ext_lower: &str, dark_mode: bool) -> Option<egui::Color32> {
+        // Color pairs: (dark-mode, light-mode)
+        macro_rules! col {
+            ($rd:expr,$gd:expr,$bd:expr, $rl:expr,$gl:expr,$bl:expr) => {
+                if dark_mode {
+                    egui::Color32::from_rgb($rd, $gd, $bd)
+                } else {
+                    egui::Color32::from_rgb($rl, $gl, $bl)
+                }
+            };
+        }
+        match ext_lower {
+            // ── Executables & scripts ──────────────────────────────────────────
+            ".exe" | ".msi" | ".com" | ".appx" | ".msix" =>
+                Some(col!(100, 160, 255,  30,  80, 200)),   // blue
+            ".bat" | ".cmd" | ".ps1" | ".psm1" | ".psd1" | ".vbs" | ".wsf" | ".sh" =>
+                Some(col!(130, 180, 255,  50, 100, 200)),   // softer blue
+            // ── Libraries & system ────────────────────────────────────────────
+            ".dll" | ".sys" | ".ocx" | ".drv" | ".ax" =>
+                Some(col!(160, 210, 255,  60, 130, 210)),   // light blue
+            // ── Videos ───────────────────────────────────────────────────────
+            ".mp4" | ".mkv" | ".avi" | ".mov" | ".wmv" | ".flv"
+            | ".webm" | ".m4v" | ".m2ts" | ".vob" | ".mpg" | ".mpeg" | ".f4v" | ".3gp" =>
+                Some(col!( 80, 200,  90,  20, 130,  40)),   // green
+            // ── Audio ────────────────────────────────────────────────────────
+            ".mp3" | ".wav" | ".flac" | ".aac" | ".ogg" | ".wma" | ".m4a"
+            | ".opus" | ".aiff" | ".ape" =>
+                Some(col!( 50, 200, 200,   0, 130, 140)),   // teal / cyan
+            // ── Images ───────────────────────────────────────────────────────
+            ".jpg" | ".jpeg" | ".png" | ".bmp" | ".gif" | ".webp"
+            | ".svg" | ".ico" | ".tiff" | ".tif" | ".heic" | ".avif" | ".raw"
+            | ".cr2" | ".nef" | ".arw" =>
+                Some(col!(255, 165,  50,  190,  90,   0)),  // amber / orange
+            // ── Archives ─────────────────────────────────────────────────────
+            ".zip" | ".7z" | ".rar" | ".tar" | ".gz" | ".bz2" | ".xz"
+            | ".zst" | ".cab" | ".iso" | ".img" | ".dmg" | ".tgz" | ".lz4" =>
+                Some(col!(200, 100, 230,  130,  30, 170)),  // purple
+            // ── Documents ────────────────────────────────────────────────────
+            ".pdf" =>
+                Some(col!(255,  90,  80,  190,  30,  20)),  // red
+            ".doc" | ".docx" | ".odt" | ".rtf" =>
+                Some(col!(130, 200, 255,  30, 100, 200)),   // Word blue
+            ".xls" | ".xlsx" | ".ods" | ".csv" =>
+                Some(col!( 80, 210, 120,  20, 140,  60)),   // Excel green
+            ".ppt" | ".pptx" | ".odp" =>
+                Some(col!(255, 140,  80,  200,  70,  10)),  // PowerPoint orange
+            ".txt" | ".md" | ".rst" | ".log" | ".nfo" =>
+                Some(col!(180, 180, 180,  100, 100, 100)),  // gray
+            // ── Code & markup ─────────────────────────────────────────────────
+            ".rs" | ".c" | ".cpp" | ".cc" | ".cxx" | ".h" | ".hpp"
+            | ".cs" | ".java" | ".go" | ".swift" | ".kt" | ".kts"
+            | ".py" | ".rb" | ".php" | ".pl" | ".lua"
+            | ".js" | ".ts" | ".jsx" | ".tsx" | ".vue" | ".svelte"
+            | ".html" | ".htm" | ".css" | ".scss" | ".sass" | ".less"
+            | ".sql" | ".r" | ".m" | ".f" | ".f90" | ".zig" | ".nim"
+            | ".dart" | ".ex" | ".exs" | ".clj" | ".cljs" | ".scala"
+            | ".elm" | ".erl" | ".hrl" | ".hs" | ".lhs" =>
+                Some(col!(255, 140,  60,  160,  70,   0)),  // code orange
+            // ── Config / data ─────────────────────────────────────────────────
+            ".json" | ".toml" | ".yaml" | ".yml" | ".xml" | ".ini"
+            | ".cfg" | ".conf" | ".env" | ".properties" | ".plist"
+            | ".reg" | ".desktop" | ".service" =>
+                Some(col!(160, 220, 160,  40, 130,  40)),   // muted green
+            // ── Fonts ─────────────────────────────────────────────────────────
+            ".ttf" | ".otf" | ".woff" | ".woff2" | ".eot" =>
+                Some(col!(230, 160, 230,  150,  40, 150)),  // magenta
+            // ── Everything else → no color override ───────────────────────────
+            _ => None,
+        }
+    }
+
+    /// Build a `LayoutJob` for a file-list entry name.
+    /// For files (non-directory), the extension is rendered in **bold** with a
+    /// type-based color; the stem uses the regular proportional font.
+    /// Directories and the parent "[..]" entry are rendered as plain text.
+    fn name_layout_job(
+        name: &str,
+        is_dir: bool,
+        color: egui::Color32,
+        italics: bool,
+        dark_mode: bool,
+    ) -> egui::text::LayoutJob {
+        const SIZE: f32 = 11.0;
+        let regular = egui::FontId::new(SIZE, egui::FontFamily::Proportional);
+        let bold    = egui::FontId::new(SIZE, egui::FontFamily::Name("Bold".into()));
+        let fmt_reg  = egui::text::TextFormat { font_id: regular.clone(), color, italics, ..Default::default() };
+
+        let mut job = egui::text::LayoutJob::default();
+
+        let is_parent = name.starts_with("[..]");
+        if is_dir || is_parent {
+            job.append(name, 0.0, fmt_reg);
+        } else {
+            // Find the last dot that is not at position 0 (hidden-file "." prefix)
+            let dot_pos = name.rfind('.').filter(|&p| p > 0);
+            match dot_pos {
+                Some(p) => {
+                    let ext_lower = name[p..].to_lowercase();
+                    // Use type color only when the entry is not highlighted (selected/clipboard).
+                    // When it IS highlighted the background is already colored, so use
+                    // the caller-supplied color (usually WHITE) for readability.
+                    let ext_color = if color == egui::Color32::WHITE {
+                        color // highlighted — keep white for contrast
+                    } else {
+                        Self::ext_color(&ext_lower, dark_mode).unwrap_or(color)
+                    };
+                    let fmt_stem = egui::text::TextFormat { font_id: regular.clone(), color: ext_color, italics, ..Default::default() };
+                    let fmt_bold = egui::text::TextFormat { font_id: bold, color: ext_color, italics, ..Default::default() };
+                    job.append(&name[..p], 0.0, fmt_stem);
+                    job.append(&name[p..], 0.0, fmt_bold);
+                }
+                None => {
+                    job.append(name, 0.0, fmt_reg);
+                }
+            }
+        }
+        job
+    }
+
     /// Returns a background color for the date column based on how old the file is.
+    /// Violet = timestamp is in the future (invalid/dashcam clock drift).
     /// Light green (very recent) → darker green → light orange → orange (>1 week).
     fn age_color(modified: SystemTime, now: SystemTime) -> egui::Color32 {
+        // Future timestamp — device clock is wrong (e.g. dashcam with bad RTC).
+        if modified > now {
+            return egui::Color32::from_rgb(140, 80, 200);
+        }
         let age = now
             .duration_since(modified)
             .map(|d| d.as_secs_f64())
@@ -1522,64 +1695,14 @@ impl RusplorerApp {
         ORANGE
     }
 
-    fn copy_files(sources: &[PathBuf], dest: &PathBuf) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        let mut pasted_names = Vec::new();
-        for source in sources {
-            let file_name = source.file_name().unwrap();
-            let mut target = dest.join(file_name);
-
-            // If target already exists (e.g. copying to same folder), generate a unique name
-            if target.exists() {
-                let stem = target.file_stem().unwrap_or_default().to_string_lossy().to_string();
-                let ext = target.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
-                let mut n = 1u32;
-                target = dest.join(format!("{} - Copy{}", stem, ext));
-                while target.exists() {
-                    n += 1;
-                    target = dest.join(format!("{} - Copy ({}){}", stem, n, ext));
-                }
-            }
-
-            if source.is_dir() {
-                copy_dir_recursive(source, &target)?;
-            } else {
-                std::fs::copy(source, &target)?;
-            }
-            if let Some(name) = target.file_name() {
-                pasted_names.push(name.to_string_lossy().to_string());
-            }
-        }
-        Ok(pasted_names)
-    }
-
-    fn move_files(sources: &[PathBuf], dest: &PathBuf) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        let mut pasted_names = Vec::new();
-        for source in sources {
-            let file_name = source.file_name().unwrap();
-            let target = dest.join(file_name);
-            // No-op if already in place
-            if source == &target {
-                continue;
-            }
-            // rename works only within the same drive/filesystem;
-            // fall back to copy+delete for cross-device moves.
-            if std::fs::rename(source, &target).is_err() {
-                if source.is_dir() {
-                    copy_dir_recursive(source, &target)?;
-                } else {
-                    std::fs::copy(source, &target)?;
-                }
-                if source.is_dir() {
-                    std::fs::remove_dir_all(source)?;
-                } else {
-                    std::fs::remove_file(source)?;
-                }
-            }
-            if let Some(name) = target.file_name() {
-                pasted_names.push(name.to_string_lossy().to_string());
-            }
-        }
-        Ok(pasted_names)
+    /// Start an async background copy/move job.  Returns immediately.
+    /// `clear_clipboard` – set `true` for cut-paste so the clipboard is cleared on completion.
+    fn start_copy_job(&mut self, sources: Vec<PathBuf>, dest: PathBuf, is_move: bool, clear_clipboard: bool) {
+        let dest_display = dest.to_string_lossy().to_string();
+        let state = Arc::new(CopyJobState::new(is_move, dest_display));
+        state.clear_clipboard.store(clear_clipboard, Ordering::Relaxed);
+        spawn_copy_job(sources, dest, Arc::clone(&state));
+        self.copy_jobs.push(state);
     }
 }
 
@@ -1825,30 +1948,14 @@ impl eframe::App for RusplorerApp {
             self.dnd_drop_target_prev = None;
         }
 
-        // Clear suppress flag once all buttons are physically released.
-        // We must use GetAsyncKeyState (actual hardware state) instead of egui's
-        // pointer tracking, because egui never receives WM_xBUTTONUP when the
-        // release happened in another window (e.g. another Rusplorer instance).
-        if self.dnd_suppress {
-            #[cfg(windows)]
-            {
-                use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-                let lmb_down = unsafe { GetAsyncKeyState(0x01) } & (0x8000u16 as i16) != 0; // VK_LBUTTON
-                let rmb_down = unsafe { GetAsyncKeyState(0x02) } & (0x8000u16 as i16) != 0; // VK_RBUTTON
-                if !lmb_down && !rmb_down {
-                    self.dnd_suppress = false;
-                }
-            }
-            #[cfg(not(windows))]
-            {
-                let any_held = ctx.input(|i|
-                    i.pointer.primary_down()
-                        || i.pointer.button_down(egui::PointerButton::Secondary)
-                );
-                if !any_held {
-                    self.dnd_suppress = false;
-                }
-            }
+        // Decrement the suppress frame-counter.  Suppress blocks new drag
+        // detection and context-menu triggers for a short window (2 frames)
+        // after DoDragDrop returns or an in-window drop completes.  Using a
+        // simple counter avoids the old bug where a genuine *new* button press
+        // was mistaken for stale state and kept suppress alive indefinitely,
+        // causing every-other-drag to fail.
+        if self.dnd_suppress > 0 {
+            self.dnd_suppress -= 1;
         }
 
         // Move own window to "Rusplorer" virtual desktop on startup (in-process: no E_ACCESSDENIED)
@@ -1905,6 +2012,34 @@ impl eframe::App for RusplorerApp {
             }
         }
 
+        // Drain completed copy/move jobs
+        {
+            let mut need_refresh = false;
+            self.copy_jobs.retain(|job| {
+                if job.done.load(Ordering::SeqCst) {
+                    // Harvest results
+                    let names = job.pasted_names.lock().unwrap().clone();
+                    if !names.is_empty() {
+                        self.selected_entries.clear();
+                        for name in names {
+                            self.selected_entries.insert(name);
+                        }
+                    }
+                    if job.clear_clipboard.load(Ordering::Relaxed) {
+                        self.clipboard_files.clear();
+                        self.clipboard_mode = None;
+                    }
+                    need_refresh = true;
+                    false // remove from list
+                } else {
+                    true // keep
+                }
+            });
+            if need_refresh {
+                self.refresh_contents();
+            }
+        }
+
         // Process any file system changes detected by watcher
         self.process_file_changes();
 
@@ -1930,10 +2065,9 @@ impl eframe::App for RusplorerApp {
                     self.dnd_sources.clear();
                     self.dnd_start_pos = None;
                     self.dnd_drag_entry = None;
-                    self.dnd_suppress = true;
+                    self.dnd_suppress = 2;
                     let dest = self.current_path.clone();
-                    let _ = Self::move_files(&files, &dest);
-                    self.refresh_contents();
+                    self.start_copy_job(files, dest, true, false);
                     ctx.request_repaint();
                 }
             }
@@ -1954,9 +2088,29 @@ impl eframe::App for RusplorerApp {
                     self.dnd_sources.clear();
                     self.dnd_start_pos = None;
                     self.dnd_drag_entry = None;
-                    self.dnd_suppress = true;
+                    self.dnd_suppress = 2;
                     let dest = self.current_path.clone();
-                    let drop_pos = ctx.input(|i| i.pointer.hover_pos().unwrap_or(egui::pos2(300.0, 300.0)));
+                    // Use GetCursorPos+ScreenToClient for accurate drop position;
+                    // egui's hover_pos() lags by one WM_MOUSEMOVE behind the actual release.
+                    let drop_pos = {
+                        let mut pos = egui::pos2(300.0, 300.0);
+                        #[cfg(windows)]
+                        unsafe {
+                            use winapi::shared::windef::POINT;
+                            use winapi::um::winuser::{GetCursorPos, ScreenToClient};
+                            let mut pt = POINT { x: 0, y: 0 };
+                            if GetCursorPos(&mut pt) != 0 {
+                                if let Some(hwnd) = crate::ole::find_own_hwnd() {
+                                    ScreenToClient(hwnd, &mut pt);
+                                }
+                                let ppp = ctx.pixels_per_point();
+                                pos = egui::pos2(pt.x as f32 / ppp, pt.y as f32 / ppp);
+                            }
+                        }
+                        #[cfg(not(windows))]
+                        if let Some(p) = ctx.input(|i| i.pointer.hover_pos()) { pos = p; }
+                        pos
+                    };
                     self.dnd_right_drop_menu = Some((files, dest, drop_pos));
                     ctx.request_repaint();
                 }
@@ -1981,12 +2135,8 @@ impl eframe::App for RusplorerApp {
                     if !self.is_right_click_drag {
                         let files = self.dragged_files.clone();
                         let dest = self.current_path.clone();
-                        std::thread::spawn(move || {
-                            let _ = RusplorerApp::move_files(&files, &dest);
-                        });
+                        self.start_copy_job(files, dest, true, false);
                         self.dragged_files.clear();
-                        // Schedule refresh for next frame
-                        std::thread::sleep(std::time::Duration::from_millis(100));
                     }
                 }
             }
@@ -2031,6 +2181,18 @@ impl eframe::App for RusplorerApp {
         }
         // Keep repainting while we are waiting so the spinner animates.
         if self.loading_path.is_some() {
+            ctx.request_repaint();
+        }
+
+        // Drain completed thumbnail loads and register them as GPU textures.
+        while let Ok((path, color_image)) = self.thumb_loader_rx.try_recv() {
+            self.thumb_loading.remove(&path);
+            let texture = ctx.load_texture(
+                path.to_string_lossy().to_string(),
+                color_image,
+                egui::TextureOptions::default(),
+            );
+            self.thumb_cache.insert(path, texture);
             ctx.request_repaint();
         }
 
@@ -2221,27 +2383,14 @@ impl eframe::App for RusplorerApp {
                     // Use our own internal clipboard — reliable cut/copy detection
                     let files = self.clipboard_files.clone();
                     let is_cut = self.clipboard_mode == Some(ClipboardMode::Cut);
-
-                    let pasted_names = if is_cut {
-                        let names = RusplorerApp::move_files(&files, &dest).unwrap_or_default();
+                    self.start_copy_job(files, dest, is_cut, is_cut);
+                    if is_cut {
                         self.clipboard_files.clear();
                         self.clipboard_mode = None;
-                        names
-                    } else {
-                        RusplorerApp::copy_files(&files, &dest).unwrap_or_default()
-                    };
-                    self.refresh_contents();
-                    self.selected_entries.clear();
-                    for name in pasted_names {
-                        self.selected_entries.insert(name);
                     }
                 } else if !win_clipboard.is_empty() {
                     // Use Windows clipboard (files from another app)
-                    let pasted_names = if win_is_cut {
-                        RusplorerApp::move_files(&win_clipboard, &dest).unwrap_or_default()
-                    } else {
-                        RusplorerApp::copy_files(&win_clipboard, &dest).unwrap_or_default()
-                    };
+                    self.start_copy_job(win_clipboard.clone(), dest, win_is_cut, win_is_cut);
                     // Sync internal clipboard so subsequent paste in
                     // same session (if copy) re-pastes the same files.
                     self.clipboard_files = win_clipboard;
@@ -2254,11 +2403,6 @@ impl eframe::App for RusplorerApp {
                         self.clipboard_files.clear();
                         self.clipboard_mode = None;
                     }
-                    self.refresh_contents();
-                    self.selected_entries.clear();
-                    for name in pasted_names {
-                        self.selected_entries.insert(name);
-                    }
                 }
             }
             #[cfg(not(windows))]
@@ -2270,13 +2414,14 @@ impl eframe::App for RusplorerApp {
 
                         let pasted_names = match mode {
                             ClipboardMode::Copy => {
-                                RusplorerApp::copy_files(&files, &dest).unwrap_or_default()
+                                self.start_copy_job(files, dest, false, false);
+                                Vec::new()
                             }
                             ClipboardMode::Cut => {
-                                let names = RusplorerApp::move_files(&files, &dest).unwrap_or_default();
+                                self.start_copy_job(files, dest, true, true);
                                 self.clipboard_files.clear();
                                 self.clipboard_mode = None;
-                                names
+                                Vec::new()
                             }
                         };
                         self.refresh_contents();
@@ -2417,12 +2562,60 @@ impl eframe::App for RusplorerApp {
             self.left_panel_width = max_w.min(250.0).max(80.0);
         }
 
+        // Compute the toolbar's required minimum width from its actual contents:
+        //   "Drives▼" button + drive mini-buttons + "Filter:" label + 70px input + "🖼" button
+        let right_panel_min: f32 = {
+            let font11 = egui::FontId::proportional(11.0);
+            let font14 = egui::FontId::proportional(14.0);
+            let item_sp = 8.0_f32; // default egui item_spacing.x
+
+            // "Drives ▲/▼" button: text width + ~10px button padding each side
+            let drives_btn_label = if self.show_drives_page { "Drives ▲" } else { "Drives ▼" };
+            let drives_btn_w = ctx.fonts(|f| {
+                f.layout_no_wrap(drives_btn_label.to_string(), font14.clone(), egui::Color32::WHITE).size().x
+            }) + 10.0 + item_sp;
+
+            // Drive mini-buttons: custom size = text_x + pad*2 (6+6=12)
+            let drive_btns_w: f32 = self.available_drives.iter().map(|d| {
+                let label = d.trim_end_matches(|c: char| c == '\\' || c == '/').to_string();
+                let tw = ctx.fonts(|f| {
+                    f.layout_no_wrap(label, font11.clone(), egui::Color32::WHITE).size().x
+                });
+                tw + 12.0 + item_sp
+            }).sum::<f32>();
+
+            // "Filter:" label
+            let filter_label_w = ctx.fonts(|f| {
+                f.layout_no_wrap("Filter:".to_string(), font14.clone(), egui::Color32::WHITE).size().x
+            }) + item_sp;
+
+            // Filter TextEdit (fixed 70px allocation)
+            let filter_edit_w = 70.0 + item_sp;
+
+            // "🖼" selectable_label
+            let thumb_w = ctx.fonts(|f| {
+                f.layout_no_wrap("🖼".to_string(), font14.clone(), egui::Color32::WHITE).size().x
+            }) + 10.0;
+
+            // Add outer panel margins / frame padding
+            let margin = 20.0;
+
+            (drives_btn_w + drive_btns_w + filter_label_w + filter_edit_w + thumb_w + margin)
+                .max(200.0)
+        };
+
         // Capture right panel width on first frame, then resize window to fit left+right
         let inner_w = ctx.input(|i| i.viewport().inner_rect.map(|r| r.width())).unwrap_or(0.0);
         if self.right_panel_width == 0.0 && inner_w > 0.0 {
-            // Initialise: remember right panel width from the actual window and initial left panel
-            self.right_panel_width = (inner_w - self.left_panel_width - 8.0).max(200.0);
+            // Initialise: remember right panel width, enforce toolbar-based minimum.
+            self.right_panel_width = (inner_w - self.left_panel_width - 8.0).max(right_panel_min);
             self.prev_left_panel_width = self.left_panel_width;
+            // If the current window is too narrow, resize now.
+            let desired_w = self.left_panel_width + self.right_panel_width + 8.0;
+            if desired_w > inner_w + 2.0 {
+                let h = ctx.input(|i| i.viewport().inner_rect.map(|r| r.height())).unwrap_or(600.0);
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(desired_w, h)));
+            }
         } else if self.right_panel_width > 0.0 {
             let left_changed = (self.left_panel_width - self.prev_left_panel_width).abs() > 0.5;
             if left_changed {
@@ -2432,11 +2625,221 @@ impl eframe::App for RusplorerApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(desired_w, h)));
                 self.prev_left_panel_width = self.left_panel_width;
             } else {
-                // Left panel unchanged — if window width changed, user resized: update right_panel_width
+                // Left panel unchanged — if window width changed, user resized: update right_panel_width.
+                // Re-enforce the toolbar minimum in case the OS hasn't delivered our resize yet.
                 let expected_w = self.left_panel_width + self.right_panel_width + 8.0;
                 if (inner_w - expected_w).abs() > 2.0 {
-                    self.right_panel_width = (inner_w - self.left_panel_width - 8.0).max(200.0);
+                    self.right_panel_width = (inner_w - self.left_panel_width - 8.0).max(right_panel_min);
+                    let desired_w = self.left_panel_width + self.right_panel_width + 8.0;
+                    if desired_w > inner_w + 2.0 {
+                        let h = ctx.input(|i| i.viewport().inner_rect.map(|r| r.height())).unwrap_or(600.0);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(desired_w, h)));
+                    }
                 }
+            }
+        }
+
+        // ── Copy/Move progress panel ──────────────────────────────────────────
+        if !self.copy_jobs.is_empty() {
+            egui::TopBottomPanel::bottom("copy_progress_panel")
+                .resizable(false)
+                .show(ctx, |ui| {
+                    for (job_idx, job) in self.copy_jobs.iter().enumerate() {
+                        let is_move = job.is_move;
+                        let op = if is_move { "Moving" } else { "Copying" };
+                        let files_done = job.files_done.load(Ordering::Relaxed);
+                        let files_total = job.files_total.load(Ordering::Relaxed);
+                        let bytes_done = job.bytes_copied.load(Ordering::Relaxed);
+                        let bytes_total = job.total_bytes.load(Ordering::Relaxed);
+                        let current_file = job.current_file.lock().unwrap().clone();
+
+                        ui.horizontal(|ui| {
+                            // Title: "Copying 3 of 12 files to D:\..."
+                            let title = if files_total > 0 {
+                                format!(
+                                    "{} {} of {} files to {}",
+                                    op,
+                                    files_done + 1,
+                                    files_total,
+                                    job.dest_display
+                                )
+                            } else {
+                                format!("{} … scanning …", op)
+                            };
+                            ui.label(egui::RichText::new(title).small());
+
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                // Abort button
+                                if ui.small_button("✕ Abort").clicked() {
+                                    job.cancelled.store(true, Ordering::SeqCst);
+                                }
+                                // Pause / Resume
+                                let paused = job.paused.load(Ordering::Relaxed);
+                                let pause_label = if paused { "▶ Resume" } else { "⏸ Pause" };
+                                if ui.small_button(pause_label).clicked() {
+                                    job.paused.store(!paused, Ordering::SeqCst);
+                                }
+                            });
+                        });
+
+                        // Current file name
+                        if !current_file.is_empty() {
+                            ui.label(
+                                egui::RichText::new(&current_file)
+                                    .small()
+                                    .color(egui::Color32::GRAY),
+                            );
+                        }
+
+                        // Per-file + overall progress bars
+                        if bytes_total > 0 {
+                            let fraction = bytes_done as f32 / bytes_total as f32;
+                            let bar_text = format!(
+                                "{} / {}",
+                                Self::format_bytes(bytes_done),
+                                Self::format_bytes(bytes_total),
+                            );
+                            ui.add(
+                                egui::ProgressBar::new(fraction)
+                                    .text(bar_text)
+                                    .desired_width(ui.available_width()),
+                            );
+                        } else {
+                            // Indeterminate (scanning)
+                            ui.spinner();
+                        }
+
+                        // Skipped-identical notifications (non-intrusive, gray)
+                        let skipped = job.skipped_identical.lock().unwrap().clone();
+                        for name in &skipped {
+                            ui.label(
+                                egui::RichText::new(format!("Skipped identical: {}", name))
+                                    .small().color(egui::Color32::GRAY)
+                            );
+                        }
+
+                        // Error display
+                        if let Some(err) = job.error.lock().unwrap().as_ref() {
+                            ui.colored_label(egui::Color32::RED, format!("Error: {}", err));
+                        }
+
+                        if job_idx + 1 < self.copy_jobs.len() {
+                            ui.separator();
+                        }
+                    }
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                });
+        }
+
+        // ── File-conflict dialog ─────────────────────────────────────────────
+        // Check every active job for a pending conflict query; show a modal for
+        // the first one found (jobs queue so we handle them one at a time).
+        if let Some(job) = self.copy_jobs.iter().find(|j| {
+            j.conflict_query.lock().unwrap().is_some()
+        }) {
+            // Clone the info so we release the lock before building the UI.
+            let info: Option<ConflictInfo> = job.conflict_query.lock().unwrap().clone();
+            if let Some(ci) = info {
+                // Helper: rough human-readable age from SystemTime.
+                let age_str = |st: std::time::SystemTime| -> String {
+                    use std::time::UNIX_EPOCH;
+                    let now = std::time::SystemTime::now()
+                        .duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                    let file = st.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                    if file > now {
+                        return "future date".to_string();
+                    }
+                    let age = now - file;
+                    if age < 60 { format!("{}s ago", age) }
+                    else if age < 3600 { format!("{}m ago", age/60) }
+                    else if age < 86400 { format!("{}h ago", age/3600) }
+                    else { format!("{} days ago", age/86400) }
+                };
+
+                let src_info = format!(
+                    "Source:       {}{}",
+                    Self::format_bytes(ci.src_size),
+                    ci.src_modified.map(|t| format!("  ({})", age_str(t))).unwrap_or_default()
+                );
+                let dst_info = format!(
+                    "Destination:  {}{}",
+                    Self::format_bytes(ci.dst_size),
+                    ci.dst_modified.map(|t| format!("  ({})", age_str(t))).unwrap_or_default()
+                );
+
+                let op = if job.is_move { "Moving" } else { "Copying" };
+                let title = format!("{} \"{}\" — file already exists", op, ci.file_name);
+
+                // Measure button widths
+                let btn_labels = [
+                    "Overwrite this file",
+                    "Skip this file",
+                    "Overwrite all if different",
+                    "Skip all with same name",
+                    "✕  Abort",
+                ];
+                let font_id = egui::TextStyle::Button.resolve(&ctx.style());
+                let btn_w = btn_labels.iter()
+                    .map(|l| ctx.fonts(|f| f.layout_no_wrap(l.to_string(), font_id.clone(), egui::Color32::WHITE).size().x))
+                    .fold(0.0f32, f32::max) + 16.0; // 8px padding each side
+
+                let mut answer: Option<ConflictChoice> = None;
+
+                egui::Window::new("conflict_dialog")
+                    .title_bar(false)
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                    .frame(egui::Frame {
+                        fill: ctx.style().visuals.window_fill(),
+                        stroke: egui::Stroke::new(1.5, egui::Color32::from_rgb(100, 140, 220)),
+                        inner_margin: egui::Margin::same(12.0),
+                        rounding: egui::Rounding::same(6.0),
+                        ..Default::default()
+                    })
+                    .show(ctx, |ui| {
+                        ui.set_min_width(btn_w + 24.0);
+
+                        // Title bar
+                        ui.label(egui::RichText::new(&title).strong());
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+
+                        // File info
+                        ui.label(egui::RichText::new(&src_info).small().monospace());
+                        ui.label(egui::RichText::new(&dst_info).small().monospace());
+                        ui.add_space(8.0);
+
+                        ui.style_mut().spacing.button_padding = egui::vec2(8.0, 4.0);
+
+                        if ui.add_sized([btn_w, 0.0], egui::Button::new("Overwrite this file")).clicked() {
+                            answer = Some(ConflictChoice::Overwrite);
+                        }
+                        if ui.add_sized([btn_w, 0.0], egui::Button::new("Skip this file")).clicked() {
+                            answer = Some(ConflictChoice::Skip);
+                        }
+                        ui.add_space(4.0);
+                        if ui.add_sized([btn_w, 0.0], egui::Button::new("Overwrite all if different")).clicked() {
+                            answer = Some(ConflictChoice::OverwriteAll);
+                        }
+                        if ui.add_sized([btn_w, 0.0], egui::Button::new("Skip all with same name")).clicked() {
+                            answer = Some(ConflictChoice::SkipAll);
+                        }
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(2.0);
+                        if ui.add_sized([btn_w, 0.0],
+                            egui::Button::new(egui::RichText::new("✕  Abort").color(egui::Color32::from_rgb(210, 80, 80)))
+                        ).clicked() {
+                            answer = Some(ConflictChoice::Abort);
+                        }
+                    });
+
+                if let Some(choice) = answer {
+                    *job.conflict_answer.lock().unwrap() = Some(choice);
+                }
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
             }
         }
 
@@ -2956,9 +3359,36 @@ impl eframe::App for RusplorerApp {
                     }
                 }
                 ui.label("Filter:");
-                ui.allocate_ui(egui::vec2(70.0, 20.0), |ui| {
-                    ui.text_edit_singleline(&mut self.filter);
+                let filter_alloc = ui.allocate_ui(egui::vec2(70.0, 20.0), |ui| {
+                    // Red text when a filter is active
+                    if !self.filter.is_empty() {
+                        ui.visuals_mut().override_text_color = Some(egui::Color32::from_rgb(255, 80, 80));
+                    }
+                    ui.text_edit_singleline(&mut self.filter)
                 });
+                self.filter_edit_rect = filter_alloc.response.rect;
+                // Little X button to clear the filter
+                if !self.filter.is_empty() {
+                    let x_btn = ui.add(egui::Button::new(
+                        egui::RichText::new("✕").size(11.0).color(egui::Color32::from_rgb(255, 80, 80))
+                    ).frame(false));
+                    if x_btn.clicked() {
+                        self.filter.clear();
+                    }
+                }
+                // Thumbnail / list view toggle
+                let is_thumb = self.thumb_view.get(&self.current_path).copied().unwrap_or(false);
+                if ui.selectable_label(is_thumb, "🖼")
+                    .on_hover_text(if is_thumb { "Switch to list view" } else { "Switch to thumbnail view" })
+                    .clicked()
+                {
+                    let new_val = !is_thumb;
+                    self.thumb_view.insert(self.current_path.clone(), new_val);
+                    self.config.thumb_view = self.thumb_view.iter()
+                        .map(|(k, v)| (k.to_string_lossy().to_string(), *v))
+                        .collect();
+                    self.config.save();
+                }
 
 
             });
@@ -3189,13 +3619,304 @@ impl eframe::App for RusplorerApp {
                 return; // skip table rendering until entries are ready
             }
 
+            // ── Shared pre-computation (list view + thumbnail view) ───────────────
+            let is_thumb_view = self.thumb_view.get(&self.current_path).copied().unwrap_or(false);
+            let filter_lower = self.filter.to_lowercase();
+            let filtered_entries: Vec<FileEntry> = self
+                .contents
+                .iter()
+                .filter(|entry| {
+                    entry.name.starts_with("[..]")
+                        || self.filter.is_empty()
+                        || entry.name.to_lowercase().contains(&filter_lower)
+                })
+                .cloned()
+                .collect();
+            let mut entry_right_clicked = false;
+            let mut sort_changed = false;
+
+            if is_thumb_view {
+                // ── THUMBNAIL GRID ───────────────────────────────────────────────
+                const CELL_W: f32 = 128.0;
+                const CELL_H: f32 = 152.0; // 112 thumb + 8 gap + ~32 label area
+                const THUMB:  f32 = 112.0;
+                const GAP:    f32 = 6.0;
+
+                // Kick off background loading for images not yet in cache.
+                {
+                    let to_load: Vec<PathBuf> = filtered_entries.iter()
+                        .filter(|e| !e.name.starts_with("[..]") && Self::is_image_file(&e.name))
+                        .map(|e| self.current_path.join(&e.name))
+                        .filter(|p| !self.thumb_cache.contains_key(p) && !self.thumb_loading.contains(p))
+                        .collect();
+                    for p in &to_load { self.thumb_loading.insert(p.clone()); }
+                    let tx = self.thumb_loader_tx.clone();
+                    for p in to_load {
+                        let tx2 = tx.clone();
+                        std::thread::spawn(move || {
+                            if let Ok(img) = image::open(&p) {
+                                let thumb = img.thumbnail(120, 120);
+                                let rgba  = thumb.to_rgba8();
+                                let (w, h) = rgba.dimensions();
+                                let ci = egui::ColorImage::from_rgba_unmultiplied(
+                                    [w as usize, h as usize], &rgba.into_raw());
+                                let _ = tx2.send((p, ci));
+                            }
+                        });
+                    }
+                }
+
+                // DnD drop-target detection (last frame's rects).
+                if self.dnd_active {
+                    if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
+                        if let Some(found) = self.entry_rects.iter().find_map(|(name, rect)| {
+                            if rect.contains(pos) {
+                                let full = self.current_path.join(name);
+                                if full.is_dir() && !self.dnd_sources.contains(&full) { Some(full) } else { None }
+                            } else { None }
+                        }) {
+                            self.dnd_drop_target = Some(found);
+                        }
+                    }
+                }
+                self.entry_rects.clear();
+                self.any_button_hovered = false;
+
+                let thumb_entries: Vec<&FileEntry> = filtered_entries.iter()
+                    .filter(|e| !e.name.starts_with("[..]")
+                    ).collect();
+                let avail_w = ui.available_width();
+                let col_count = ((avail_w + GAP) / (CELL_W + GAP)).max(1.0) as usize;
+
+                egui::ScrollArea::vertical()
+                    .id_source("thumb_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for chunk in thumb_entries.chunks(col_count) {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = GAP;
+                                for entry in chunk {
+                                    let full_path = self.current_path.join(&entry.name);
+                                    let is_selected = self.selected_entries.contains(&entry.name);
+                                    let is_drop_target = self.dnd_active && entry.is_dir
+                                        && self.dnd_drop_target_prev.as_ref() == Some(&full_path);
+                                    let (cell_rect, resp) = ui.allocate_exact_size(
+                                        egui::vec2(CELL_W, CELL_H),
+                                        egui::Sense::click_and_drag(),
+                                    );
+                                    self.entry_rects.insert(entry.name.clone(), cell_rect);
+
+                                    if ui.is_rect_visible(cell_rect) {
+                                        let p = ui.painter();
+                                        let bg = if is_drop_target {
+                                            egui::Color32::from_rgb(80, 200, 80)
+                                        } else if is_selected {
+                                            egui::Color32::from_rgb(80, 130, 220)
+                                        } else if resp.hovered() {
+                                            egui::Color32::from_white_alpha(18)
+                                        } else {
+                                            egui::Color32::TRANSPARENT
+                                        };
+                                        if bg != egui::Color32::TRANSPARENT {
+                                            p.rect_filled(cell_rect, 6.0, bg);
+                                        }
+
+                                        let thumb_rect = egui::Rect::from_min_size(
+                                            egui::pos2(
+                                                cell_rect.min.x + (CELL_W - THUMB) / 2.0,
+                                                cell_rect.min.y + 4.0,
+                                            ),
+                                            egui::vec2(THUMB, THUMB),
+                                        );
+
+                                        if Self::is_image_file(&entry.name) {
+                                            if let Some(tex) = self.thumb_cache.get(&full_path) {
+                                                let [tw, th] = tex.size();
+                                                let draw_rect = egui::Rect::from_center_size(
+                                                    thumb_rect.center(),
+                                                    egui::vec2(tw as f32, th as f32),
+                                                );
+                                                p.image(
+                                                    tex.id(), draw_rect,
+                                                    egui::Rect::from_min_max(
+                                                        egui::pos2(0.0, 0.0),
+                                                        egui::pos2(1.0, 1.0),
+                                                    ),
+                                                    egui::Color32::WHITE,
+                                                );
+                                            } else {
+                                                // Loading placeholder
+                                                p.rect_filled(thumb_rect, 4.0, egui::Color32::from_gray(45));
+                                                let spinners = ["⣾","⣽","⣻","⢿","⡿","⣟","⣯","⣷"];
+                                                let fi = ((ctx.input(|i| i.time) * 8.0) as usize) % spinners.len();
+                                                p.text(
+                                                    thumb_rect.center(), egui::Align2::CENTER_CENTER,
+                                                    spinners[fi], egui::FontId::proportional(16.0),
+                                                    egui::Color32::from_gray(140),
+                                                );
+                                            }
+                                        } else if Self::is_video_file(&entry.name) {
+                                            p.rect_filled(thumb_rect, 4.0, egui::Color32::from_gray(35));
+                                            p.text(
+                                                thumb_rect.center(), egui::Align2::CENTER_CENTER,
+                                                "🎦", egui::FontId::proportional(36.0),
+                                                egui::Color32::from_gray(180),
+                                            );
+                                        } else if entry.is_dir {
+                                            p.text(
+                                                thumb_rect.center(), egui::Align2::CENTER_CENTER,
+                                                "📁", egui::FontId::proportional(36.0),
+                                                egui::Color32::from_rgb(255, 245, 150),
+                                            );
+                                        } else {
+                                            p.text(
+                                                thumb_rect.center(), egui::Align2::CENTER_CENTER,
+                                                "📄", egui::FontId::proportional(36.0),
+                                                egui::Color32::from_gray(200),
+                                            );
+                                        }
+
+                                        // Filename label (truncated)
+                                        let chars: Vec<char> = entry.name.chars().collect();
+                                        let name_display = if chars.len() > 16 {
+                                            format!("{}\u{2026}", chars[..15].iter().collect::<String>())
+                                        } else {
+                                            entry.name.clone()
+                                        };
+                                        p.text(
+                                            egui::pos2(cell_rect.center().x, cell_rect.min.y + THUMB + 8.0),
+                                            egui::Align2::CENTER_TOP, &name_display,
+                                            egui::FontId::proportional(11.0),
+                                            if is_selected { egui::Color32::WHITE } else { egui::Color32::from_gray(210) },
+                                        );
+                                    }
+
+                                    // Click handling
+                                    if resp.clicked() {
+                                        let is_ctrl  = ctx.input(|i| i.modifiers.ctrl);
+                                        let is_shift = ctx.input(|i| i.modifiers.shift);
+                                        if is_ctrl {
+                                            if !self.selected_entries.remove(&entry.name) {
+                                                self.selected_entries.insert(entry.name.clone());
+                                            }
+                                        } else if is_shift {
+                                            if let Some(ref anchor) = self.last_clicked_entry.clone() {
+                                                let ai = thumb_entries.iter().position(|e| e.name == *anchor);
+                                                let bi = thumb_entries.iter().position(|e| e.name == entry.name);
+                                                if let (Some(a), Some(b)) = (ai, bi) {
+                                                    self.selected_entries.clear();
+                                                    for i in a.min(b)..=a.max(b) {
+                                                        self.selected_entries.insert(thumb_entries[i].name.clone());
+                                                    }
+                                                }
+                                            } else {
+                                                self.selected_entries.clear();
+                                                self.selected_entries.insert(entry.name.clone());
+                                            }
+                                            self.last_clicked_entry = Some(entry.name.clone());
+                                        } else {
+                                            self.selected_entries.clear();
+                                            self.selected_entries.insert(entry.name.clone());
+                                            self.last_clicked_entry = Some(entry.name.clone());
+                                        }
+                                    }
+
+                                    if resp.double_clicked() {
+                                        if entry.is_dir {
+                                            self.selected_action = Some(FileAction::OpenDir(
+                                                self.current_path.join(&entry.name)));
+                                        } else {
+                                            #[cfg(windows)]
+                                            let _ = std::process::Command::new("explorer")
+                                                .arg(&full_path).spawn();
+                                        }
+                                    }
+
+                                    // Right-click context menu (skip when right-drag DnD active)
+                                    let raw_sec = !self.dnd_is_right_click
+                                        && self.dnd_suppress == 0
+                                        && ctx.input(|i| i.pointer.secondary_released())
+                                        && ctx.input(|i| i.pointer.hover_pos()
+                                            .map_or(false, |pos| cell_rect.contains(pos)));
+                                    if raw_sec {
+                                        if !self.selected_entries.contains(&entry.name) {
+                                            self.selected_entries.clear();
+                                            self.selected_entries.insert(entry.name.clone());
+                                        }
+                                        self.context_menu_selection = self.selected_entries.iter()
+                                            .map(|n| self.current_path.join(n)).collect();
+                                        self.show_context_menu = true;
+                                        self.show_bg_context_menu = false;
+                                        self.context_menu_entry = Some((*entry).clone());
+                                        self.context_menu_tree_path = None;
+                                        self.context_menu_position =
+                                            ctx.input(|i| i.pointer.hover_pos().unwrap_or_default());
+                                        entry_right_clicked = true;
+                                    }
+
+                                    // DnD drag initiation
+                                    let primary_down   = ctx.input(|i| i.pointer.primary_down());
+                                    let secondary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
+                                    let any_btn   = primary_down || secondary_down;
+                                    let cursor_over = ctx.input(|i| i.pointer.hover_pos()
+                                        .map_or(false, |pos| cell_rect.contains(pos)));
+                                    if cursor_over { self.any_button_hovered = true; }
+                                    if cursor_over && any_btn && !self.dnd_active && self.dnd_suppress == 0
+                                        && !self.is_dragging_selection && self.dnd_start_pos.is_none()
+                                        && !self.ole_drag_in_active.load(Ordering::SeqCst)
+                                    {
+                                        self.dnd_start_pos = ctx.input(|i| i.pointer.hover_pos());
+                                        self.dnd_drag_entry = Some(entry.name.clone());
+                                        self.dnd_is_right_click = secondary_down;
+                                    }
+                                    if !self.dnd_active && !any_btn {
+                                        self.dnd_start_pos = None;
+                                        self.dnd_drag_entry = None;
+                                        self.dnd_is_right_click = false;
+                                    }
+                                    if any_btn && self.dnd_drag_entry.as_deref() == Some(&entry.name)
+                                        && !self.dnd_active && !self.is_dragging_selection
+                                    {
+                                        if let (Some(start), Some(cur)) = (
+                                            self.dnd_start_pos,
+                                            ctx.input(|i| i.pointer.hover_pos()),
+                                        ) {
+                                            if start.distance(cur) > 5.0 {
+                                                if self.selected_entries.contains(&entry.name) {
+                                                    self.dnd_sources = self.selected_entries.iter()
+                                                        .map(|n| self.current_path.join(n)).collect();
+                                                } else {
+                                                    self.dnd_sources = vec![full_path.clone()];
+                                                    self.selected_entries.clear();
+                                                    self.selected_entries.insert(entry.name.clone());
+                                                }
+                                                let cnt = self.dnd_sources.len();
+                                                self.dnd_label = if cnt == 1 {
+                                                    format!("📄 {}", entry.name)
+                                                } else {
+                                                    format!("📦 {} items", cnt)
+                                                };
+                                                self.dnd_active = true;
+                                                if self.dnd_is_right_click {
+                                                    self.dnd_label = format!("{}  [Move / Copy / Shortcut]", self.dnd_label);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                            ui.add_space(GAP);
+                        }
+                    });
+
+            } else {
+            // ── TABLE (list view) ────────────────────────────────────────────────
             // Table with proper column alignment
             let show_dates = self
                 .show_date_columns
                 .get(&self.current_path)
                 .copied()
                 .unwrap_or(false);
-            let mut sort_changed = false;
 
             // Pre-compute time values once per frame (avoids per-row Windows API calls)
             let now = SystemTime::now();
@@ -3315,21 +4036,6 @@ impl eframe::App for RusplorerApp {
             }; // +20 for X button + padding
             let name_col_w = (available - size_col_w - date_col_w - 15.0).max(50.0);
 
-            // Track whether a right-click was consumed by an entry this frame
-            let mut entry_right_clicked = false;
-
-            // Pre-filter entries for the table body
-            let filter_lower = self.filter.to_lowercase();
-            let filtered_entries: Vec<FileEntry> = self
-                .contents
-                .iter()
-                .filter(|entry| {
-                    entry.name.starts_with("[..]")
-                        || self.filter.is_empty()
-                        || entry.name.to_lowercase().contains(&filter_lower)
-                })
-                .cloned()
-                .collect();
             let num_rows = filtered_entries.len();
 
             let table_builder = TableBuilder::new(ui)
@@ -3489,48 +4195,53 @@ impl eframe::App for RusplorerApp {
                         // Name column
                         row.col(|ui| {
                                 let col_width = ui.available_width();
+                                let text_color = ui.visuals().text_color();
+                                let dark_mode = ui.visuals().dark_mode;
 
                                 let button = if is_drop_target {
                                     egui::Button::new(
-                                        egui::RichText::new(&entry.name)
-                                            .color(egui::Color32::WHITE),
+                                        Self::name_layout_job(&entry.name, entry.is_dir, egui::Color32::WHITE, false, dark_mode)
                                     )
                                     .fill(egui::Color32::from_rgb(80, 200, 80))
                                     .frame(false)
                                 } else if is_selected && is_in_clipboard {
-                                      egui::Button::new(
-                                          egui::RichText::new(&entry.name)
-                                              .color(egui::Color32::WHITE)
-                                              .italics(),
-                                      )
-                                      .fill(egui::Color32::from_rgb(100, 150, 255))
-                                      .frame(false)
-                                  } else if is_selected {
-                                      egui::Button::new(
-                                          egui::RichText::new(&entry.name)
-
-
-                                            .color(egui::Color32::WHITE),
+                                    egui::Button::new(
+                                        Self::name_layout_job(&entry.name, entry.is_dir, egui::Color32::WHITE, true, dark_mode)
+                                    )
+                                    .fill(egui::Color32::from_rgb(100, 150, 255))
+                                    .frame(false)
+                                } else if is_selected {
+                                    egui::Button::new(
+                                        Self::name_layout_job(&entry.name, entry.is_dir, egui::Color32::WHITE, false, dark_mode)
                                     )
                                     .fill(egui::Color32::from_rgb(100, 150, 255))
                                     .frame(false)
                                 } else if is_in_clipboard && entry.is_dir {
-                                    egui::Button::new(egui::RichText::new(&entry.name).italics().color(egui::Color32::from_gray(20)))
-                                        .fill(egui::Color32::from_rgb(255, 245, 150))
-                                        .frame(false)
+                                    egui::Button::new(
+                                        Self::name_layout_job(&entry.name, true, egui::Color32::from_gray(20), true, dark_mode)
+                                    )
+                                    .fill(egui::Color32::from_rgb(255, 245, 150))
+                                    .frame(false)
                                 } else if is_in_clipboard {
-                                    egui::Button::new(egui::RichText::new(&entry.name).italics())
-                                        .frame(false)
+                                    egui::Button::new(
+                                        Self::name_layout_job(&entry.name, entry.is_dir, text_color, true, dark_mode)
+                                    )
+                                    .frame(false)
                                 } else if entry.name.starts_with("[..]") {
                                     egui::Button::new(&entry.name)
                                         .fill(egui::Color32::TRANSPARENT)
                                         .frame(false)
                                 } else if entry.is_dir {
-                                    egui::Button::new(egui::RichText::new(&entry.name).color(egui::Color32::from_gray(20)))
-                                        .fill(egui::Color32::from_rgb(255, 245, 150))
-                                        .frame(false)
+                                    egui::Button::new(
+                                        Self::name_layout_job(&entry.name, true, egui::Color32::from_gray(20), false, dark_mode)
+                                    )
+                                    .fill(egui::Color32::from_rgb(255, 245, 150))
+                                    .frame(false)
                                 } else {
-                                    egui::Button::new(&entry.name).frame(false)
+                                    egui::Button::new(
+                                        Self::name_layout_job(&entry.name, false, text_color, false, dark_mode)
+                                    )
+                                    .frame(false)
                                 };
 
                                 let button = button.sense(egui::Sense::click_and_drag());
@@ -3556,7 +4267,7 @@ impl eframe::App for RusplorerApp {
                                 if cursor_over
                                     && any_btn_down
                                     && !self.dnd_active
-                                    && !self.dnd_suppress
+                                    && self.dnd_suppress == 0
                                     && !self.is_dragging_selection
                                     && self.dnd_start_pos.is_none()
                                     && !entry.name.starts_with("[..]")
@@ -3665,6 +4376,7 @@ impl eframe::App for RusplorerApp {
                                 // because secondary_clicked() relies on hovered() which returns false
                                 // when a Foreground Area (bg context menu) overlaps this entry.
                                 let raw_secondary = !self.dnd_is_right_click
+                                    && self.dnd_suppress == 0
                                     && ctx.input(|i| i.pointer.secondary_released())
                                     && ctx.input(|i| {
                                         i.pointer.hover_pos()
@@ -3794,6 +4506,9 @@ impl eframe::App for RusplorerApp {
                                     };
                                     if !date_text.is_empty() {
                                         // Paint age-based background color
+                                        let is_future = entry.modified
+                                            .map(|m| m > now)
+                                            .unwrap_or(false);
                                         if let Some(modified) = entry.modified {
                                             let bg = Self::age_color(modified, now);
                                             ui.painter().rect_filled(ui.max_rect(), 0.0, bg);
@@ -3801,10 +4516,15 @@ impl eframe::App for RusplorerApp {
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
-                                                let label = if is_in_clipboard {
-                                                    egui::RichText::new(&date_text).color(egui::Color32::from_rgb(60, 60, 60)).italics()
+                                                let text_color = if is_future {
+                                                    egui::Color32::WHITE
                                                 } else {
-                                                    egui::RichText::new(&date_text).color(egui::Color32::from_rgb(60, 60, 60))
+                                                    egui::Color32::from_rgb(60, 60, 60)
+                                                };
+                                                let label = if is_in_clipboard {
+                                                    egui::RichText::new(&date_text).color(text_color).italics()
+                                                } else {
+                                                    egui::RichText::new(&date_text).color(text_color)
                                                 };
                                                 ui.label(label);
                                             },
@@ -3815,9 +4535,11 @@ impl eframe::App for RusplorerApp {
                         });
                     });
 
+            } // end else (list view)
+
             // Background right-click: open menu only when no entry was clicked
             // and no context menu was already opened this frame (e.g. from tree panel)
-            if !entry_right_clicked && !self.dnd_active && !self.show_context_menu {
+            if !entry_right_clicked && !self.dnd_active && self.dnd_suppress == 0 && !self.show_context_menu {
                 if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
                     if !self.tab_bar_rect.contains(pos)
                         && ctx.input(|i| i.pointer.secondary_released())
@@ -3838,7 +4560,9 @@ impl eframe::App for RusplorerApp {
             {            ctx.input(|i| {
                 if let Some(pointer_pos) = i.pointer.hover_pos() {
                     let in_tab_bar = self.tab_bar_rect.contains(pointer_pos);
-                    if i.pointer.primary_pressed() && !self.any_button_hovered && !in_tab_bar {
+                    if i.pointer.primary_pressed() && !self.any_button_hovered && !in_tab_bar
+                        && !self.filter_edit_rect.contains(pointer_pos)
+                    {
                         self.is_dragging_selection = true;
                         self.selection_drag_start = Some(pointer_pos);
                         self.selection_drag_current = Some(pointer_pos);
@@ -3974,18 +4698,16 @@ impl eframe::App for RusplorerApp {
                         self.dnd_drag_entry = None;
                         self.dnd_drop_target = None;
                         self.dnd_drop_target_prev = None;
-                        self.dnd_suppress = true;
+                        self.dnd_suppress = 2;
                         // Blocking OLE drag — pumps Windows messages until drop/cancel
                         let was_move = ole_drag_files_out(&sources, is_right);
                         // DoDragDrop is blocking; the user released the mouse button inside the
                         // drop-target window (e.g. Chrome), so WM_LBUTTONUP was sent there and
                         // winit/egui never received it.  egui therefore believes the button is
-                        // still held, which triggers a phantom drag on the very next frame
-                        // (dnd_suppress clears because GetAsyncKeyState sees the hardware state,
-                        // but egui's primary_down remains true → drag-detection fires immediately
-                        // on whatever entry the cursor happens to be over, then move_files() runs
-                        // permanently deleting the file). Fix: post a synthetic button-up to our
-                        // own message queue so winit processes it and clears primary_down before
+                        // still held, which would trigger a phantom drag once dnd_suppress
+                        // expires.  Fix: post a synthetic button-up to our own message queue
+                        // so winit processes it and clears primary_down before the next
+                        // update() frame runs the drag-detection code.
                         // the next update() frame runs the drag-detection code.
                         if let Some(hwnd) = crate::ole::find_own_hwnd() {
                             use winapi::um::winuser::{PostMessageW, WM_LBUTTONUP, WM_RBUTTONUP};
@@ -4004,6 +4726,15 @@ impl eframe::App for RusplorerApp {
                 }
 
                 if !pointer_down && self.dnd_active {
+                    // If the cursor is outside our window, the user intended a cross-window
+                    // drop.  OLE should have handled it; if the button-release and cursor-exit
+                    // raced on the same frame, just cancel — don't act in the source window.
+                    let cursor_inside = ctx.input(|i| {
+                        i.pointer.hover_pos()
+                            .or(i.pointer.latest_pos())
+                            .map_or(false, |pos| i.screen_rect().contains(pos))
+                    });
+
                     // If releasing over a tab, use that tab's folder as the drop destination
                     let drop_tab_idx = ctx.input(|i| i.pointer.latest_pos().or(i.pointer.hover_pos()))
                         .and_then(|pos| {
@@ -4025,7 +4756,7 @@ impl eframe::App for RusplorerApp {
                         .cloned()
                         .collect();
 
-                    if !sources.is_empty() {
+                    if !sources.is_empty() && cursor_inside {
                         if self.dnd_is_right_click {
                             // Right-click drop: open the move/copy/shortcut menu
                             // Use latest pointer position (may be over the tree panel)
@@ -4035,9 +4766,8 @@ impl eframe::App for RusplorerApp {
                             self.dnd_right_drop_menu = Some((sources, dest, drop_pos));
                         } else {
                             // Left-click drop: always move
-                            let _ = Self::move_files(&sources, &dest);
+                            self.start_copy_job(sources, dest.clone(), true, false);
                             self.selected_entries.clear();
-                            self.refresh_contents();
                             // Switch to destination tab so user sees where the files landed
                             if let Some(tab_idx) = drop_tab_idx {
                                 self.switch_to_tab(tab_idx);
@@ -4054,7 +4784,7 @@ impl eframe::App for RusplorerApp {
                     self.dnd_start_pos = None;
                     self.dnd_drag_entry = None;
                     self.dnd_drop_target = None;
-                    self.dnd_suppress = true;
+                    self.dnd_suppress = 2;
                 }
 
                 // Draw ghost label near cursor
@@ -4110,18 +4840,14 @@ impl eframe::App for RusplorerApp {
                     if ui.button("Move here").clicked() {
                         let files = self.dragged_files.clone();
                         let dest = self.current_path.clone();
-                        std::thread::spawn(move || {
-                            let _ = RusplorerApp::move_files(&files, &dest);
-                        });
+                        self.start_copy_job(files, dest, true, false);
                         self.show_drop_menu = false;
                         self.dragged_files.clear();
                     }
                     if ui.button("Copy here").clicked() {
                         let files = self.dragged_files.clone();
                         let dest = self.current_path.clone();
-                        std::thread::spawn(move || {
-                            let _ = RusplorerApp::copy_files(&files, &dest);
-                        });
+                        self.start_copy_job(files, dest, false, false);
                         self.show_drop_menu = false;
                         self.dragged_files.clear();
                     }
@@ -4190,14 +4916,12 @@ impl eframe::App for RusplorerApp {
             });
             match action {
                 Some("move") => {
-                    let _ = Self::move_files(&sources, &dest);
+                    self.start_copy_job(sources, dest, true, false);
                     self.selected_entries.clear();
-                    self.refresh_contents();
                     self.dnd_right_drop_menu = None;
                 }
                 Some("copy") => {
-                    let _ = Self::copy_files(&sources, &dest);
-                    self.refresh_contents();
+                    self.start_copy_job(sources, dest, false, false);
                     self.dnd_right_drop_menu = None;
                 }
                 #[cfg(windows)]
@@ -4241,6 +4965,12 @@ impl eframe::App for RusplorerApp {
                 ];
                 if entry.is_dir || Self::is_code_file(&full_path) {
                     labels.push("Open with VS Code");
+                }
+                let is_ps1 = full_path.extension()
+                    .map(|e| e.to_ascii_lowercase() == "ps1")
+                    .unwrap_or(false);
+                if is_ps1 {
+                    labels.push("▶ Run in PowerShell");
                 }
                 if Self::is_archive(&full_path) {
                     labels.push(extract_label.as_str());
@@ -4286,6 +5016,19 @@ impl eframe::App for RusplorerApp {
                                 let _ = std::process::Command::new("code").arg(&full_path).spawn();
                                 self.show_context_menu = false;
                                 self.context_menu_tree_path = None;
+                                self.context_menu_tree_highlight = None;
+                            }
+
+                            // Run in PowerShell (.ps1)
+                            if is_ps1
+                                && ui.add_sized([menu_w, 0.0], egui::Button::new("▶ Run in PowerShell")).clicked()
+                            {
+                                #[cfg(windows)]
+                                let _ = std::process::Command::new("powershell")
+                                    .args(["-ExecutionPolicy", "Bypass", "-File",
+                                           full_path.to_string_lossy().as_ref()])
+                                    .spawn();
+                                self.show_context_menu = false;
                                 self.context_menu_tree_highlight = None;
                             }
 
@@ -4789,9 +5532,41 @@ impl eframe::App for RusplorerApp {
         let has_bg_work = self.size_receiver.is_some()
             || self.archive_done_receiver.is_some()
             || self.extract_done_receiver.is_some()
-            || self.dir_load_receiver.is_some();
+            || self.dir_load_receiver.is_some()
+            || !self.copy_jobs.is_empty();
         if has_bg_work {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        } else {
+            // Wake up every 2 s to detect hotplugged / ejected drives.
+            ctx.request_repaint_after(std::time::Duration::from_secs(2));
+        }
+
+        // Hotplug detection: re-scan the drive list every 2 s.
+        if self.last_drive_check.elapsed() >= std::time::Duration::from_secs(2) {
+            self.last_drive_check = std::time::Instant::now();
+            let current = Self::list_drives();
+            if current != self.available_drives {
+                // Classify any drives that weren't known before.
+                for d in &current {
+                    if !self.drive_types.contains_key(d) {
+                        let letter = d.chars().next().unwrap_or('C');
+                        let kind = Self::classify_drive(letter);
+                        self.drive_types.insert(d.clone(), kind);
+                    }
+                }
+                // Drop stale entries for removed drives.
+                self.drive_types.retain(|k, _| current.contains(k));
+                self.drives_info.retain(|info| current.contains(&info.drive));
+                for d in &current {
+                    if !self.drives_info.iter().any(|info| &info.drive == d) {
+                        let letter = d.chars().next().unwrap_or('C');
+                        let kind = Self::classify_drive(letter);
+                        let (free_bytes, total_bytes) = Self::get_drive_space(d);
+                        self.drives_info.push(DriveInfo { drive: d.clone(), kind, free_bytes, total_bytes });
+                    }
+                }
+                self.available_drives = current;
+            }
         }
     }
 }

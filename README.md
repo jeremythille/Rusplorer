@@ -10,8 +10,9 @@ A lightweight, blazingly-fast file explorer written in Rust / egui for Windows.
 
 ## Disclaimer
 
-I custom-made this file explorer specifically for my needs, as I like it. That's why there are next to no options or configuration. Consequently, you may like it too, or you may not.  
-**It is not intended to be pretty, but fast as hell, minimalist, and practical.** Everything must be pretty first these days, who cares about optimization or usability! But I couldn't care less about Rusplorer being pretty. It must WORK and BE QUICK.
+The primary goal of this file explorer was to specifically fit my needs and desire. That's why there are next to no options or configuration. Consequently, you may like it too, or you may not.  
+
+**It is not intended to be pretty, but fast as hell, minimalist, and practical.** Everything must be pretty first these days! Yeah, who cares about optimization or usability, right? No. I couldn't care less about Rusplorer being pretty. It must WORK and BE QUICK.
 
 
 
@@ -26,7 +27,7 @@ I custom-made this file explorer specifically for my needs, as I like it. That's
 ## ⚡ Key Advantages
 
 ### Speed & Performance
-- **Super lightweight** - 7 MB self-contained executable, 2 MB of which are due to embedded font (Iosevka Aile)
+- **Super lightweight** - 6 MB executable + 2 MB due to embedded font (Iosevka Aile) and 2 MB for legacy graphics adapters compatibility = 9.9 MB self-contained executable
 - **All folders and file sizes** - Computed lazily and multithreaded, 0 impact on speed and reactivity
 - **Instant directory listing** - Displays folder contents immediately without waiting for file size calculations
 - **Background threading** - No UI blocking, ever smooth interaction
@@ -39,6 +40,7 @@ I custom-made this file explorer specifically for my needs, as I like it. That's
 - **Possibility to save state as .rsess files**
 
 ### User Experience
+- **No installation (portable)** - Just run rusplorer.exe; config.json file will be created on the side as you go
 - **Tabs support**
 - **Side mouse button support** - Use your mouse back/forward buttons for navigation
 - **2.5 column layout** - File names on the left, sizes aligned to the right, with optional modification date column

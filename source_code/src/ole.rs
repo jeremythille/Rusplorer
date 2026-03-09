@@ -124,6 +124,26 @@ pub fn try_move_to_rusplorer_desktop() -> bool {
     }
 }
 
+// ── Custom clipboard format for right-button drag signalling ─────────────────
+
+/// Register / retrieve the custom clipboard format used to signal a right-button
+/// OLE drag.  The returned ID is stable for the lifetime of the process (and
+/// across all processes in the same Windows session that use the same name).
+#[cfg(windows)]
+fn rusplorer_right_drag_format() -> u16 {
+    use std::sync::OnceLock;
+    static FMT: OnceLock<u16> = OnceLock::new();
+    *FMT.get_or_init(|| {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        let name: Vec<u16> = OsStr::new("RusplorerRightDrag")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe { winapi::um::winuser::RegisterClipboardFormatW(name.as_ptr()) as u16 }
+    })
+}
+
 // ── OLE drag-out ─────────────────────────────────────────────────────────────
 
 /// Initiate an OLE drag-and-drop of the given files out to other applications (e.g. Explorer).
@@ -178,10 +198,12 @@ pub fn ole_drag_files_out(files: &[PathBuf], right_button: bool) -> bool {
         }
     }
 
-    // ── IDataObject (CF_HDROP only) ──────────────────────────────────────
+    // ── IDataObject (CF_HDROP + optional right-drag marker) ─────────────
     #[implement(IDataObject)]
     struct HdropData {
         blob: Vec<u8>,
+        /// Custom clipboard format ID for right-button drag (0 = not a right drag).
+        right_drag_fmt: u16,
     }
 
     impl IDataObject_Impl for HdropData_Impl {
@@ -191,23 +213,38 @@ pub fn ole_drag_files_out(files: &[PathBuf], right_button: bool) -> bool {
         ) -> windows::core::Result<STGMEDIUM> {
             unsafe {
                 let fmt = &*pformatetcin;
-                if fmt.cfFormat != CF_HDROP_RAW {
-                    return Err(windows::core::Error::from_hresult(E_NOTIMPL));
+                if fmt.cfFormat == CF_HDROP_RAW {
+                    let hmem = GlobalAlloc(
+                        GLOBAL_ALLOC_FLAGS(0x0042), // GMEM_MOVEABLE | GMEM_ZEROINIT
+                        self.blob.len(),
+                    )?;
+                    let ptr = GlobalLock(hmem) as *mut u8;
+                    if ptr.is_null() {
+                        return Err(windows::core::Error::from_hresult(E_NOTIMPL));
+                    }
+                    std::ptr::copy_nonoverlapping(self.blob.as_ptr(), ptr, self.blob.len());
+                    let _ = GlobalUnlock(hmem);
+                    let mut medium: STGMEDIUM = std::mem::zeroed();
+                    medium.tymed = TYMED_HGLOBAL.0 as u32;
+                    medium.u.hGlobal = hmem;
+                    Ok(medium)
+                } else if self.right_drag_fmt != 0 && fmt.cfFormat == self.right_drag_fmt {
+                    // Return a tiny HGLOBAL — the drop target only tests for the
+                    // format's existence via QueryGetData, but COM may call GetData
+                    // when marshalling across processes.
+                    let hmem = GlobalAlloc(GLOBAL_ALLOC_FLAGS(0x0042), 1)?;
+                    let ptr = GlobalLock(hmem) as *mut u8;
+                    if !ptr.is_null() {
+                        *ptr = 1;
+                        let _ = GlobalUnlock(hmem);
+                    }
+                    let mut medium: STGMEDIUM = std::mem::zeroed();
+                    medium.tymed = TYMED_HGLOBAL.0 as u32;
+                    medium.u.hGlobal = hmem;
+                    Ok(medium)
+                } else {
+                    Err(windows::core::Error::from_hresult(E_NOTIMPL))
                 }
-                let hmem = GlobalAlloc(
-                    GLOBAL_ALLOC_FLAGS(0x0042), // GMEM_MOVEABLE | GMEM_ZEROINIT
-                    self.blob.len(),
-                )?;
-                let ptr = GlobalLock(hmem) as *mut u8;
-                if ptr.is_null() {
-                    return Err(windows::core::Error::from_hresult(E_NOTIMPL));
-                }
-                std::ptr::copy_nonoverlapping(self.blob.as_ptr(), ptr, self.blob.len());
-                let _ = GlobalUnlock(hmem);
-                let mut medium: STGMEDIUM = std::mem::zeroed();
-                medium.tymed = TYMED_HGLOBAL.0 as u32;
-                medium.u.hGlobal = hmem;
-                Ok(medium)
             }
         }
         fn GetDataHere(
@@ -219,7 +256,10 @@ pub fn ole_drag_files_out(files: &[PathBuf], right_button: bool) -> bool {
         }
         fn QueryGetData(&self, pformatetc: *const FORMATETC) -> HRESULT {
             unsafe {
-                if (*pformatetc).cfFormat == CF_HDROP_RAW {
+                let cf = (*pformatetc).cfFormat;
+                if cf == CF_HDROP_RAW {
+                    S_OK
+                } else if self.right_drag_fmt != 0 && cf == self.right_drag_fmt {
                     S_OK
                 } else {
                     HRESULT(0x80040064_u32 as i32) // DV_E_FORMATETC
@@ -249,14 +289,23 @@ pub fn ole_drag_files_out(files: &[PathBuf], right_button: bool) -> bool {
             if dwdirection != 1 { // DATADIR_GET
                 return Err(windows::core::Error::from_hresult(E_NOTIMPL));
             }
-            let fmt = FORMATETC {
+            let mut fmts = vec![FORMATETC {
                 cfFormat: CF_HDROP_RAW,
                 ptd: std::ptr::null_mut(),
                 dwAspect: 1, // DVASPECT_CONTENT
                 lindex: -1,
                 tymed: TYMED_HGLOBAL.0 as u32,
-            };
-            unsafe { SHCreateStdEnumFmtEtc(&[fmt]) }
+            }];
+            if self.right_drag_fmt != 0 {
+                fmts.push(FORMATETC {
+                    cfFormat: self.right_drag_fmt,
+                    ptd: std::ptr::null_mut(),
+                    dwAspect: 1,
+                    lindex: -1,
+                    tymed: TYMED_HGLOBAL.0 as u32,
+                });
+            }
+            unsafe { SHCreateStdEnumFmtEtc(&fmts) }
         }
         fn DAdvise(
             &self,
@@ -303,7 +352,8 @@ pub fn ole_drag_files_out(files: &[PathBuf], right_button: bool) -> bool {
     }
 
     // ── Perform OLE drag ─────────────────────────────────────────────────
-    let data_obj: IDataObject = HdropData { blob }.into();
+    let right_drag_fmt = if right_button { rusplorer_right_drag_format() } else { 0 };
+    let data_obj: IDataObject = HdropData { blob, right_drag_fmt }.into();
     let source: IDropSource = DropSource { button_mask: track_button }.into();
     let mut effect = DROPEFFECT_NONE;
     let hr = unsafe {
@@ -346,6 +396,8 @@ pub fn register_ole_drop_target(
         sender: std::sync::mpsc::Sender<Vec<PathBuf>>,
         right_click_sender: std::sync::mpsc::Sender<Vec<PathBuf>>,
         last_key_state: std::cell::Cell<u32>,
+        /// Set in DragEnter (button is guaranteed held) — more reliable than last_key_state for Drop.
+        is_right_drag: std::cell::Cell<bool>,
         drag_in_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
@@ -358,6 +410,22 @@ pub fn register_ole_drop_target(
             pdweffect: *mut DROPEFFECT,
         ) -> windows::core::Result<()> {
             self.last_key_state.set(grfkeystate.0);
+            // Primary detection: look for our custom "RusplorerRightDrag" format
+            // in the data object — this is reliable across processes because COM
+            // marshals QueryGetData transparently.  Falls back to grfkeystate.
+            let right_via_format = if let Some(obj) = pdataobj {
+                let fmt = FORMATETC {
+                    cfFormat: rusplorer_right_drag_format(),
+                    ptd: std::ptr::null_mut(),
+                    dwAspect: 1,
+                    lindex: -1,
+                    tymed: TYMED_HGLOBAL.0 as u32,
+                };
+                unsafe { obj.QueryGetData(&fmt) == S_OK }
+            } else {
+                false
+            };
+            self.is_right_drag.set(right_via_format || grfkeystate.0 & MK_RBUTTON != 0);
             self.drag_in_active.store(true, std::sync::atomic::Ordering::SeqCst);
             unsafe {
                 let ok = if let Some(obj) = pdataobj {
@@ -384,11 +452,17 @@ pub fn register_ole_drop_target(
             pdweffect: *mut DROPEFFECT,
         ) -> windows::core::Result<()> {
             self.last_key_state.set(grfkeystate.0);
+            // Latch: if right button is seen in ANY DragOver, remember it.
+            // DragEnter may have missed MK_RBUTTON on some timing paths.
+            if grfkeystate.0 & MK_RBUTTON != 0 {
+                self.is_right_drag.set(true);
+            }
             unsafe { *pdweffect = DROPEFFECT_COPY; }
             Ok(())
         }
 
         fn DragLeave(&self) -> windows::core::Result<()> {
+            self.is_right_drag.set(false);
             self.drag_in_active.store(false, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
@@ -436,7 +510,21 @@ pub fn register_ole_drop_target(
 
                 self.drag_in_active.store(false, std::sync::atomic::Ordering::SeqCst);
                 if !files.is_empty() {
-                    if self.last_key_state.get() & MK_RBUTTON != 0 {
+                    // Determine right-drag: latched flag (from DragEnter/DragOver) OR
+                    // custom clipboard format (reliable across processes even if
+                    // grfkeystate was lost).
+                    let right_via_format = {
+                        let fmt = FORMATETC {
+                            cfFormat: rusplorer_right_drag_format(),
+                            ptd: std::ptr::null_mut(),
+                            dwAspect: 1,
+                            lindex: -1,
+                            tymed: TYMED_HGLOBAL.0 as u32,
+                        };
+                        obj.QueryGetData(&fmt) == S_OK
+                    };
+                    let is_right = self.is_right_drag.get() || right_via_format;
+                    if is_right {
                         let _ = self.right_click_sender.send(files);
                     } else {
                         let _ = self.sender.send(files);
@@ -452,6 +540,7 @@ pub fn register_ole_drop_target(
         sender,
         right_click_sender,
         last_key_state: std::cell::Cell::new(0),
+        is_right_drag: std::cell::Cell::new(false),
         drag_in_active,
     }.into();
     unsafe {
