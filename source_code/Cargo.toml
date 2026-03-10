@@ -39,6 +39,7 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+debug = false
 # strip = "symbols" removes all symbol tables. The .pdata section (64-bit exception
 # unwinding in C++ code) is separate and unaffected on Windows.
 strip = "symbols"

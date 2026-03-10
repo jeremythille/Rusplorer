@@ -12,7 +12,7 @@ A lightweight, blazingly-fast file explorer written in Rust / egui for Windows.
 
 The primary goal of this file explorer was to specifically fit my needs and desire. That's why there are next to no options or configuration. Consequently, you may like it too, or you may not.  
 
-**It is not intended to be pretty, but fast as hell, minimalist, and practical.** Everything must be pretty first these days! Yeah, who cares about optimization or usability, right? No. I couldn't care less about Rusplorer being pretty. It must WORK and BE QUICK.
+**It is not intended to be pretty, but fast as hell, minimalist, and practical.** Everything must be pretty first these days! Yeah, who cares about optimization or usability, right? No. I couldn't care less about Rusplorer being pretty. It must WORK and be PRACTICAL and QUICK.
 
 
 
@@ -27,8 +27,8 @@ The primary goal of this file explorer was to specifically fit my needs and desi
 ## ⚡ Key Advantages
 
 ### Speed & Performance
-- **Super lightweight** - 6 MB executable + 2 MB due to embedded font (Iosevka Aile) and 2 MB for legacy graphics adapters compatibility = 9.9 MB self-contained executable
-- **All folders and file sizes** - Computed lazily and multithreaded, 0 impact on speed and reactivity
+- **Super lightweight** - 7 MB main program + 2 MB due to embedded font (Iosevka Aile) and 2 MB for legacy graphics adapters compatibility = 11 MB self-contained executable
+- **All folders and file sizes** - Computed lazily and multithreaded, 0 impact on speed and reactivity. Plus, pauses folder size calculation on focus loss
 - **Instant directory listing** - Displays folder contents immediately without waiting for file size calculations
 - **Background threading** - No UI blocking, ever smooth interaction
 - **Minimal overhead** - Built with `egui` and `eframe` for efficient rendering
@@ -56,7 +56,7 @@ There's a single executable in the root folder. Just launch rusplorer.exe, that'
 
 - ✅ Fast directory browsing
 - ✅ View all folders and file sizes (lazy-loaded)
-- ✅ Support for all Windows drives
+- ✅ Support all kinds of drives (SSD/HDD/USB/Network) with color indications
 - ✅ Back/forward navigation with history
 - ✅ Mouse button 4/5 support (side buttons)
 - ✅ Keyboard navigation (Alt+arrows)

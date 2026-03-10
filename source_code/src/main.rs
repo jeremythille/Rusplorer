@@ -4961,6 +4961,7 @@ impl eframe::App for RusplorerApp {
                     "Add to archive",
                     "📋 Copy full path",
                     "Rename",
+                    "Delete",
                     "Properties",
                 ];
                 if entry.is_dir || Self::is_code_file(&full_path) {
@@ -4986,6 +4987,8 @@ impl eframe::App for RusplorerApp {
                 let raw = self.context_menu_position;
                 let adj_x = raw.x.min(screen.max.x - ms.x).max(screen.min.x);
                 let adj_y = raw.y.min(screen.max.y - ms.y).max(screen.min.y);
+
+                let mut pending_delete: Vec<PathBuf> = Vec::new();
 
                 let area_resp = egui::Area::new(egui::Id::new("ctx_menu"))
                     .fixed_pos(egui::pos2(adj_x, adj_y))
@@ -5101,7 +5104,21 @@ impl eframe::App for RusplorerApp {
                                 self.context_menu_tree_highlight = None;
                             }
 
-                            // Properties
+                            // Delete → Recycle Bin
+                            if !entry.name.starts_with("[..]")
+                                && ui.add_sized([menu_w, 0.0],
+                                    egui::Button::new(egui::RichText::new("Delete")
+                                        .color(egui::Color32::from_rgb(220, 50, 50)))
+                                ).clicked()
+                            {
+                                pending_delete = if !self.context_menu_selection.is_empty() {
+                                    self.context_menu_selection.clone()
+                                } else {
+                                    vec![full_path.clone()]
+                                };
+                                self.show_context_menu = false;
+                                self.context_menu_tree_highlight = None;
+                            }
                             if ui.add_sized([menu_w, 0.0], egui::Button::new("Properties")).clicked() {
                                 #[cfg(windows)]
                                 {
@@ -5132,6 +5149,40 @@ impl eframe::App for RusplorerApp {
 
                 // Store actual rendered size for next-frame clamping
                 self.context_menu_size = area_resp.response.rect.size();
+
+                // Process pending delete (set inside closure; executed out here to avoid &mut self conflict)
+                if !pending_delete.is_empty() {
+                    #[cfg(windows)]
+                    {
+                        let mut path_buffer: Vec<u16> = Vec::new();
+                        for path in &pending_delete {
+                            let wide: Vec<u16> = OsStr::new(path.to_str().unwrap_or(""))
+                                .encode_wide()
+                                .chain(std::iter::once(0u16))
+                                .collect();
+                            path_buffer.extend_from_slice(&wide);
+                        }
+                        path_buffer.push(0u16);
+                        unsafe {
+                            let mut file_op = SHFILEOPSTRUCTW {
+                                hwnd: std::ptr::null_mut(),
+                                wFunc: FO_DELETE as u32,
+                                pFrom: path_buffer.as_ptr(),
+                                pTo: std::ptr::null(),
+                                fFlags: FOF_ALLOWUNDO | FOF_NOCONFIRMATION,
+                                fAnyOperationsAborted: 0,
+                                hNameMappings: std::ptr::null_mut(),
+                                lpszProgressTitle: std::ptr::null(),
+                            };
+                            let result = SHFileOperationW(&mut file_op);
+                            if result == 0 {
+                                self.last_deleted_paths = pending_delete;
+                                self.selected_entries.clear();
+                                self.refresh_contents();
+                            }
+                        }
+                    }
+                }
             }
 
             // Close context menu if clicked elsewhere
