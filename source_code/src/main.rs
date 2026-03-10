@@ -114,18 +114,10 @@ fn run_app() -> Result<(), eframe::Error> {
         concat!("Rusplorer (", env!("GIT_COMMIT_DATE"), ")")
     };
 
-    // 1. Glow (OpenGL) — fastest on machines that support it.
-    let result = launch(eframe::Renderer::Glow, None, session.clone(), window_title);
+    // 1. Try wgpu with primary backends (DX12 / Vulkan).
+    let result = launch(eframe::Renderer::Wgpu, None, session.clone(), window_title);
 
-    // 2. If OpenGL 2.0 is unavailable, try wgpu with primary backends (DX12 / Vulkan).
-    let result = match result {
-        Err(ref e) if format!("{:?}", e).to_lowercase().contains("opengl") => {
-            launch(eframe::Renderer::Wgpu, None, session.clone(), window_title)
-        }
-        other => return other,
-    };
-
-    // 3. Last resort: use the GL (ANGLE) backend.
+    // 2. Last resort: use the GL (ANGLE) backend.
     //    On Windows, ANGLE implements OpenGL ES on top of D3D11's software path,
     //    which works on AWS WorkSpaces, Hyper-V guests, and any environment where
     //    there is no GPU and DX12/Vulkan are unavailable.
@@ -1930,7 +1922,7 @@ impl RusplorerApp {
 }
 
 impl eframe::App for RusplorerApp {
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         // Flush active tab state back into the tabs vec, then persist to config.
         self.save_active_tab();
         self.config.tabs = Some(self.tabs.clone());
