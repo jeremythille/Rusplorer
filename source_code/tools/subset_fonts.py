@@ -133,4 +133,41 @@ if __name__ == "__main__":
     print("Subsetting Iosevka fonts …\n")
     subset_font("IosevkaAile-Regular.ttf", "IosevkaAile-Regular.ttf")
     subset_font("IosevkaAile-Bold.ttf",    "IosevkaAile-Bold.ttf")
+
+    print("\nSubsetting NotoEmoji (emoji used in the UI only) …\n")
+    # Emoji actually used: 🖼💾📋📁📄📦🎦⭐ — subset to just these 8 glyphs.
+    # NotoEmoji.orig.ttf must exist (copy from cargo cache or download).
+    src = os.path.join(FONTS_DIR, "NotoEmoji-Regular.orig.ttf")
+    dst = os.path.join(FONTS_DIR, "NotoEmoji-Regular.ttf")
+    if os.path.exists(src):
+        before_kb = os.path.getsize(src) / 1024
+        emoji_codepoints = (
+            "U+1F4C5,"   # 📅  calendar (show modification date)
+            "U+1F4BE,"   # 💾  floppy disk
+            "U+1F4CB,"   # 📋  clipboard
+            "U+1F3A6,"   # 🎦  cinema
+            "U+1F4C1,"   # 📁  folder
+            "U+1F4C4,"   # 📄  page
+            "U+1F4E6,"   # 📦  package
+            "U+2B50,"    # ⭐  star
+            "U+FE0F,"    # variation selector-16 (emoji presentation)
+            "U+20E3"     # combining enclosing keycap
+        )
+        cmd = [
+            sys.executable, "-m", "fontTools.subset", src,
+            f"--output-file={dst}",
+            f"--unicodes={emoji_codepoints}",
+            "--layout-features=*", "--notdef-outline", "--no-hinting",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"  ERROR: {result.stderr}")
+        else:
+            after_kb = os.path.getsize(dst) / 1024
+            pct = (1 - after_kb / before_kb) * 100
+            print(f"  {'NotoEmoji-Regular.ttf':<35}  {before_kb:7.1f} KB  →  {after_kb:7.1f} KB  (-{pct:.0f}%)")
+    else:
+        print(f"  SKIP  NotoEmoji-Regular.orig.ttf not found — copy it from:")
+        print(f"        %USERPROFILE%\\.cargo\\registry\\src\\...\\epaint-0.27.2\\fonts\\NotoEmoji-Regular.ttf")
+
     print("\nDone.")

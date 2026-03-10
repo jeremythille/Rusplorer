@@ -184,12 +184,22 @@ fn launch(
                 "IosevkaAile-Bold".to_owned(),
                 egui::FontData::from_static(include_bytes!("fonts/IosevkaAile-Bold.ttf")),
             );
-            // Replace the default proportional font with Iosevka Aile Regular
+            fonts.font_data.insert(
+                "NotoEmoji".to_owned(),
+                egui::FontData::from_static(include_bytes!("fonts/NotoEmoji-Regular.ttf")),
+            );
+            // Replace the default proportional font with Iosevka Aile Regular,
+            // with NotoEmoji as fallback for emoji glyphs not in Iosevka.
             fonts
                 .families
                 .entry(egui::FontFamily::Proportional)
                 .or_default()
                 .insert(0, "IosevkaAile-Regular".to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .push("NotoEmoji".to_owned());
             // Register Bold under a named family used in the tree
             fonts
                 .families
@@ -2555,7 +2565,7 @@ impl eframe::App for RusplorerApp {
         }
 
         // Compute the toolbar's required minimum width from its actual contents:
-        //   "Drives▼" button + drive mini-buttons + "Filter:" label + 70px input + "🖼" button
+        //   "Drives▼" button + drive mini-buttons + "Filter:" label + 70px input + "�" button
         let right_panel_min: f32 = {
             let font11 = egui::FontId::proportional(11.0);
             let font14 = egui::FontId::proportional(14.0);
@@ -2584,9 +2594,9 @@ impl eframe::App for RusplorerApp {
             // Filter TextEdit (fixed 70px allocation)
             let filter_edit_w = 70.0 + item_sp;
 
-            // "🖼" selectable_label
+            // "�" selectable_label
             let thumb_w = ctx.fonts(|f| {
-                f.layout_no_wrap("🖼".to_string(), font14.clone(), egui::Color32::WHITE).size().x
+                f.layout_no_wrap("▦".to_string(), font14.clone(), egui::Color32::WHITE).size().x
             }) + 10.0;
 
             // Add outer panel margins / frame padding
@@ -3370,7 +3380,7 @@ impl eframe::App for RusplorerApp {
                 }
                 // Thumbnail / list view toggle
                 let is_thumb = self.thumb_view.get(&self.current_path).copied().unwrap_or(false);
-                if ui.selectable_label(is_thumb, "🖼")
+                if ui.selectable_label(is_thumb, "�")
                     .on_hover_text(if is_thumb { "Switch to list view" } else { "Switch to thumbnail view" })
                     .clicked()
                 {
