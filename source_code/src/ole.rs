@@ -2,6 +2,22 @@
 
 use std::path::PathBuf;
 
+/// Write a diagnostic line to `%TEMP%\rusplorer_dnd_<pid>.log`.
+/// Each call appends one line with a timestamp.
+#[cfg(windows)]
+pub fn log_dnd(msg: &str) {
+    use std::io::Write;
+    let pid = std::process::id();
+    let path = std::env::temp_dir().join(format!("rusplorer_dnd_{pid}.log"));
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "[{:.3}] {msg}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64() % 100000.0);
+    }
+}
+
 // ── Virtual desktop helpers ──────────────────────────────────────────────────
 
 /// Parse a Windows GUID string like "{DA9C62FD-3F94-400B-87B5-A43B9EB6C70D}" into a GUID struct.
@@ -370,14 +386,17 @@ pub fn ole_drag_files_out(files: &[PathBuf], right_button: bool) -> bool {
 // ── OLE drop-target registration ─────────────────────────────────────────────
 
 /// Returns the IDropTarget COM object (must be kept alive for the duration of the session).
-/// Returns None if registration failed.
+/// Returns:
+///   `None`        — registration failed entirely (fatal, don't retry)
+///   `Some(false)` — registered but winit's target was not yet present; retry next frame
+///   `Some(true)`  — successfully revoked winit's target and installed ours
 #[cfg(windows)]
 pub fn register_ole_drop_target(
     hwnd_raw: *mut std::ffi::c_void,
     sender: std::sync::mpsc::Sender<Vec<PathBuf>>,
     right_click_sender: std::sync::mpsc::Sender<Vec<PathBuf>>,
     drag_in_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> Option<windows::Win32::System::Ole::IDropTarget> {
+) -> Option<(windows::Win32::System::Ole::IDropTarget, bool)> {
     use windows::core::implement;
     use windows::Win32::Foundation::{HWND, POINTL, S_OK};
     use windows::Win32::System::Com::{IDataObject, FORMATETC, TYMED_HGLOBAL};
@@ -410,9 +429,10 @@ pub fn register_ole_drop_target(
             pdweffect: *mut DROPEFFECT,
         ) -> windows::core::Result<()> {
             self.last_key_state.set(grfkeystate.0);
-            // Primary detection: look for our custom "RusplorerRightDrag" format
-            // in the data object — this is reliable across processes because COM
-            // marshals QueryGetData transparently.  Falls back to grfkeystate.
+            // Detect right-button drag via multiple signals:
+            // 1. Custom clipboard format (reliable across processes)
+            // 2. grfkeystate from OLE (may miss MK_RBUTTON in some cases)
+            // 3. Hardware key state (most reliable)
             let right_via_format = if let Some(obj) = pdataobj {
                 let fmt = FORMATETC {
                     cfFormat: rusplorer_right_drag_format(),
@@ -425,7 +445,14 @@ pub fn register_ole_drop_target(
             } else {
                 false
             };
-            self.is_right_drag.set(right_via_format || grfkeystate.0 & MK_RBUTTON != 0);
+            let hw_right = unsafe {
+                windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x02)
+            } & (0x8000u16 as i16) != 0;
+            let is_right = right_via_format
+                || grfkeystate.0 & MK_RBUTTON != 0
+                || hw_right;
+            self.is_right_drag.set(is_right);
+            log_dnd(&format!("DragEnter: fmt={right_via_format} keystate=0x{:04X} hw={hw_right} => is_right={is_right}", grfkeystate.0));
             self.drag_in_active.store(true, std::sync::atomic::Ordering::SeqCst);
             unsafe {
                 let ok = if let Some(obj) = pdataobj {
@@ -455,6 +482,9 @@ pub fn register_ole_drop_target(
             // Latch: if right button is seen in ANY DragOver, remember it.
             // DragEnter may have missed MK_RBUTTON on some timing paths.
             if grfkeystate.0 & MK_RBUTTON != 0 {
+                if !self.is_right_drag.get() {
+                    log_dnd(&format!("DragOver: latching is_right_drag via keystate 0x{:04X}", grfkeystate.0));
+                }
                 self.is_right_drag.set(true);
             }
             unsafe { *pdweffect = DROPEFFECT_COPY; }
@@ -462,6 +492,7 @@ pub fn register_ole_drop_target(
         }
 
         fn DragLeave(&self) -> windows::core::Result<()> {
+            log_dnd(&format!("DragLeave: was_right={}", self.is_right_drag.get()));
             self.is_right_drag.set(false);
             self.drag_in_active.store(false, std::sync::atomic::Ordering::SeqCst);
             Ok(())
@@ -510,9 +541,10 @@ pub fn register_ole_drop_target(
 
                 self.drag_in_active.store(false, std::sync::atomic::Ordering::SeqCst);
                 if !files.is_empty() {
-                    // Determine right-drag: latched flag (from DragEnter/DragOver) OR
-                    // custom clipboard format (reliable across processes even if
-                    // grfkeystate was lost).
+                    // Determine right-drag via multiple methods:
+                    // 1. Latched flag from DragEnter/DragOver (set while button held)
+                    // 2. Custom format via GetData (more reliably marshaled cross-process
+                    //    than QueryGetData)
                     let right_via_format = {
                         let fmt = FORMATETC {
                             cfFormat: rusplorer_right_drag_format(),
@@ -521,9 +553,10 @@ pub fn register_ole_drop_target(
                             lindex: -1,
                             tymed: TYMED_HGLOBAL.0 as u32,
                         };
-                        obj.QueryGetData(&fmt) == S_OK
+                        obj.GetData(&fmt).is_ok()
                     };
                     let is_right = self.is_right_drag.get() || right_via_format;
+                    log_dnd(&format!("Drop: latched={} fmt={right_via_format} => is_right={is_right}", self.is_right_drag.get()));
                     if is_right {
                         let _ = self.right_click_sender.send(files);
                     } else {
@@ -544,10 +577,22 @@ pub fn register_ole_drop_target(
         drag_in_active,
     }.into();
     unsafe {
+        // OleInitialize is called by winit (drag_and_drop=true).
+        // We revoke winit's IDropTarget and install our own.
+        // RevokeDragDrop returns an error if nothing is registered yet
+        // (winit registers slightly later than our first update frame).
+        // We return Some(false) in that case so the caller retries next frame.
         let hwnd = HWND(hwnd_raw);
-        let _ = RevokeDragDrop(hwnd);
-        if RegisterDragDrop(hwnd, &drop_target).is_ok() {
-            Some(drop_target)
+        log_dnd(&format!("Registering IDropTarget on HWND={hwnd_raw:?}"));
+        let revoked = RevokeDragDrop(hwnd).is_ok();
+        log_dnd(&format!("RevokeDragDrop ok={revoked}"));
+        let reg_hr = RegisterDragDrop(hwnd, &drop_target);
+        log_dnd(&format!(
+            "RegisterDragDrop -> {}",
+            if reg_hr.is_ok() { "OK" } else { "FAILED" }
+        ));
+        if reg_hr.is_ok() {
+            Some((drop_target, revoked))
         } else {
             None
         }

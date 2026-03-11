@@ -148,6 +148,10 @@ fn launch(
     // Disable multisampling — required on some corporate/VM environments
     // where the GPU driver does not expose MSAA sample counts.
     options.multisampling = 0;
+    // Keep winit's drag_and_drop=true so winit calls OleInitialize and OLE's
+    // internal HWND→drop-target routing is set up correctly.
+    // We replace winit's own IDropTarget a few frames later via
+    // RevokeDragDrop + RegisterDragDrop inside register_ole_drop_target.
     options.viewport.inner_size = session
         .as_ref()
         .and_then(|s| s.window_size)
@@ -339,7 +343,6 @@ struct RusplorerApp {
     show_drop_menu: bool,
     #[allow(dead_code)]
     drop_menu_position: egui::Pos2,
-    is_right_click_drag: bool,
     config: Config,
     max_file_size: u64,
     is_focused: bool,
@@ -483,6 +486,10 @@ struct RusplorerApp {
     thumb_loader_rx: std::sync::mpsc::Receiver<(PathBuf, egui::ColorImage)>,
     /// Active background copy/move jobs.
     copy_jobs: Vec<Arc<CopyJobState>>,
+    /// Which drive letters each active job touches (parallel to copy_jobs).
+    copy_job_drives: Vec<std::collections::HashSet<char>>,
+    /// Jobs waiting for a drive to become free.
+    copy_pending: std::collections::VecDeque<(Vec<PathBuf>, PathBuf, Arc<CopyJobState>)>,
 }
 
 #[derive(Clone)]
@@ -637,7 +644,6 @@ impl RusplorerApp {
             dragged_files: Vec::new(),
             show_drop_menu: false,
             drop_menu_position: egui::Pos2::ZERO,
-            is_right_click_drag: false,
             config,
             max_file_size: 0,
             is_focused: true,
@@ -742,6 +748,8 @@ impl RusplorerApp {
             thumb_loader_tx: thumb_tx,
             thumb_loader_rx: thumb_rx,
             copy_jobs: Vec::new(),
+            copy_job_drives: Vec::new(),
+            copy_pending: std::collections::VecDeque::new(),
         };
 
         // Initialise tabs — from session if provided, then config, then single default
@@ -1703,9 +1711,55 @@ impl RusplorerApp {
         let dest_display = dest.to_string_lossy().to_string();
         let state = Arc::new(CopyJobState::new(is_move, dest_display));
         state.clear_clipboard.store(clear_clipboard, Ordering::Relaxed);
-        spawn_copy_job(sources, dest, Arc::clone(&state));
-        self.copy_jobs.push(state);
+        let new_drives = drives_of(&sources, &dest);
+        // Queue if any running job touches the same drive(s) to avoid thrashing.
+        let conflict = self.copy_job_drives.iter()
+            .any(|d| d.intersection(&new_drives).next().is_some());
+        if conflict {
+            self.copy_pending.push_back((sources, dest, state));
+        } else {
+            spawn_copy_job(sources, dest, Arc::clone(&state));
+            self.copy_job_drives.push(new_drives);
+            self.copy_jobs.push(state);
+        }
     }
+
+    /// Scan the pending queue and launch every job whose drives are now free.
+    fn advance_copy_queue(&mut self) {
+        let mut i = 0;
+        while i < self.copy_pending.len() {
+            let (sources, dest, _) = &self.copy_pending[i];
+            let d = drives_of(sources, dest);
+            let conflict = self.copy_job_drives.iter()
+                .any(|bd| bd.intersection(&d).next().is_some());
+            if !conflict {
+                let (sources, dest, state) = self.copy_pending.remove(i).unwrap();
+                let d = drives_of(&sources, &dest);
+                spawn_copy_job(sources, dest, Arc::clone(&state));
+                self.copy_job_drives.push(d);
+                self.copy_jobs.push(state);
+                // Don't increment — the next item has shifted into slot i,
+                // and we've added a new busy-drive entry so re-check from i.
+            } else {
+                i += 1;
+            }
+        }
+    }
+}
+
+/// Returns the set of uppercase drive letters touched by a copy job.
+/// On non-Windows or UNC paths the set may be empty (no queuing penalty).
+fn drives_of(sources: &[PathBuf], dest: &PathBuf) -> std::collections::HashSet<char> {
+    use std::path::{Component, Prefix};
+    let mut set = std::collections::HashSet::new();
+    for p in sources.iter().chain(std::iter::once(dest)) {
+        if let Some(Component::Prefix(prefix)) = p.components().next() {
+            if let Prefix::Disk(b) = prefix.kind() {
+                set.insert((b as char).to_ascii_uppercase());
+            }
+        }
+    }
+    set
 }
 
 impl RusplorerApp {
@@ -1951,11 +2005,8 @@ impl eframe::App for RusplorerApp {
         }
 
         // Decrement the suppress frame-counter.  Suppress blocks new drag
-        // detection and context-menu triggers for a short window (2 frames)
-        // after DoDragDrop returns or an in-window drop completes.  Using a
-        // simple counter avoids the old bug where a genuine *new* button press
-        // was mistaken for stale state and kept suppress alive indefinitely,
-        // causing every-other-drag to fail.
+        // detection and context-menu triggers for a short window after an OLE
+        // drag-out completes or an in-window drop finishes.
         if self.dnd_suppress > 0 {
             self.dnd_suppress -= 1;
         }
@@ -1971,26 +2022,64 @@ impl eframe::App for RusplorerApp {
             { self.startup_vd_done = true; }
         }
 
-        // Register OLE IDropTarget on our HWND so Explorer can drag files in
+        // Register OLE IDropTarget on our HWND so Explorer can drag files in.
+        // We must replace winit's own IDropTarget with our custom one that
+        // understands right-button drags.  Winit registers its target a few
+        // frames after startup, so we keep retrying until RevokeDragDrop
+        // succeeds (= winit's target was there and we replaced it).
         #[cfg(windows)]
         if !self.drop_target_registered {
-            if let Some(tx) = self.ole_drop_sender.take() {
-                let rc_tx = self.ole_rclick_drop_sender.take();
-                if let Some(hwnd_raw) = find_own_hwnd() {
-                    let hwnd_ptr = hwnd_raw as *mut _;
-                    let rc = rc_tx.unwrap_or_else(|| std::sync::mpsc::channel().0);
-                    let drag_in_flag = self.ole_drag_in_active.clone();
-                    if let Some(target) = register_ole_drop_target(hwnd_ptr, tx, rc, drag_in_flag) {
-                        self._ole_drop_target = Some(target);
-                        self.drop_target_registered = true;
-                    } else {
-                        // Registration failed — don't retry (probably no OLE)
-                        self.drop_target_registered = true;
+            if let Some(hwnd_raw) = find_own_hwnd() {
+                // Ensure senders are available for (re)registration attempts.
+                // On the first attempt they are taken; on retries we use the
+                // stored IDropTarget's channels, so we only need them once.
+                if self._ole_drop_target.is_none() {
+                    // First attempt: consume the one-shot senders.
+                    if let (Some(tx), Some(rc_tx)) = (
+                        self.ole_drop_sender.take(),
+                        self.ole_rclick_drop_sender.take(),
+                    ) {
+                        let drag_in_flag = self.ole_drag_in_active.clone();
+                        match register_ole_drop_target(
+                            hwnd_raw as *mut _,
+                            tx,
+                            rc_tx,
+                            drag_in_flag,
+                        ) {
+                            Some((target, revoked)) => {
+                                self._ole_drop_target = Some(target);
+                                if revoked {
+                                    self.drop_target_registered = true;
+                                }
+                                // else: registered but winit not yet present —
+                                // need to re-revoke next frame
+                            }
+                            None => {
+                                self.drop_target_registered = true; // fatal, stop
+                            }
+                        }
                     }
                 } else {
-                    // HWND not ready yet — put senders back
-                    self.ole_drop_sender = Some(tx);
-                    self.ole_rclick_drop_sender = rc_tx;
+                    // Subsequent attempts: our target is already constructed,
+                    // just try to revoke whatever's there and re-register ours.
+                    if let Some(target) = self._ole_drop_target.as_ref() {
+                        use windows::Win32::Foundation::HWND;
+                        use windows::Win32::System::Ole::{
+                            RegisterDragDrop, RevokeDragDrop,
+                        };
+                        let hwnd = HWND(hwnd_raw as *mut _);
+                        unsafe {
+                            let revoked = RevokeDragDrop(hwnd).is_ok();
+                            crate::ole::log_dnd(&format!("Retry RevokeDragDrop ok={revoked}"));
+                            if revoked {
+                                let ok = RegisterDragDrop(hwnd, target).is_ok();
+                                crate::ole::log_dnd(&format!("Retry RegisterDragDrop ok={ok}"));
+                                if ok {
+                                    self.drop_target_registered = true;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2017,8 +2106,11 @@ impl eframe::App for RusplorerApp {
         // Drain completed copy/move jobs
         {
             let mut need_refresh = false;
-            self.copy_jobs.retain(|job| {
-                if job.done.load(Ordering::SeqCst) {
+            let mut i = 0;
+            while i < self.copy_jobs.len() {
+                if self.copy_jobs[i].done.load(Ordering::SeqCst) {
+                    let job = self.copy_jobs.remove(i);
+                    self.copy_job_drives.remove(i);
                     // Harvest results
                     let names = job.pasted_names.lock().unwrap().clone();
                     if !names.is_empty() {
@@ -2032,11 +2124,17 @@ impl eframe::App for RusplorerApp {
                         self.clipboard_mode = None;
                     }
                     need_refresh = true;
-                    false // remove from list
+                    // don't increment i — the next job has shifted into slot i
                 } else {
-                    true // keep
+                    i += 1;
                 }
-            });
+            }
+            // Advance the queue: launch any pending job whose drives are now free.
+            // Also purge any queued jobs the user cancelled.
+            self.copy_pending.retain(|(_, _, s)| !s.cancelled.load(Ordering::Relaxed));
+            if need_refresh || !self.copy_pending.is_empty() {
+                self.advance_copy_queue();
+            }
             if need_refresh {
                 self.refresh_contents();
             }
@@ -2119,7 +2217,9 @@ impl eframe::App for RusplorerApp {
             }
         }
 
-        // Handle drag and drop
+        // Handle drag and drop (from external apps via egui/winit — legacy fallback)
+        // NOTE: with drag_and_drop=false on Windows, this path is inactive.
+        // Our custom OLE IDropTarget handles drops instead.
         ctx.input(|i| {
             let dropped_files = &i.raw.dropped_files;
             if !dropped_files.is_empty() {
@@ -2128,18 +2228,31 @@ impl eframe::App for RusplorerApp {
                     .filter_map(|f| f.path.clone())
                     .collect();
                 if !self.dragged_files.is_empty() {
-                    // Check if it's a right-click drag (we'll detect this by checking pointer events)
-                    self.is_right_click_drag =
-                        i.pointer.button_down(egui::PointerButton::Secondary);
-                    self.show_drop_menu = self.is_right_click_drag;
-
-                    // Left click defaults to move
-                    if !self.is_right_click_drag {
-                        let files = self.dragged_files.clone();
-                        let dest = self.current_path.clone();
-                        self.start_copy_job(files, dest, true, false);
-                        self.dragged_files.clear();
-                    }
+                    // Winit's drop target has no right-click awareness,
+                    // so always present the right-click menu for safety.
+                    let dest = self.current_path.clone();
+                    let drop_pos = {
+                        let mut pos = egui::pos2(300.0, 300.0);
+                        #[cfg(windows)]
+                        unsafe {
+                            use winapi::shared::windef::POINT;
+                            use winapi::um::winuser::{GetCursorPos, ScreenToClient};
+                            let mut pt = POINT { x: 0, y: 0 };
+                            if GetCursorPos(&mut pt) != 0 {
+                                if let Some(hwnd) = crate::ole::find_own_hwnd() {
+                                    ScreenToClient(hwnd, &mut pt);
+                                }
+                                let ppp = i.pixels_per_point();
+                                pos = egui::pos2(pt.x as f32 / ppp, pt.y as f32 / ppp);
+                            }
+                        }
+                        #[cfg(not(windows))]
+                        if let Some(p) = i.pointer.hover_pos() { pos = p; }
+                        pos
+                    };
+                    let files = self.dragged_files.clone();
+                    self.dragged_files.clear();
+                    self.dnd_right_drop_menu = Some((files, dest, drop_pos));
                 }
             }
         });
@@ -2245,9 +2358,19 @@ impl eframe::App for RusplorerApp {
             }
         }
 
-        // Handle Escape to deselect all
+        // Handle Escape to deselect all and cancel any active DnD
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.selected_entries.clear();
+            // Cancel any active or pending internal DnD
+            self.dnd_active = false;
+            self.dnd_start_pos = None;
+            self.dnd_drag_entry = None;
+            self.dnd_is_right_click = false;
+            self.dnd_sources.clear();
+            self.dnd_label.clear();
+            self.dnd_drop_target = None;
+            self.dnd_drop_target_prev = None;
+            self.dnd_right_drop_menu = None;
         }
 
         // Handle Ctrl+C / Ctrl+X / Ctrl+V / DEL using Windows API directly (bypass egui)
@@ -2725,9 +2848,31 @@ impl eframe::App for RusplorerApp {
                             ui.colored_label(egui::Color32::RED, format!("Error: {}", err));
                         }
 
-                        if job_idx + 1 < self.copy_jobs.len() {
+                        if job_idx + 1 < self.copy_jobs.len() || !self.copy_pending.is_empty() {
                             ui.separator();
                         }
+                    }
+                    // Show queued (waiting) jobs
+                    for (q_idx, (sources, dest, state)) in self.copy_pending.iter().enumerate() {
+                        let op = if state.is_move { "Move" } else { "Copy" };
+                        let n = sources.len();
+                        let noun = if n == 1 { "file" } else { "files" };
+                        let dest_str = dest.to_string_lossy();
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    format!("\u{23f3} Queued: {op} {n} {noun} → {dest_str}")
+                                )
+                                .small()
+                                .color(egui::Color32::from_rgb(160, 160, 160))
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("✕ Cancel").clicked() {
+                                    state.cancelled.store(true, Ordering::SeqCst);
+                                }
+                            });
+                        });
+                        if q_idx + 1 < self.copy_pending.len() { ui.separator(); }
                     }
                     ctx.request_repaint_after(std::time::Duration::from_millis(100));
                 });
@@ -3380,7 +3525,7 @@ impl eframe::App for RusplorerApp {
                 }
                 // Thumbnail / list view toggle
                 let is_thumb = self.thumb_view.get(&self.current_path).copied().unwrap_or(false);
-                if ui.selectable_label(is_thumb, "�")
+                if ui.selectable_label(is_thumb, "📷")
                     .on_hover_text(if is_thumb { "Switch to list view" } else { "Switch to thumbnail view" })
                     .clicked()
                 {
@@ -3859,7 +4004,21 @@ impl eframe::App for RusplorerApp {
                                     // DnD drag initiation
                                     let primary_down   = ctx.input(|i| i.pointer.primary_down());
                                     let secondary_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
-                                    let any_btn   = primary_down || secondary_down;
+                                    // Cross-check: egui may believe a button is held due to
+                                    // stale state after a blocking DoDragDrop call.  Only
+                                    // trust egui if the hardware agrees.
+                                    let any_btn = {
+                                        let egui_any = primary_down || secondary_down;
+                                        #[cfg(windows)] {
+                                            if egui_any {
+                                                use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+                                                let hw_lmb = unsafe { GetAsyncKeyState(0x01) } & (0x8000u16 as i16) != 0;
+                                                let hw_rmb = unsafe { GetAsyncKeyState(0x02) } & (0x8000u16 as i16) != 0;
+                                                hw_lmb || hw_rmb
+                                            } else { false }
+                                        }
+                                        #[cfg(not(windows))] { egui_any }
+                                    };
                                     let cursor_over = ctx.input(|i| i.pointer.hover_pos()
                                         .map_or(false, |pos| cell_rect.contains(pos)));
                                     if cursor_over { self.any_button_hovered = true; }
@@ -4263,7 +4422,21 @@ impl eframe::App for RusplorerApp {
                                 //  after the blocking DoDragDrop OLE call)
                                 let primary_down = ui.input(|i| i.pointer.primary_down());
                                 let secondary_down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
-                                let any_btn_down = primary_down || secondary_down;
+                                // Cross-check: egui may believe a button is held due to
+                                // stale state after a blocking DoDragDrop call.  Only
+                                // trust egui if the hardware agrees.
+                                let any_btn_down = {
+                                    let egui_any = primary_down || secondary_down;
+                                    #[cfg(windows)] {
+                                        if egui_any {
+                                            use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+                                            let hw_lmb = unsafe { GetAsyncKeyState(0x01) } & (0x8000u16 as i16) != 0;
+                                            let hw_rmb = unsafe { GetAsyncKeyState(0x02) } & (0x8000u16 as i16) != 0;
+                                            hw_lmb || hw_rmb
+                                        } else { false }
+                                    }
+                                    #[cfg(not(windows))] { egui_any }
+                                };
 
                                 // Detect new press on this entry
                                 if cursor_over
@@ -4691,7 +4864,7 @@ impl eframe::App for RusplorerApp {
                     if btn_held && cursor_outside && !self.dnd_sources.is_empty() {
                         let sources = self.dnd_sources.clone();
                         let is_right = self.dnd_is_right_click;
-                        // Reset internal DnD state first
+                        // Reset internal DnD state before blocking OLE call
                         self.dnd_active = false;
                         self.dnd_is_right_click = false;
                         self.dnd_sources.clear();
@@ -4700,26 +4873,32 @@ impl eframe::App for RusplorerApp {
                         self.dnd_drag_entry = None;
                         self.dnd_drop_target = None;
                         self.dnd_drop_target_prev = None;
-                        self.dnd_suppress = 2;
-                        // Blocking OLE drag — pumps Windows messages until drop/cancel
+                        // Blocking OLE drag — DoDragDrop requires the UI thread
+                        // for mouse capture (SetCapture). The UI won't repaint
+                        // while this blocks, but Windows pumps messages so the
+                        // window stays responsive to the OS.
+                        crate::ole::log_dnd(&format!("DragOut: is_right={is_right} files={}", sources.len()));
                         let was_move = ole_drag_files_out(&sources, is_right);
-                        // DoDragDrop is blocking; the user released the mouse button inside the
-                        // drop-target window (e.g. Chrome), so WM_LBUTTONUP was sent there and
-                        // winit/egui never received it.  egui therefore believes the button is
-                        // still held, which would trigger a phantom drag once dnd_suppress
-                        // expires.  Fix: post a synthetic button-up to our own message queue
-                        // so winit processes it and clears primary_down before the next
-                        // update() frame runs the drag-detection code.
-                        // the next update() frame runs the drag-detection code.
+                        // Post synthetic button-ups so egui clears stale
+                        // held-state that accumulated during the blocking call.
                         if let Some(hwnd) = crate::ole::find_own_hwnd() {
-                            use winapi::um::winuser::{PostMessageW, WM_LBUTTONUP, WM_RBUTTONUP};
-                            let msg = if is_right { WM_RBUTTONUP } else { WM_LBUTTONUP };
-                            unsafe { PostMessageW(hwnd, msg, 0, 0); }
+                            use winapi::um::winuser::{PostMessageW, WM_LBUTTONUP, WM_RBUTTONUP, GetCursorPos, ScreenToClient};
+                            use winapi::shared::windef::POINT;
+                            unsafe {
+                                let mut pt = POINT { x: 0, y: 0 };
+                                GetCursorPos(&mut pt);
+                                ScreenToClient(hwnd, &mut pt);
+                                let lparam = ((pt.y as u32) << 16 | (pt.x as u32 & 0xFFFF)) as isize;
+                                PostMessageW(hwnd, WM_LBUTTONUP, 0, lparam);
+                                PostMessageW(hwnd, WM_RBUTTONUP, 0, lparam);
+                            }
                         }
-                        // Belt-and-suspenders: re-clear drag tracking fields that may have been
-                        // populated by the Windows message-pump inside DoDragDrop.
+                        // Re-clear any DnD state that the Windows message pump
+                        // inside DoDragDrop may have populated.
                         self.dnd_start_pos = None;
                         self.dnd_drag_entry = None;
+                        self.dnd_is_right_click = false;
+                        self.dnd_suppress = 3;
                         if was_move {
                             self.selected_entries.clear();
                         }
