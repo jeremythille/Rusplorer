@@ -1494,7 +1494,7 @@ impl RusplorerApp {
     fn is_video_file(name: &str) -> bool {
         matches!(
             name.rsplit('.').next().map(|e| e.to_ascii_lowercase()).as_deref(),
-            Some("mp4" | "avi" | "mkv" | "mov" | "wmv" | "flv" | "webm" | "m4v")
+            Some("mp4" | "avi" | "mkv" | "mov" | "wmv" | "flv" | "webm" | "m4v" | "ogv")
         )
     }
 
@@ -1570,7 +1570,7 @@ impl RusplorerApp {
                 Some(col!(160, 210, 255,  60, 130, 210)),   // light blue
             // ── Videos ───────────────────────────────────────────────────────
             ".mp4" | ".mkv" | ".avi" | ".mov" | ".wmv" | ".flv"
-            | ".webm" | ".m4v" | ".m2ts" | ".vob" | ".mpg" | ".mpeg" | ".f4v" | ".3gp" =>
+            | ".webm" | ".m4v" | ".m2ts" | ".vob" | ".mpg" | ".mpeg" | ".f4v" | ".3gp" | ".ogv" =>
                 Some(col!( 80, 200,  90,  20, 130,  40)),   // green
             // ── Audio ────────────────────────────────────────────────────────
             ".mp3" | ".wav" | ".flac" | ".aac" | ".ogg" | ".wma" | ".m4a"
@@ -1623,6 +1623,41 @@ impl RusplorerApp {
     /// For files (non-directory), the extension is rendered in **bold** with a
     /// type-based color; the stem uses the regular proportional font.
     /// Directories and the parent "[..]" entry are rendered as plain text.
+    /// Truncate `name` so it fits within `max_px` pixels at font size 11px.
+    /// If truncation is needed, ellipsis is inserted before the extension:
+    ///   "long file name.mp4" → "long fil….mp4"
+    fn truncate_name(name: &str, max_px: f32, ui: &egui::Ui) -> String {
+        let font_id = egui::FontId::new(11.0, egui::FontFamily::Proportional);
+        let measure = |s: &str| -> f32 {
+            ui.ctx().fonts(|f| {
+                f.layout_no_wrap(s.to_string(), font_id.clone(), egui::Color32::WHITE).size().x
+            })
+        };
+        if measure(name) <= max_px {
+            return name.to_string();
+        }
+        // Split stem and extension.
+        let (stem, ext) = if name.starts_with("[..]") {
+            (name, "")
+        } else {
+            match name.rfind('.').filter(|&p| p > 0) {
+                Some(p) => (&name[..p], &name[p..]),
+                None    => (name, ""),
+            }
+        };
+        let ellipsis = "…";
+        // Remove chars from the end of stem until it fits.
+        let mut truncated = stem.to_string();
+        loop {
+            let candidate = format!("{truncated}{ellipsis}{ext}");
+            if measure(&candidate) <= max_px || truncated.is_empty() {
+                return candidate;
+            }
+            // Pop one char (handle multi-byte correctly).
+            truncated.pop();
+        }
+    }
+
     fn name_layout_job(
         name: &str,
         is_dir: bool,
@@ -2348,8 +2383,15 @@ impl eframe::App for RusplorerApp {
             self.go_forward();
         }
 
+        // Block global shortcuts when any modal dialog is open
+        let any_modal_open = self.show_rename_dialog
+            || self.show_new_item_dialog
+            || self.show_archive_dialog
+            || self.show_extract_dialog
+            || self.show_save_session_dialog;
+
         // Handle Ctrl+A to select all
-        if ctx.input(|i| i.key_pressed(egui::Key::A) && i.modifiers.ctrl) {
+        if !any_modal_open && ctx.input(|i| i.key_pressed(egui::Key::A) && i.modifiers.ctrl) {
             self.selected_entries.clear();
             for entry in &self.contents {
                 if !entry.name.starts_with("[..]") {
@@ -2359,7 +2401,7 @@ impl eframe::App for RusplorerApp {
         }
 
         // Handle Escape to deselect all and cancel any active DnD
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if !any_modal_open && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.selected_entries.clear();
             // Cancel any active or pending internal DnD
             self.dnd_active = false;
@@ -2405,7 +2447,9 @@ impl eframe::App for RusplorerApp {
                 // can return None (defaulting to true), causing false positives when
                 // the user presses shortcuts in another window while GetAsyncKeyState
                 // reports global key state.
-                let dialog_open = self.show_rename_dialog || self.show_new_item_dialog;
+                let dialog_open = self.show_rename_dialog || self.show_new_item_dialog
+                    || self.show_archive_dialog || self.show_extract_dialog
+                    || self.show_save_session_dialog;
                 let really_focused = self.is_focused && {
                     match find_own_hwnd() {
                         Some(hwnd) => unsafe {
@@ -3062,7 +3106,10 @@ impl eframe::App for RusplorerApp {
                     self.config.save();
                 }
 
-                ui.separator();
+                // Visual separator between favorites and folder tree
+                ui.add_space(3.0);
+                ui.add(egui::Separator::default().spacing(3.0));
+                ui.add_space(3.0);
 
                 // ── Folder tree ──────────────────────────────────────────
                 let dnd_active = self.dnd_active;
@@ -3514,10 +3561,10 @@ impl eframe::App for RusplorerApp {
                     ui.text_edit_singleline(&mut self.filter)
                 });
                 self.filter_edit_rect = filter_alloc.response.rect;
-                // Little X button to clear the filter
+                // Little × button to clear the filter
                 if !self.filter.is_empty() {
                     let x_btn = ui.add(egui::Button::new(
-                        egui::RichText::new("✕").size(11.0).color(egui::Color32::from_rgb(255, 80, 80))
+                        egui::RichText::new("×").size(11.0).color(egui::Color32::from_rgb(255, 80, 80))
                     ).frame(false));
                     if x_btn.clicked() {
                         self.filter.clear();
@@ -3923,19 +3970,23 @@ impl eframe::App for RusplorerApp {
                                             );
                                         }
 
-                                        // Filename label (truncated)
-                                        let chars: Vec<char> = entry.name.chars().collect();
-                                        let name_display = if chars.len() > 16 {
-                                            format!("{}\u{2026}", chars[..15].iter().collect::<String>())
+                                        // Filename label with extension colour coding
+                                        let dark_mode = ui.visuals().dark_mode;
+                                        let name_display = Self::truncate_name(&entry.name, CELL_W - 4.0, ui);
+                                        let label_color = if is_selected {
+                                            egui::Color32::WHITE
+                                        } else if dark_mode {
+                                            egui::Color32::from_gray(210)
                                         } else {
-                                            entry.name.clone()
+                                            egui::Color32::from_gray(70)
                                         };
-                                        p.text(
-                                            egui::pos2(cell_rect.center().x, cell_rect.min.y + THUMB + 8.0),
-                                            egui::Align2::CENTER_TOP, &name_display,
-                                            egui::FontId::proportional(11.0),
-                                            if is_selected { egui::Color32::WHITE } else { egui::Color32::from_gray(210) },
+                                        let job = Self::name_layout_job(&name_display, entry.is_dir, label_color, false, dark_mode);
+                                        let galley = ctx.fonts(|f| f.layout_job(job));
+                                        let label_pos = egui::pos2(
+                                            cell_rect.center().x - galley.size().x * 0.5,
+                                            cell_rect.min.y + THUMB + 8.0,
                                         );
+                                        p.galley(label_pos, galley, label_color);
                                     }
 
                                     // Click handling
@@ -4358,49 +4409,51 @@ impl eframe::App for RusplorerApp {
                                 let col_width = ui.available_width();
                                 let text_color = ui.visuals().text_color();
                                 let dark_mode = ui.visuals().dark_mode;
+                                // Truncate name before the extension so it fits the column.
+                                let display_name = Self::truncate_name(&entry.name, col_width - 4.0, ui);
 
                                 let button = if is_drop_target {
                                     egui::Button::new(
-                                        Self::name_layout_job(&entry.name, entry.is_dir, egui::Color32::WHITE, false, dark_mode)
+                                        Self::name_layout_job(&display_name, entry.is_dir, egui::Color32::WHITE, false, dark_mode)
                                     )
                                     .fill(egui::Color32::from_rgb(80, 200, 80))
                                     .frame(false)
                                 } else if is_selected && is_in_clipboard {
                                     egui::Button::new(
-                                        Self::name_layout_job(&entry.name, entry.is_dir, egui::Color32::WHITE, true, dark_mode)
+                                        Self::name_layout_job(&display_name, entry.is_dir, egui::Color32::WHITE, true, dark_mode)
                                     )
                                     .fill(egui::Color32::from_rgb(100, 150, 255))
                                     .frame(false)
                                 } else if is_selected {
                                     egui::Button::new(
-                                        Self::name_layout_job(&entry.name, entry.is_dir, egui::Color32::WHITE, false, dark_mode)
+                                        Self::name_layout_job(&display_name, entry.is_dir, egui::Color32::WHITE, false, dark_mode)
                                     )
                                     .fill(egui::Color32::from_rgb(100, 150, 255))
                                     .frame(false)
                                 } else if is_in_clipboard && entry.is_dir {
                                     egui::Button::new(
-                                        Self::name_layout_job(&entry.name, true, egui::Color32::from_gray(20), true, dark_mode)
+                                        Self::name_layout_job(&display_name, true, egui::Color32::from_gray(20), true, dark_mode)
                                     )
                                     .fill(egui::Color32::from_rgb(255, 245, 150))
                                     .frame(false)
                                 } else if is_in_clipboard {
                                     egui::Button::new(
-                                        Self::name_layout_job(&entry.name, entry.is_dir, text_color, true, dark_mode)
+                                        Self::name_layout_job(&display_name, entry.is_dir, text_color, true, dark_mode)
                                     )
                                     .frame(false)
                                 } else if entry.name.starts_with("[..]") {
-                                    egui::Button::new(&entry.name)
+                                    egui::Button::new(&display_name)
                                         .fill(egui::Color32::TRANSPARENT)
                                         .frame(false)
                                 } else if entry.is_dir {
                                     egui::Button::new(
-                                        Self::name_layout_job(&entry.name, true, egui::Color32::from_gray(20), false, dark_mode)
+                                        Self::name_layout_job(&display_name, true, egui::Color32::from_gray(20), false, dark_mode)
                                     )
                                     .fill(egui::Color32::from_rgb(255, 245, 150))
                                     .frame(false)
                                 } else {
                                     egui::Button::new(
-                                        Self::name_layout_job(&entry.name, false, text_color, false, dark_mode)
+                                        Self::name_layout_job(&display_name, false, text_color, false, dark_mode)
                                     )
                                     .frame(false)
                                 };
@@ -5608,6 +5661,22 @@ impl eframe::App for RusplorerApp {
         }
 
         // Rename dialog
+        // ── Modal backdrop ────────────────────────────────────────────────
+        if self.show_rename_dialog || self.show_new_item_dialog
+            || self.show_archive_dialog || self.show_extract_dialog
+            || self.show_save_session_dialog
+        {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::PanelResizeLine,
+                egui::Id::new("modal_backdrop"),
+            ));
+            painter.rect_filled(
+                ctx.screen_rect(),
+                0.0,
+                egui::Color32::from_black_alpha(110),
+            );
+        }
+
         // ── New folder / New file dialog ──────────────────────────────────
         if self.show_new_item_dialog {
             let title = if self.new_item_is_dir { "New folder" } else { "New text file" };
