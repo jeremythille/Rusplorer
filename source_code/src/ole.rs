@@ -541,6 +541,31 @@ pub fn register_ole_drop_target(
 
                 self.drag_in_active.store(false, std::sync::atomic::Ordering::SeqCst);
                 if !files.is_empty() {
+                    // Some apps (e.g. 7-Zip) extract to a private temp folder, call
+                    // Drop(), and immediately delete that temp folder once we return.
+                    // Our async copy job runs *after* we return, so the files are gone.
+                    // Fix: synchronously copy any temp-resident files into our own
+                    // stable temp dir RIGHT NOW, before returning from Drop().
+                    let temp_dir = std::env::temp_dir();
+                    let staging = temp_dir.join("rusplorer_drop");
+                    let files: Vec<PathBuf> = files.into_iter().map(|src| {
+                        let in_temp = src.starts_with(&temp_dir);
+                        if in_temp {
+                            let _ = std::fs::create_dir_all(&staging);
+                            if let Some(name) = src.file_name() {
+                                let dst = staging.join(name);
+                                match std::fs::copy(&src, &dst) {
+                                    Ok(_) => {
+                                        log_dnd(&format!("  staged: {} -> {}", src.display(), dst.display()));
+                                        return dst;
+                                    }
+                                    Err(e) => log_dnd(&format!("  stage FAIL {}: {e}", src.display())),
+                                }
+                            }
+                        }
+                        src
+                    }).collect();
+
                     // Determine right-drag via multiple methods:
                     // 1. Latched flag from DragEnter/DragOver (set while button held)
                     // 2. Custom format via GetData (more reliably marshaled cross-process
@@ -556,7 +581,8 @@ pub fn register_ole_drop_target(
                         obj.GetData(&fmt).is_ok()
                     };
                     let is_right = self.is_right_drag.get() || right_via_format;
-                    log_dnd(&format!("Drop: latched={} fmt={right_via_format} => is_right={is_right}", self.is_right_drag.get()));
+                    log_dnd(&format!("Drop: {} file(s), latched={} fmt={right_via_format} => is_right={is_right}", files.len(), self.is_right_drag.get()));
+                    for f in &files { log_dnd(&format!("  path: {}", f.display())); }
                     if is_right {
                         let _ = self.right_click_sender.send(files);
                     } else {

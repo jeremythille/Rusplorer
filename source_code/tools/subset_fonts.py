@@ -74,6 +74,8 @@ UNICODE_RANGES = ",".join([
     "U+2980-29FF",
     # Supplemental Arrows-C / Misc Symbols and Arrows: ⭐ (U+2B50)
     "U+2B00-2BFF",
+    # Mathematical Alphanumeric Symbols: 𝍖 (U+1D356)
+    "U+1D300-1D35F",
     # Enclosed Alphanumeric Supplement
     "U+1F100-1F1FF",
     # Enclosed Ideographic Supplement
@@ -131,22 +133,25 @@ def subset_font(src_name: str, dst_name: str) -> None:
 
 if __name__ == "__main__":
     print("Subsetting Iosevka fonts …\n")
-    subset_font("IosevkaAile-Regular.ttf", "IosevkaAile-Regular.ttf")
-    subset_font("IosevkaAile-Bold.ttf",    "IosevkaAile-Bold.ttf")
+    subset_font("IosevkaAile-Regular.orig.ttf", "IosevkaAile-Regular.ttf")
+    subset_font("IosevkaAile-Bold.orig.ttf",    "IosevkaAile-Bold.ttf")
 
     print("\nSubsetting NotoEmoji (emoji used in the UI only) …\n")
-    # Emoji actually used: 🖼💾📋📁📄📦🎦⭐ — subset to just these 8 glyphs.
+    # Emoji actually used: ⌛⏳🖼💾📋📁📂📅📄📦⭐ — subset to just these glyphs.
     # NotoEmoji.orig.ttf must exist (copy from cargo cache or download).
     src = os.path.join(FONTS_DIR, "NotoEmoji-Regular.orig.ttf")
     dst = os.path.join(FONTS_DIR, "NotoEmoji-Regular.ttf")
     if os.path.exists(src):
         before_kb = os.path.getsize(src) / 1024
         emoji_codepoints = (
+            "U+231B,"    # ⌛  hourglass done
+            "U+23F3,"    # ⏳  hourglass not done
+            "U+1F5BC,"   # 🖼  frame with picture (thumbnail view toggle)
+            "U+1F4C1,"   # 📁  folder
+            "U+1F4C2,"   # 📂  open folder (paste path from clipboard)
             "U+1F4C5,"   # 📅  calendar (show modification date)
             "U+1F4BE,"   # 💾  floppy disk
             "U+1F4CB,"   # 📋  clipboard
-            "U+1F3A6,"   # 🎦  cinema
-            "U+1F4C1,"   # 📁  folder
             "U+1F4C4,"   # 📄  page
             "U+1F4E6,"   # 📦  package
             "U+2B50,"    # ⭐  star
