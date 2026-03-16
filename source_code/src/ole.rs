@@ -160,6 +160,24 @@ fn rusplorer_right_drag_format() -> u16 {
     })
 }
 
+/// Register / retrieve the custom clipboard format used to mark ANY Rusplorer
+/// OLE drag-out.  When the drop target (another Rusplorer window) sees this
+/// format it refuses the drop so the drag can reach the application behind it.
+#[cfg(windows)]
+fn rusplorer_source_drag_format() -> u16 {
+    use std::sync::OnceLock;
+    static FMT: OnceLock<u16> = OnceLock::new();
+    *FMT.get_or_init(|| {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        let name: Vec<u16> = OsStr::new("RusplorerDragSource")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe { winapi::um::winuser::RegisterClipboardFormatW(name.as_ptr()) as u16 }
+    })
+}
+
 // ── OLE drag-out ─────────────────────────────────────────────────────────────
 
 /// Initiate an OLE drag-and-drop of the given files out to other applications (e.g. Explorer).
@@ -214,12 +232,15 @@ pub fn ole_drag_files_out(files: &[PathBuf], right_button: bool) -> bool {
         }
     }
 
-    // ── IDataObject (CF_HDROP + optional right-drag marker) ─────────────
+    // ── IDataObject (CF_HDROP + optional right-drag marker + source marker) ─
     #[implement(IDataObject)]
     struct HdropData {
         blob: Vec<u8>,
         /// Custom clipboard format ID for right-button drag (0 = not a right drag).
         right_drag_fmt: u16,
+        /// Custom clipboard format ID marking this drag as originating from Rusplorer.
+        /// Always non-zero; used by other Rusplorer windows to refuse the drop.
+        source_drag_fmt: u16,
     }
 
     impl IDataObject_Impl for HdropData_Impl {
@@ -244,7 +265,9 @@ pub fn ole_drag_files_out(files: &[PathBuf], right_button: bool) -> bool {
                     medium.tymed = TYMED_HGLOBAL.0 as u32;
                     medium.u.hGlobal = hmem;
                     Ok(medium)
-                } else if self.right_drag_fmt != 0 && fmt.cfFormat == self.right_drag_fmt {
+                } else if self.right_drag_fmt != 0 && fmt.cfFormat == self.right_drag_fmt
+                    || fmt.cfFormat == self.source_drag_fmt
+                {
                     // Return a tiny HGLOBAL — the drop target only tests for the
                     // format's existence via QueryGetData, but COM may call GetData
                     // when marshalling across processes.
@@ -276,6 +299,8 @@ pub fn ole_drag_files_out(files: &[PathBuf], right_button: bool) -> bool {
                 if cf == CF_HDROP_RAW {
                     S_OK
                 } else if self.right_drag_fmt != 0 && cf == self.right_drag_fmt {
+                    S_OK
+                } else if cf == self.source_drag_fmt {
                     S_OK
                 } else {
                     HRESULT(0x80040064_u32 as i32) // DV_E_FORMATETC
@@ -321,6 +346,13 @@ pub fn ole_drag_files_out(files: &[PathBuf], right_button: bool) -> bool {
                     tymed: TYMED_HGLOBAL.0 as u32,
                 });
             }
+            fmts.push(FORMATETC {
+                cfFormat: self.source_drag_fmt,
+                ptd: std::ptr::null_mut(),
+                dwAspect: 1,
+                lindex: -1,
+                tymed: TYMED_HGLOBAL.0 as u32,
+            });
             unsafe { SHCreateStdEnumFmtEtc(&fmts) }
         }
         fn DAdvise(
@@ -369,7 +401,8 @@ pub fn ole_drag_files_out(files: &[PathBuf], right_button: bool) -> bool {
 
     // ── Perform OLE drag ─────────────────────────────────────────────────
     let right_drag_fmt = if right_button { rusplorer_right_drag_format() } else { 0 };
-    let data_obj: IDataObject = HdropData { blob, right_drag_fmt }.into();
+    let source_drag_fmt = rusplorer_source_drag_format();
+    let data_obj: IDataObject = HdropData { blob, right_drag_fmt, source_drag_fmt }.into();
     let source: IDropSource = DropSource { button_mask: track_button }.into();
     let mut effect = DROPEFFECT_NONE;
     let hr = unsafe {
@@ -417,6 +450,8 @@ pub fn register_ole_drop_target(
         last_key_state: std::cell::Cell<u32>,
         /// Set in DragEnter (button is guaranteed held) — more reliable than last_key_state for Drop.
         is_right_drag: std::cell::Cell<bool>,
+        /// Set when DragEnter determines this is a Rusplorer-originated drag (must refuse).
+        refused_drag: std::cell::Cell<bool>,
         drag_in_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
@@ -429,6 +464,23 @@ pub fn register_ole_drop_target(
             pdweffect: *mut DROPEFFECT,
         ) -> windows::core::Result<()> {
             self.last_key_state.set(grfkeystate.0);
+            // If this drag originated from another Rusplorer window, refuse it so
+            // the underlying application (e.g. Affinity) can receive the drop.
+            if let Some(obj) = pdataobj {
+                let fmt = FORMATETC {
+                    cfFormat: rusplorer_source_drag_format(),
+                    ptd: std::ptr::null_mut(),
+                    dwAspect: 1,
+                    lindex: -1,
+                    tymed: TYMED_HGLOBAL.0 as u32,
+                };
+                if unsafe { obj.QueryGetData(&fmt) == S_OK } {
+                    log_dnd("DragEnter: refusing drop from another Rusplorer (RusplorerDragSource format found)");
+                    self.refused_drag.set(true);
+                    unsafe { *pdweffect = DROPEFFECT_NONE; }
+                    return Ok(());
+                }
+            }
             // Detect right-button drag via multiple signals:
             // 1. Custom clipboard format (reliable across processes)
             // 2. grfkeystate from OLE (may miss MK_RBUTTON in some cases)
@@ -478,6 +530,11 @@ pub fn register_ole_drop_target(
             _pt: &POINTL,
             pdweffect: *mut DROPEFFECT,
         ) -> windows::core::Result<()> {
+            // If we refused this drag in DragEnter, keep refusing.
+            if self.refused_drag.get() {
+                unsafe { *pdweffect = DROPEFFECT_NONE; }
+                return Ok(());
+            }
             self.last_key_state.set(grfkeystate.0);
             // Latch: if right button is seen in ANY DragOver, remember it.
             // DragEnter may have missed MK_RBUTTON on some timing paths.
@@ -492,8 +549,9 @@ pub fn register_ole_drop_target(
         }
 
         fn DragLeave(&self) -> windows::core::Result<()> {
-            log_dnd(&format!("DragLeave: was_right={}", self.is_right_drag.get()));
+            log_dnd(&format!("DragLeave: was_right={} was_refused={}", self.is_right_drag.get(), self.refused_drag.get()));
             self.is_right_drag.set(false);
+            self.refused_drag.set(false);
             self.drag_in_active.store(false, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
@@ -507,6 +565,12 @@ pub fn register_ole_drop_target(
         ) -> windows::core::Result<()> {
             unsafe {
                 *pdweffect = DROPEFFECT_NONE;
+                // If this drag was refused in DragEnter (came from another Rusplorer), ignore it.
+                if self.refused_drag.get() {
+                    self.refused_drag.set(false);
+                    log_dnd("Drop: refusing (Rusplorer source drag)");
+                    return Ok(());
+                }
                 let obj = match pdataobj { Some(o) => o, None => return Ok(()) };
                 let fmt = FORMATETC {
                     cfFormat: CF_HDROP_RAW,
@@ -600,6 +664,7 @@ pub fn register_ole_drop_target(
         right_click_sender,
         last_key_state: std::cell::Cell::new(0),
         is_right_drag: std::cell::Cell::new(false),
+        refused_drag: std::cell::Cell::new(false),
         drag_in_active,
     }.into();
     unsafe {

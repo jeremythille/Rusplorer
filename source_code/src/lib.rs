@@ -277,7 +277,7 @@ struct RusplorerApp {
     is_dragging_selection: bool,
     selection_before_drag: HashSet<String>,
     any_button_hovered: bool,
-    filter_edit_rect: egui::Rect,    // rect of the filter TextEdit ï¿½ excluded from rubber-band
+    filter_edit_rect: egui::Rect,    // rect of the filter TextEdit × excluded from rubber-band
     // Internal drag-and-drop
     dnd_active: bool,
     dnd_sources: Vec<PathBuf>,
@@ -1335,8 +1335,8 @@ impl eframe::App for RusplorerApp {
             let font14 = egui::FontId::proportional(14.0);
             let item_sp = 8.0_f32; // default egui item_spacing.x
 
-            // "Drives ?/?" button: text width + ~10px button padding each side
-            let drives_btn_label = if self.show_drives_page { "Drives ?" } else { "Drives ?" };
+            // "Drives ▲▼" button: text width + ~10px button padding each side
+            let drives_btn_label = if self.show_drives_page { "Drives ▲" } else { "Drives ▼" };
             let drives_btn_w = ctx.fonts(|f| {
                 f.layout_no_wrap(drives_btn_label.to_string(), font14.clone(), egui::Color32::WHITE).size().x
             }) + 10.0 + item_sp;
@@ -1713,7 +1713,7 @@ impl eframe::App for RusplorerApp {
                                 if self.tabs.len() > 1 {
                                     let close_resp = ui.add(
                                         egui::Label::new(
-                                            egui::RichText::new("ï¿½").color(text_color).small(),
+                                            egui::RichText::new("×").color(text_color).small(),
                                         ).selectable(false),
                                     );
                                     close_btn_rect = close_resp.rect;
@@ -1956,7 +1956,7 @@ impl eframe::App for RusplorerApp {
             let mut selected_drive: Option<PathBuf> = None;
             ui.horizontal(|ui| {
                 // "Drives" toggle button
-                let drives_btn_label = if self.show_drives_page { "Drives ?" } else { "Drives ?" };
+                let drives_btn_label = if self.show_drives_page { "Drives ▲" } else { "Drives ▼" };
                 if ui.button(drives_btn_label).clicked() {
                     self.show_drives_page = !self.show_drives_page;
                     if self.show_drives_page {
@@ -2012,10 +2012,10 @@ impl eframe::App for RusplorerApp {
                     ui.text_edit_singleline(&mut self.filter)
                 });
                 self.filter_edit_rect = filter_alloc.response.rect;
-                // Little ï¿½ button to clear the filter
+                // Little × button to clear the filter
                 if !self.filter.is_empty() {
                     let x_btn = ui.add(egui::Button::new(
-                        egui::RichText::new("ï¿½").size(11.0).color(egui::Color32::from_rgb(255, 80, 80))
+                        egui::RichText::new("×").size(11.0).color(egui::Color32::from_rgb(255, 80, 80))
                     ).frame(false));
                     if x_btn.clicked() {
                         self.filter.clear();

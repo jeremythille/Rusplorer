@@ -13,7 +13,7 @@ impl RusplorerApp {
             .show(ctx, |ui| {
                 // ── Favorites ────────────────────────────────────────────
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("⭐ Favorites").small());
+                    ui.label(egui::RichText::new("⭐ Favorites"));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add(egui::Button::new("+").small().frame(false))
@@ -80,9 +80,10 @@ impl RusplorerApp {
                 }
 
                 // Visual separator between favorites and folder tree
-                ui.add_space(3.0);
-                ui.add(egui::Separator::default().spacing(3.0));
-                ui.add_space(3.0);
+                ui.add_space(8.0);
+                let (separator_rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+                ui.painter().rect_filled(separator_rect, 0.0, egui::Color32::from_gray(128));
+                ui.add_space(8.0);
 
                 // ── Folder tree ──────────────────────────────────────────
                 let dnd_active = self.dnd_active;
