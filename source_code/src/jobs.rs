@@ -137,10 +137,23 @@ impl RusplorerApp {
                         } else if exists_on_disk && !path.is_dir() {
                             if let Ok(metadata) = path.metadata() {
                                 let size = metadata.len();
-                                self.file_sizes.insert(path, size);
+                                let modified = metadata.modified().ok();
+                                // Update size in the size map
+                                self.file_sizes.insert(path.clone(), size);
                                 if size > self.max_file_size {
                                     self.max_file_size = size;
                                 }
+                                // Update the modified timestamp in the contents list so the
+                                // date column reflects the change immediately
+                                for entry in &mut self.contents {
+                                    if entry.name == file_name {
+                                        entry.modified = modified;
+                                        break;
+                                    }
+                                }
+                                // Evict stale thumbnail so it is reloaded on the next render
+                                self.thumb_cache.remove(&path);
+                                self.thumb_loading.remove(&path);
                             }
                         }
                     }

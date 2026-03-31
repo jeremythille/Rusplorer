@@ -6,6 +6,159 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+/// Send `paths` to the Recycle Bin using IFileOperation (COM).
+/// Returns `true` if all items were successfully queued and the operation
+/// was performed without a system error dialog.
+/// No confirmation dialog is shown; the operation is fully silent.
+#[cfg(windows)]
+pub fn delete_to_recycle_bin(paths: &[PathBuf]) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize,
+        CLSCTX_ALL, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::{
+        IFileOperation, IShellItem,
+        SHCreateItemFromParsingName,
+        FOF_ALLOWUNDO, FOF_NO_UI,
+    };
+    use windows::core::PCWSTR;
+
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+
+        let file_op: IFileOperation = match CoCreateInstance(
+            &windows::Win32::UI::Shell::FileOperation,
+            None,
+            CLSCTX_ALL,
+        ) {
+            Ok(op) => op,
+            Err(_) => { CoUninitialize(); return false; }
+        };
+
+        // Silent: no progress UI, no confirmations, but Undo is supported via Recycle Bin.
+        let flags = FOF_ALLOWUNDO | FOF_NO_UI;
+        if file_op.SetOperationFlags(flags).is_err() {
+            CoUninitialize();
+            return false;
+        }
+
+        let mut any_queued = false;
+        for path in paths {
+            let wide: Vec<u16> = path.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0u16))
+                .collect();
+            let shell_item: Result<IShellItem, _> =
+                SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None);
+            if let Ok(item) = shell_item {
+                if file_op.DeleteItem(&item, None).is_ok() {
+                    any_queued = true;
+                }
+            }
+        }
+
+        let ok = if any_queued {
+            file_op.PerformOperations().is_ok()
+        } else {
+            false
+        };
+
+        CoUninitialize();
+        ok
+    }
+}
+
+#[cfg(not(windows))]
+pub fn delete_to_recycle_bin(_paths: &[PathBuf]) -> bool { false }
+
+/// Use the Windows Restart Manager API to enumerate which processes currently
+/// hold a handle to `path` (i.e. are "locking" it).  Returns a list of
+/// `(pid, display_name)` pairs.  Returns an empty Vec if the file is not
+/// locked or if the API is unavailable.
+#[cfg(windows)]
+pub fn find_locking_processes(path: &Path) -> Vec<(u32, String)> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::System::RestartManager::{
+        RmEndSession, RmGetList, RmRegisterResources, RmStartSession, RM_PROCESS_INFO,
+    };
+    use windows::core::{PCWSTR, PWSTR};
+
+    // CCH_RM_SESSION_KEY = 32 wide chars; +1 for NUL terminator
+    let mut session_key = [0u16; 33];
+    let mut session_handle = 0u32;
+    let mut results = Vec::new();
+
+    let wide_path: Vec<u16> = path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let files = [PCWSTR(wide_path.as_ptr())];
+
+    unsafe {
+        // WIN32_ERROR(0) == ERROR_SUCCESS
+        let rc = RmStartSession(&mut session_handle, 0, PWSTR(session_key.as_mut_ptr()));
+        if rc.0 != 0 {
+            return results;
+        }
+
+        // windows 0.58 uses Option<&[T]> instead of (count, *const T) pairs
+        let rc = RmRegisterResources(
+            session_handle,
+            Some(&files),
+            None,
+            None,
+        );
+
+        if rc.0 == 0 {
+            let mut n_needed = 0u32;
+            let mut n_got    = 0u32;
+            let mut reboot   = 0u32;
+
+            // First call just gets the count; may return ERROR_MORE_DATA (234).
+            let _ = RmGetList(
+                session_handle,
+                &mut n_needed,
+                &mut n_got,
+                None,
+                &mut reboot,
+            );
+
+            if n_needed > 0 {
+                let mut buf: Vec<RM_PROCESS_INFO> = (0..n_needed)
+                    .map(|_| std::mem::zeroed::<RM_PROCESS_INFO>())
+                    .collect();
+                n_got = n_needed;
+
+                let rc2 = RmGetList(
+                    session_handle,
+                    &mut n_needed,
+                    &mut n_got,
+                    Some(buf.as_mut_ptr()),
+                    &mut reboot,
+                );
+                // 0 = ERROR_SUCCESS, 234 = ERROR_MORE_DATA (partial results still usable)
+                if rc2.0 == 0 || rc2.0 == 234 {
+                    for info in &buf[..n_got as usize] {
+                        let pid = info.Process.dwProcessId;
+                        let len = info.strAppName
+                            .iter()
+                            .position(|&c| c == 0)
+                            .unwrap_or(info.strAppName.len());
+                        let name = String::from_utf16_lossy(&info.strAppName[..len]);
+                        results.push((pid, name));
+                    }
+                }
+            }
+        }
+
+        let _ = RmEndSession(session_handle);
+    }
+
+    results
+}
+
+#[cfg(not(windows))]
+pub fn find_locking_processes(_path: &Path) -> Vec<(u32, String)> { Vec::new() }
+
 /// Recursively calculate directory size, sending progressive updates via `tx`.
 /// Returns `false` if cancelled.
 pub fn calculate_dir_size_progressive(
@@ -418,6 +571,30 @@ pub fn spawn_copy_job(sources: Vec<PathBuf>, dest: PathBuf, state: Arc<CopyJobSt
     std::thread::spawn(move || { run_copy_job(sources, dest, &state); });
 }
 
+/// When copying a file/folder into the same directory it already lives in,
+/// generate a unique name by appending " copy", " copy 2", " copy 3", …
+/// For files the suffix is inserted before the extension.
+fn make_copy_path(source: &Path, dest_dir: &Path) -> PathBuf {
+    let stem = source
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let ext = source
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+
+    // First candidate: "name copy.ext"
+    let mut candidate = dest_dir.join(format!("{} copy{}", stem, ext));
+    let mut n = 2u32;
+    while candidate.exists() {
+        candidate = dest_dir.join(format!("{} copy {}{}", stem, n, ext));
+        n += 1;
+    }
+    candidate
+}
+
 fn run_copy_job(sources: Vec<PathBuf>, dest: PathBuf, state: &CopyJobState) {
     let (total_files, total_bytes) = tally_sources(&sources);
     state.files_total.store(total_files, Ordering::Relaxed);
@@ -431,6 +608,16 @@ fn run_copy_job(sources: Vec<PathBuf>, dest: PathBuf, state: &CopyJobState) {
             None => continue,
         };
         let target = dest.join(&file_name);
+
+        // When copying (not moving) into the folder that already contains the
+        // source, we must give the copy a new name instead of overwriting.
+        let target = if !state.is_move
+            && source.parent().map(|p| p == dest).unwrap_or(false)
+        {
+            make_copy_path(source, &dest)
+        } else {
+            target
+        };
 
         // Same-filesystem move: try rename first (fails if target exists on Windows).
         if state.is_move && source != &target {

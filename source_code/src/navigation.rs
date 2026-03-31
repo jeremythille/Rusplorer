@@ -105,6 +105,9 @@ impl RusplorerApp {
         self.file_sizes.clear();
         self.max_file_size = 0;
         self.dirs_done.clear();
+        // Reset type-to-select state so a new folder starts fresh.
+        self.type_select_char = None;
+        self.type_select_index = 0;
 
         // Add parent directory option
         if let Some(parent) = self.current_path.parent() {
@@ -126,7 +129,19 @@ impl RusplorerApp {
                     let path = e.path();
                     let name = e.file_name().to_string_lossy().to_string();
                     let is_dir = path.is_dir();
-                    let modified = e.metadata().ok().and_then(|m| m.modified().ok());
+                    // Use whichever is more recent: modified or created.
+                    // This handles files copied from older sources where the
+                    // creation date can be newer than the modification date.
+                    let modified = e.metadata().ok().and_then(|m| {
+                        let mtime = m.modified().ok();
+                        let ctime = m.created().ok();
+                        match (mtime, ctime) {
+                            (Some(m), Some(c)) => Some(m.max(c)),
+                            (Some(m), None)    => Some(m),
+                            (None,    Some(c)) => Some(c),
+                            (None,    None)    => None,
+                        }
+                    });
                     FileEntry {
                         name,
                         is_dir,
@@ -290,14 +305,15 @@ impl RusplorerApp {
             .map(|(k, v)| (k.to_string_lossy().to_string(), *v))
             .collect();
         self.config.save();
-        let path_snap = self.current_path.clone();
-        self.expand_tree_to(&path_snap);
-        self.save_active_tab();
 
         if self.is_slow_drive(&path) {
+            // Do NOT call expand_tree_to here — it calls read_dir_children which
+            // blocks the main thread while the disk spins up.  Defer it to the
+            // spin-done handler in the update loop.
             self.contents.clear();
             self.cancel_token.store(true, Ordering::SeqCst);
             self.loading_path = Some(path.clone());
+            self.save_active_tab();
             let (tx, rx) = std::sync::mpsc::channel::<bool>();
             self.dir_load_receiver = Some(rx);
             std::thread::spawn(move || {
@@ -305,6 +321,9 @@ impl RusplorerApp {
                 let _ = tx.send(ok);
             });
         } else {
+            let path_snap = self.current_path.clone();
+            self.expand_tree_to(&path_snap);
+            self.save_active_tab();
             self.loading_path = None;
             self.dir_load_receiver = None;
             self.refresh_contents();

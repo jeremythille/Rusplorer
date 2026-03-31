@@ -144,15 +144,22 @@ impl RusplorerApp {
 
         let num_rows = filtered_entries.len();
 
-        let table_builder = TableBuilder::new(ui)
+        // Consume a pending type-to-select scroll request.
+        let scroll_to = self.type_select_scroll.take();
+
+        let mut table_builder = TableBuilder::new(ui)
             .striped(true)
             .resizable(false)
             .vscroll(true)
             .drag_to_scroll(false)
+            .max_scroll_height(f32::INFINITY)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::exact(name_col_w).clip(true))
             .column(Column::exact(size_col_w))
             .column(Column::exact(date_col_w));
+        if let Some(row) = scroll_to {
+            table_builder = table_builder.scroll_to_row(row, Some(egui::Align::Center));
+        }
 
         table_builder
             .header(row_height, |mut header| {
@@ -228,7 +235,7 @@ impl RusplorerApp {
                             } else {
                                 ""
                             };
-                            let text = format!("Modified{}", arrow);
+                            let text = format!("Date{}", arrow);
                             if ui
                                 .add_sized(
                                     egui::vec2(ui.available_width(), ui.available_height()),
@@ -248,7 +255,7 @@ impl RusplorerApp {
                     } else {
                         if ui
                             .small_button("📅")
-                            .on_hover_text("Show modification date")
+                            .on_hover_text("Show date column")
                             .clicked()
                         {
                             self.show_date_columns
@@ -357,6 +364,15 @@ impl RusplorerApp {
 
                             let button = button.sense(egui::Sense::click_and_drag());
                             let response = ui.horizontal(|ui| ui.add(button)).inner;
+
+                            // Show the full name in a tooltip when the name was truncated.
+                            if display_name != entry.name && response.hovered() {
+                                egui::show_tooltip_text(
+                                    ui.ctx(),
+                                    egui::Id::new("name_tooltip").with(&entry.name),
+                                    &entry.name,
+                                );
+                            }
 
                             self.entry_rects.insert(entry.name.clone(), response.rect);
                             // Use direct cursor-rect check so hover works even during drag

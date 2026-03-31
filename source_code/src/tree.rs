@@ -152,7 +152,12 @@ pub fn render_tree_node(
             expanded.remove(path);
         } else {
             expanded.insert(path.clone());
-            if !children_cache.contains_key(path) {
+            // Skip blocking read_dir_children for drive-root nodes (depth 0) that
+            // are not the current path — they may be on idle HDDs/USB drives that
+            // would freeze the main thread.  Navigation triggers expand_tree_to
+            // which populates the cache after the drive has spun up.
+            let skip_eager_read = depth == 0 && !is_current;
+            if !skip_eager_read && !children_cache.contains_key(path) {
                 let children = read_dir_children(path);
                 children_cache.insert(path.clone(), children);
             }

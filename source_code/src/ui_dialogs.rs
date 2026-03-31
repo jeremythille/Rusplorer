@@ -8,8 +8,6 @@ use std::ffi::OsStr;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
-use winapi::um::shellapi::{FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, SHFILEOPSTRUCTW, SHFileOperationW};
-#[cfg(windows)]
 use crate::shortcuts::create_lnk_shortcut;
 
 impl RusplorerApp {
@@ -166,6 +164,16 @@ impl RusplorerApp {
                 if is_ps1 {
                     labels.push("▶ Run in PowerShell");
                 }
+                let is_font = !entry.is_dir && full_path.extension()
+                    .map(|e| { let e = e.to_ascii_lowercase(); e == "ttf" || e == "otf" || e == "ttc" })
+                    .unwrap_or(false);
+                if is_font {
+                    labels.push("Install font");
+                }
+                if !entry.is_dir {
+                    labels.push("Open with\u{2026}");
+                    labels.push("\u{1F513} Unlock\u{2026}");
+                }
                 if Self::is_archive(&full_path) {
                     labels.push(extract_label.as_str());
                 }
@@ -200,6 +208,33 @@ impl RusplorerApp {
                             ui.set_min_width(menu_w);
                             ui.style_mut().spacing.button_padding = egui::vec2(4.0, 2.0);
 
+                            // Open with… (all files)
+                            if !entry.is_dir
+                                && ui.add_sized([menu_w, 0.0], egui::Button::new("Open with\u{2026}")).clicked()
+                            {
+                                #[cfg(windows)]
+                                {
+                                    use winapi::um::shellapi::{ShellExecuteExW, SHELLEXECUTEINFOW, SEE_MASK_INVOKEIDLIST};
+                                    use winapi::um::winuser::SW_SHOW;
+                                    let verb: Vec<u16> = OsStr::new("openwith")
+                                        .encode_wide().chain(std::iter::once(0)).collect();
+                                    let file: Vec<u16> = OsStr::new(full_path.to_str().unwrap_or(""))
+                                        .encode_wide().chain(std::iter::once(0)).collect();
+                                    unsafe {
+                                        let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
+                                        info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+                                        info.fMask = SEE_MASK_INVOKEIDLIST;
+                                        info.lpVerb = verb.as_ptr();
+                                        info.lpFile = file.as_ptr();
+                                        info.nShow = SW_SHOW as i32;
+                                        ShellExecuteExW(&mut info);
+                                    }
+                                }
+                                self.show_context_menu = false;
+                                self.context_menu_tree_path = None;
+                                self.context_menu_tree_highlight = None;
+                            }
+
                             // Open with VS Code
                             if (entry.is_dir || Self::is_code_file(&full_path))
                                 && ui.add_sized([menu_w, 0.0], egui::Button::new("Open with VS Code")).clicked()
@@ -225,6 +260,45 @@ impl RusplorerApp {
                                            full_path.to_string_lossy().as_ref()])
                                     .spawn();
                                 self.show_context_menu = false;
+                                self.context_menu_tree_highlight = None;
+                            }
+
+                            // Install font (.ttf / .otf / .ttc)
+                            if is_font
+                                && ui.add_sized([menu_w, 0.0], egui::Button::new("Install font")).clicked()
+                            {
+                                #[cfg(windows)]
+                                {
+                                    use winapi::um::shellapi::{ShellExecuteExW, SHELLEXECUTEINFOW, SEE_MASK_INVOKEIDLIST};
+                                    use winapi::um::winuser::SW_SHOW;
+                                    let verb: Vec<u16> = OsStr::new("install")
+                                        .encode_wide().chain(std::iter::once(0)).collect();
+                                    let file: Vec<u16> = OsStr::new(full_path.to_str().unwrap_or(""))
+                                        .encode_wide().chain(std::iter::once(0)).collect();
+                                    unsafe {
+                                        let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
+                                        info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+                                        info.fMask = SEE_MASK_INVOKEIDLIST;
+                                        info.lpVerb = verb.as_ptr();
+                                        info.lpFile = file.as_ptr();
+                                        info.nShow = SW_SHOW as i32;
+                                        ShellExecuteExW(&mut info);
+                                    }
+                                }
+                                self.show_context_menu = false;
+                                self.context_menu_tree_path = None;
+                                self.context_menu_tree_highlight = None;
+                            }
+
+                            // Unlock (files only) — find & kill locking processes
+                            if !entry.is_dir
+                                && ui.add_sized([menu_w, 0.0], egui::Button::new("\u{1F513} Unlock\u{2026}")).clicked()
+                            {
+                                self.unlock_dialog_path = Some(full_path.clone());
+                                self.unlock_locking_processes = crate::fs_ops::find_locking_processes(&full_path);
+                                self.show_unlock_dialog = true;
+                                self.show_context_menu = false;
+                                self.context_menu_tree_path = None;
                                 self.context_menu_tree_highlight = None;
                             }
 
@@ -345,35 +419,10 @@ impl RusplorerApp {
 
                 // Process pending delete (set inside closure; executed out here to avoid &mut self conflict)
                 if !pending_delete.is_empty() {
-                    #[cfg(windows)]
-                    {
-                        let mut path_buffer: Vec<u16> = Vec::new();
-                        for path in &pending_delete {
-                            let wide: Vec<u16> = OsStr::new(path.to_str().unwrap_or(""))
-                                .encode_wide()
-                                .chain(std::iter::once(0u16))
-                                .collect();
-                            path_buffer.extend_from_slice(&wide);
-                        }
-                        path_buffer.push(0u16);
-                        unsafe {
-                            let mut file_op = SHFILEOPSTRUCTW {
-                                hwnd: std::ptr::null_mut(),
-                                wFunc: FO_DELETE as u32,
-                                pFrom: path_buffer.as_ptr(),
-                                pTo: std::ptr::null(),
-                                fFlags: FOF_ALLOWUNDO | FOF_NOCONFIRMATION,
-                                fAnyOperationsAborted: 0,
-                                hNameMappings: std::ptr::null_mut(),
-                                lpszProgressTitle: std::ptr::null(),
-                            };
-                            let result = SHFileOperationW(&mut file_op);
-                            if result == 0 {
-                                self.last_deleted_paths = pending_delete;
-                                self.selected_entries.clear();
-                                self.refresh_contents();
-                            }
-                        }
+                    if crate::fs_ops::delete_to_recycle_bin(&pending_delete) {
+                        self.last_deleted_paths = pending_delete;
+                        self.selected_entries.clear();
+                        self.refresh_contents();
                     }
                 }
             }
@@ -623,7 +672,7 @@ impl RusplorerApp {
         // ── Modal backdrop ────────────────────────────────────────────────
         if self.show_rename_dialog || self.show_new_item_dialog
             || self.show_archive_dialog || self.show_extract_dialog
-            || self.show_save_session_dialog
+            || self.show_save_session_dialog || self.show_unlock_dialog
         {
             let painter = ctx.layer_painter(egui::LayerId::new(
                 egui::Order::PanelResizeLine,
@@ -784,6 +833,81 @@ impl RusplorerApp {
                             .color(egui::Color32::WHITE).size(12.0));
                     });
                 });
+        }
+
+        // ── Unlock file dialog ────────────────────────────────────────────
+        if self.show_unlock_dialog {
+            let path_str = self.unlock_dialog_path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+
+            let mut close_dialog = false;
+            let mut kill_and_unlock = false;
+
+            egui::Window::new("\u{1F513} Unlock file")
+                .collapsible(false)
+                .resizable(false)
+                .min_width(300.0)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label(format!("File: {}", path_str));
+                    ui.add_space(6.0);
+
+                    if self.unlock_locking_processes.is_empty() {
+                        ui.label("\u{2705} This file is not currently locked.");
+                        ui.add_space(4.0);
+                        if ui.button("Close").clicked()
+                            || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                        {
+                            close_dialog = true;
+                        }
+                    } else {
+                        ui.label("Locked by:");
+                        for (pid, name) in &self.unlock_locking_processes {
+                            ui.label(format!("  \u{2022} {} (PID {})", name, pid));
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button(egui::RichText::new("Kill all & Unlock")
+                                .color(egui::Color32::from_rgb(220, 50, 50))).clicked()
+                            {
+                                kill_and_unlock = true;
+                                close_dialog = true;
+                            }
+                            if ui.button("Cancel").clicked()
+                                || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                            {
+                                close_dialog = true;
+                            }
+                        });
+                    }
+                });
+
+            if kill_and_unlock {
+                #[cfg(windows)]
+                {
+                    use winapi::um::processthreadsapi::{OpenProcess, TerminateProcess};
+                    use winapi::um::handleapi::CloseHandle;
+                    use winapi::um::winnt::PROCESS_TERMINATE;
+                    for (pid, _) in &self.unlock_locking_processes {
+                        unsafe {
+                            let handle = OpenProcess(PROCESS_TERMINATE, 0, *pid);
+                            if !handle.is_null() {
+                                TerminateProcess(handle, 1);
+                                CloseHandle(handle);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if close_dialog {
+                self.show_unlock_dialog = false;
+                self.unlock_dialog_path = None;
+                self.unlock_locking_processes.clear();
+            }
         }
     }
 }

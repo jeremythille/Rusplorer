@@ -12,12 +12,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 
 #[cfg(windows)]
-use std::ffi::OsStr;
-#[cfg(windows)]
-use std::os::windows::ffi::OsStrExt;
-#[cfg(windows)]
-use winapi::um::shellapi::{FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, SHFILEOPSTRUCTW, SHFileOperationW};
-#[cfg(windows)]
 use winapi::um::winuser::GetAsyncKeyState;
 
 mod clipboard;
@@ -369,6 +363,15 @@ struct RusplorerApp {
     last_window_pos:  Option<[f32; 2]>,
     last_window_size: Option<[f32; 2]>,
     last_window_geo_check: std::time::Instant,
+    /// Type-to-select: last pressed letter and which match index we are on.
+    type_select_char: Option<char>,
+    type_select_index: usize,
+    /// Row to scroll to in the next render_file_list call (consumed after use).
+    type_select_scroll: Option<usize>,
+    /// Unlock-file dialog.
+    show_unlock_dialog: bool,
+    unlock_dialog_path: Option<PathBuf>,
+    unlock_locking_processes: Vec<(u32, String)>,
 }
 
 impl Default for RusplorerApp {
@@ -536,6 +539,12 @@ impl RusplorerApp {
             last_window_pos:  None,
             last_window_size: None,
             last_window_geo_check: std::time::Instant::now(),
+            type_select_char: None,
+            type_select_index: 0,
+            type_select_scroll: None,
+            show_unlock_dialog: false,
+            unlock_dialog_path: None,
+            unlock_locking_processes: Vec::new(),
         };
 
         // Initialise tabs ï¿½ from session if provided, then config, then single default
@@ -921,15 +930,18 @@ impl eframe::App for RusplorerApp {
             self.loading_path = None;
             self.dir_load_receiver = None;
             if accessible {
-                // Drive is now spinning ï¿½ read_dir will be fast.
+                // Drive is now spinning — expand the tree and list the directory.
+                let path_snap = self.current_path.clone();
+                self.expand_tree_to(&path_snap);
                 self.refresh_contents();
                 self.start_file_watcher();
             }
             // If not accessible (e.g. drive removed), leave the empty listing.
             ctx.request_repaint();
         }
-        // Keep repainting while we are waiting so the spinner animates.
+        // Keep repainting and show wait cursor while we are waiting for spin-up.
         if self.loading_path.is_some() {
+            ctx.set_cursor_icon(egui::CursorIcon::Progress);
             ctx.request_repaint();
         }
 
@@ -987,7 +999,61 @@ impl eframe::App for RusplorerApp {
             || self.show_new_item_dialog
             || self.show_archive_dialog
             || self.show_extract_dialog
-            || self.show_save_session_dialog;
+            || self.show_save_session_dialog
+            || self.show_unlock_dialog;
+
+        // Type-to-select: pressing a letter jumps to the next entry starting with that letter.
+        // Ignored when a modal is open, when Ctrl/Alt is held, or when the filter box is focused.
+        if !any_modal_open {
+            let filter_focused = ctx.memory(|m| {
+                m.focused().map_or(false, |id| {
+                    // The filter TextEdit widget gets an id derived from its rect/position;
+                    // we detect focus by checking if any text-editing widget is active.
+                    ctx.memory(|m2| m2.has_focus(id))
+                })
+            });
+            let typed_char: Option<char> = ctx.input(|i| {
+                if i.modifiers.ctrl || i.modifiers.alt || i.modifiers.command {
+                    return None;
+                }
+                i.events.iter().find_map(|e| {
+                    if let egui::Event::Text(s) = e {
+                        let c = s.chars().next()?;
+                        if c.is_alphabetic() { Some(c.to_ascii_lowercase()) } else { None }
+                    } else {
+                        None
+                    }
+                })
+            });
+            if !filter_focused {
+                if let Some(ch) = typed_char {
+                    // Collect indices of matching entries (skip "[..]")
+                    let matches: Vec<usize> = self.contents
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, e)| {
+                            !e.name.starts_with("[..]")
+                                && e.name.to_ascii_lowercase().starts_with(ch)
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    if !matches.is_empty() {
+                        // Advance to next match if same letter pressed again
+                        let next_idx = if self.type_select_char == Some(ch) {
+                            (self.type_select_index + 1) % matches.len()
+                        } else {
+                            0
+                        };
+                        let row = matches[next_idx];
+                        self.type_select_char = Some(ch);
+                        self.type_select_index = next_idx;
+                        self.selected_entries.clear();
+                        self.selected_entries.insert(self.contents[row].name.clone());
+                        self.type_select_scroll = Some(row);
+                    }
+                }
+            }
+        }
 
         // Handle Ctrl+A to select all
         if !any_modal_open && ctx.input(|i| i.key_pressed(egui::Key::A) && i.modifiers.ctrl) {
@@ -1048,7 +1114,7 @@ impl eframe::App for RusplorerApp {
                 // reports global key state.
                 let dialog_open = self.show_rename_dialog || self.show_new_item_dialog
                     || self.show_archive_dialog || self.show_extract_dialog
-                    || self.show_save_session_dialog;
+                    || self.show_save_session_dialog || self.show_unlock_dialog;
                 let really_focused = self.is_focused && {
                     match find_own_hwnd() {
                         Some(hwnd) => unsafe {
@@ -1210,38 +1276,10 @@ impl eframe::App for RusplorerApp {
                 .map(|name| self.current_path.join(name))
                 .collect();
 
-            #[cfg(windows)]
-            {
-                // Build double-null-terminated wide string list
-                let mut path_buffer: Vec<u16> = Vec::new();
-                for path in &files_to_delete {
-                    let wide: Vec<u16> = OsStr::new(path.to_str().unwrap())
-                        .encode_wide()
-                        .chain(std::iter::once(0u16))
-                        .collect();
-                    path_buffer.extend_from_slice(&wide);
-                }
-                path_buffer.push(0u16); // Final null terminator
-
-                unsafe {
-                    let mut file_op = SHFILEOPSTRUCTW {
-                        hwnd: std::ptr::null_mut(),
-                        wFunc: FO_DELETE as u32,
-                        pFrom: path_buffer.as_ptr(),
-                        pTo: std::ptr::null(),
-                        fFlags: FOF_ALLOWUNDO | FOF_NOCONFIRMATION,
-                        fAnyOperationsAborted: 0,
-                        hNameMappings: std::ptr::null_mut(),
-                        lpszProgressTitle: std::ptr::null(),
-                    };
-
-                    let result = SHFileOperationW(&mut file_op);
-                    if result == 0 {
-                        self.last_deleted_paths = files_to_delete.clone();
-                        self.selected_entries.clear();
-                        self.refresh_contents();
-                    }
-                }
+            if crate::fs_ops::delete_to_recycle_bin(&files_to_delete) {
+                self.last_deleted_paths = files_to_delete;
+                self.selected_entries.clear();
+                self.refresh_contents();
             }
         }
 
@@ -2254,13 +2292,13 @@ impl eframe::App for RusplorerApp {
             if self.loading_path.is_some() {
                 let t = ctx.input(|i| i.time);
                 // Simple 8-frame braille spinner that cycles at ~4 fps
-                let spinners = ["?","?","?","?","?","?","?","?"];
+                let spinners = ["|", "/", "—", "\\", "|", "/", "—", "\\"];
                 let frame = ((t * 8.0) as usize) % spinners.len();
                 let spinner = spinners[frame];
                 ui.add_space(50.0);
                 ui.vertical_centered(|ui| {
                     ui.label(
-                        egui::RichText::new(format!("{} Spinning upï¿½", spinner))
+                        egui::RichText::new(format!("{} Spinning up…", spinner))
                             .color(egui::Color32::from_gray(210))
                             .size(15.0),
                     );
@@ -2272,7 +2310,7 @@ impl eframe::App for RusplorerApp {
                         })
                         .unwrap_or_default();
                     ui.label(
-                        egui::RichText::new(format!("Waiting for {}  to respondï¿½", drive))
+                        egui::RichText::new(format!("Waiting for {}  to respond…", drive))
                             .color(egui::Color32::from_gray(130))
                             .size(11.0),
                     );
