@@ -97,7 +97,8 @@ UNICODE_RANGES = ",".join([
 # fmt: on
 
 OPTIONS = [
-    "--layout-features=*",      # keep all OpenType features (kerning, ligatures)
+    "--layout-features=",       # drop ALL OpenType features (ligatures, alternates, etc.)
+                                # a file explorer needs zero GSUB/GPOS magic
     "--glyph-names",            # keep glyph names (helps debugging)
     "--notdef-outline",         # keep .notdef (missing-char box)
     "--no-hinting",             # strip hinting — rendering engine handles it

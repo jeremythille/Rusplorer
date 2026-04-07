@@ -56,20 +56,10 @@ pub fn run_app() -> Result<(), eframe::Error> {
         .map(|name| name.contains("dev"))
         .unwrap_or(false);
 
-    // Format the current local date/time as "YYYY-MM-DD HH:MM".
-    let now_str = {
-        let mut st = winapi::um::minwinbase::SYSTEMTIME {
-            wYear: 0, wMonth: 0, wDayOfWeek: 0, wDay: 0,
-            wHour: 0, wMinute: 0, wSecond: 0, wMilliseconds: 0,
-        };
-        unsafe { winapi::um::sysinfoapi::GetLocalTime(&mut st) };
-        format!("{:04}-{:02}-{:02} {:02}:{:02}",
-            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute)
-    };
     let window_title = if is_dev {
-        format!("Rusplorer (dev) ({})", now_str)
+        concat!("Rusplorer (dev) (", env!("BUILD_TIMESTAMP"), ")")
     } else {
-        format!("Rusplorer ({})", now_str)
+        concat!("Rusplorer (", env!("BUILD_TIMESTAMP"), ")")
     };
 
     // 1. Try wgpu with primary backends (DX12 / Vulkan).
