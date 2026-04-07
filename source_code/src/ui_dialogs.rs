@@ -214,21 +214,11 @@ impl RusplorerApp {
                             {
                                 #[cfg(windows)]
                                 {
-                                    use winapi::um::shellapi::{ShellExecuteExW, SHELLEXECUTEINFOW, SEE_MASK_INVOKEIDLIST};
-                                    use winapi::um::winuser::SW_SHOW;
-                                    let verb: Vec<u16> = OsStr::new("openwith")
-                                        .encode_wide().chain(std::iter::once(0)).collect();
-                                    let file: Vec<u16> = OsStr::new(full_path.to_str().unwrap_or(""))
-                                        .encode_wide().chain(std::iter::once(0)).collect();
-                                    unsafe {
-                                        let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
-                                        info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-                                        info.fMask = SEE_MASK_INVOKEIDLIST;
-                                        info.lpVerb = verb.as_ptr();
-                                        info.lpFile = file.as_ptr();
-                                        info.nShow = SW_SHOW as i32;
-                                        ShellExecuteExW(&mut info);
-                                    }
+                                    // rundll32 OpenAs_RunDLL always shows the picker,
+                                    // even when the file has no registered association.
+                                    let _ = std::process::Command::new("rundll32.exe")
+                                        .args(["shell32.dll,OpenAs_RunDLL", full_path.to_string_lossy().as_ref()])
+                                        .spawn();
                                 }
                                 self.show_context_menu = false;
                                 self.context_menu_tree_path = None;
@@ -709,10 +699,15 @@ impl RusplorerApp {
                                 let target = self.current_path.join(&name);
                                 if self.new_item_is_dir {
                                     let _ = std::fs::create_dir(&target);
+                                    // Invalidate tree cache so the new folder appears in the tree
+                                    self.tree_children_cache.remove(&self.current_path);
                                 } else {
                                     let _ = std::fs::File::create(&target);
                                 }
                                 self.refresh_contents();
+                                // Select the newly created item
+                                self.selected_entries.clear();
+                                self.selected_entries.insert(name);
                             }
                             close_dialog = true;
                         }
