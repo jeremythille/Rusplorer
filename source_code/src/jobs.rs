@@ -118,53 +118,28 @@ impl RusplorerApp {
     }
 
     pub(crate) fn process_file_changes(&mut self) {
-        let mut needs_refresh = false;
-
+        // Drain all watcher events without making any filesystem calls (which would
+        // block the UI thread during large copies).  Any event for the current
+        // directory simply marks that a debounced refresh is needed; the actual
+        // disk I/O happens later in flush_watch_debounce → refresh_contents.
         if let Some(ref rx) = self.watch_receiver {
             while let Ok(path) = rx.try_recv() {
-                if let Some(parent) = path.parent() {
-                    if parent == self.current_path {
-                        let file_name = path
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string();
-                        let exists_in_list = self.contents.iter().any(|e| e.name == file_name);
-                        let exists_on_disk = path.exists();
-
-                        if (exists_on_disk && !exists_in_list) || (!exists_on_disk && exists_in_list) {
-                            needs_refresh = true;
-                        } else if exists_on_disk && !path.is_dir() {
-                            if let Ok(metadata) = path.metadata() {
-                                let size = metadata.len();
-                                let modified = metadata.modified().ok();
-                                // Update size in the size map
-                                self.file_sizes.insert(path.clone(), size);
-                                if size > self.max_file_size {
-                                    self.max_file_size = size;
-                                }
-                                // Update the modified timestamp in the contents list so the
-                                // date column reflects the change immediately
-                                for entry in &mut self.contents {
-                                    if entry.name == file_name {
-                                        entry.modified = modified;
-                                        break;
-                                    }
-                                }
-                                // Evict stale thumbnail so it is reloaded on the next render
-                                self.thumb_cache.remove(&path);
-                                self.thumb_loading.remove(&path);
-                            }
-                        }
-                    }
+                if path.parent().map_or(false, |p| p == self.current_path) {
+                    self.watch_pending_refresh = Some(std::time::Instant::now());
                 }
             }
         }
+    }
 
-        if needs_refresh {
-            self.refresh_contents();
-            let updated_children = read_dir_children(&self.current_path.clone());
-            self.tree_children_cache.insert(self.current_path.clone(), updated_children);
+    /// Call each frame: fires the debounced file-watcher refresh after 500 ms of quiet.
+    pub(crate) fn flush_watch_debounce(&mut self) {
+        if let Some(t) = self.watch_pending_refresh {
+            if t.elapsed().as_millis() >= 500 {
+                self.watch_pending_refresh = None;
+                self.refresh_contents();
+                let updated_children = read_dir_children(&self.current_path.clone());
+                self.tree_children_cache.insert(self.current_path.clone(), updated_children);
+            }
         }
     }
 

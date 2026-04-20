@@ -210,6 +210,9 @@ struct RusplorerApp {
     file_watcher: Option<notify::RecommendedWatcher>,
     watch_receiver: Option<Receiver<PathBuf>>,
     stop_watcher: Option<Sender<()>>,
+    /// When Some, a file-system event arrived. We delay the actual refresh
+    /// until this instant is >500 ms in the past (debounce).
+    watch_pending_refresh: Option<std::time::Instant>,
     show_context_menu: bool,
     context_menu_entry: Option<FileEntry>,
     /// When the context menu was opened from the tree panel, holds the full path
@@ -223,6 +226,8 @@ struct RusplorerApp {
     /// Used by menu actions so that a click-through to the table can't clobber the selection.
     context_menu_selection: Vec<PathBuf>,
     show_rename_dialog: bool,
+    /// When true the rename dialog creates a new folder instead of renaming.
+    new_folder_mode: bool,
     rename_buffer: String,
     /// The file extension (e.g. ".txt") stored separately while renaming.
     rename_ext: String,
@@ -427,6 +432,7 @@ impl RusplorerApp {
             file_watcher: None,
             watch_receiver: None,
             stop_watcher: None,
+            watch_pending_refresh: None,
             show_context_menu: false,
             context_menu_entry: None,
             context_menu_tree_path: None,
@@ -435,6 +441,7 @@ impl RusplorerApp {
             context_menu_size: egui::vec2(100.0, 100.0),
             context_menu_selection: Vec::new(),
             show_rename_dialog: false,
+            new_folder_mode: false,
             rename_buffer: String::new(),
             rename_ext: String::new(),
             rename_show_ext: false,
@@ -769,6 +776,10 @@ impl eframe::App for RusplorerApp {
 
         // Process any file system changes detected by watcher
         self.process_file_changes();
+        self.flush_watch_debounce();
+        if self.watch_pending_refresh.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
 
         // Track window focus and pause/resume background work
         let is_focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
@@ -988,7 +999,6 @@ impl eframe::App for RusplorerApp {
         let any_modal_open = self.show_rename_dialog
             || self.show_new_item_dialog
             || self.show_archive_dialog
-            || self.show_extract_dialog
             || self.show_save_session_dialog
             || self.show_unlock_dialog;
 
@@ -1103,7 +1113,7 @@ impl eframe::App for RusplorerApp {
                 // the user presses shortcuts in another window while GetAsyncKeyState
                 // reports global key state.
                 let dialog_open = self.show_rename_dialog || self.show_new_item_dialog
-                    || self.show_archive_dialog || self.show_extract_dialog
+                    || self.show_archive_dialog
                     || self.show_save_session_dialog || self.show_unlock_dialog;
                 let really_focused = self.is_focused && {
                     match find_own_hwnd() {
@@ -1464,12 +1474,12 @@ impl eframe::App for RusplorerApp {
 
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 // Abort button
-                                if ui.small_button("? Abort").clicked() {
+                                if ui.small_button("Abort").clicked() {
                                     job.cancelled.store(true, Ordering::SeqCst);
                                 }
                                 // Pause / Resume
                                 let paused = job.paused.load(Ordering::Relaxed);
-                                let pause_label = if paused { "? Resume" } else { "? Pause" };
+                                let pause_label = if paused { "Resume" } else { "Pause" };
                                 if ui.small_button(pause_label).clicked() {
                                     job.paused.store(!paused, Ordering::SeqCst);
                                 }
@@ -1488,10 +1498,26 @@ impl eframe::App for RusplorerApp {
                         // Per-file + overall progress bars
                         if bytes_total > 0 {
                             let fraction = bytes_done as f32 / bytes_total as f32;
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            let started_at_ms = job.started_at_ms.load(Ordering::Relaxed);
+                            let elapsed_s = if started_at_ms > 0 && now_ms > started_at_ms {
+                                (now_ms - started_at_ms) as f64 / 1000.0
+                            } else {
+                                0.0
+                            };
+                            let speed_mbps = if elapsed_s > 0.0 {
+                                (bytes_done as f64 / (1024.0 * 1024.0)) / elapsed_s
+                            } else {
+                                0.0
+                            };
                             let bar_text = format!(
-                                "{} / {}",
+                                "{} / {}  ({:.1} MB/s)",
                                 Self::format_bytes(bytes_done),
                                 Self::format_bytes(bytes_total),
+                                speed_mbps,
                             );
                             ui.add(
                                 egui::ProgressBar::new(fraction)
@@ -1530,13 +1556,13 @@ impl eframe::App for RusplorerApp {
                         ui.horizontal(|ui| {
                             ui.label(
                                 egui::RichText::new(
-                                    format!("\u{23f3} Queued: {op} {n} {noun} ? {dest_str}")
+                                    format!("Queued: {op} {n} {noun} -> {dest_str}")
                                 )
                                 .small()
                                 .color(egui::Color32::from_rgb(160, 160, 160))
                             );
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("? Cancel").clicked() {
+                                if ui.small_button("Cancel").clicked() {
                                     state.cancelled.store(true, Ordering::SeqCst);
                                 }
                             });
@@ -1592,7 +1618,7 @@ impl eframe::App for RusplorerApp {
                     "Skip this file",
                     "Overwrite all if different",
                     "Skip all with same name",
-                    "?  Abort",
+                    "Abort",
                 ];
                 let font_id = egui::TextStyle::Button.resolve(&ctx.style());
                 let btn_w = btn_labels.iter()
@@ -1646,7 +1672,7 @@ impl eframe::App for RusplorerApp {
                         ui.separator();
                         ui.add_space(2.0);
                         if ui.add_sized([btn_w, 0.0],
-                            egui::Button::new(egui::RichText::new("?  Abort").color(egui::Color32::from_rgb(210, 80, 80)))
+                            egui::Button::new(egui::RichText::new("Abort").color(egui::Color32::from_rgb(210, 80, 80)))
                         ).clicked() {
                             answer = Some(ConflictChoice::Abort);
                         }
@@ -1696,7 +1722,7 @@ impl eframe::App for RusplorerApp {
                         let is_active = i == self.active_tab;
                         let label_text = self.tabs[i].label();
                         let display = if label_text.len() > 20 {
-                            format!("{}ï¿½", &label_text[..19])
+                            format!("{}…", &label_text[..19])
                         } else {
                             label_text.clone()
                         };
@@ -2537,43 +2563,51 @@ impl eframe::App for RusplorerApp {
                             .map_or(false, |pos| i.screen_rect().contains(pos))
                     });
 
-                    // If releasing over a tab, use that tab's folder as the drop destination
+                    // If releasing over a tab, treat this as a tab-bar gesture,
+                    // not as a filesystem move target.
                     let drop_tab_idx = ctx.input(|i| i.pointer.latest_pos().or(i.pointer.hover_pos()))
                         .and_then(|pos| {
                             self.dnd_tab_rects.iter().enumerate()
                                 .find_map(|(i, r)| if r.contains(pos) { Some(i) } else { None })
                         });
-                    if let Some(tab_idx) = drop_tab_idx {
-                        self.dnd_drop_target = Some(self.tabs[tab_idx].path.clone());
-                    }
+                    let all_sources: Vec<PathBuf> = self.dnd_sources.iter().cloned().collect();
 
-                    // Fallback: if no specific folder target, use current directory
-                    let dest = self.dnd_drop_target.take()
-                        .filter(|d| d.is_dir())
-                        .unwrap_or_else(|| self.current_path.clone());
-
-                    let sources: Vec<PathBuf> = self.dnd_sources
-                        .iter()
-                        .filter(|s| **s != dest)
-                        .cloned()
-                        .collect();
-
-                    if !sources.is_empty() && cursor_inside {
-                        if self.dnd_is_right_click {
-                            // Right-click drop: open the move/copy/shortcut menu
-                            // Use latest pointer position (may be over the tree panel)
-                            let drop_pos = ctx.input(|i|
-                                i.pointer.latest_pos().or(i.pointer.hover_pos()).unwrap_or_default()
-                            );
-                            self.dnd_right_drop_menu = Some((sources, dest, drop_pos));
-                        } else {
-                            // Left-click drop: always move
-                            self.start_copy_job(sources, dest.clone(), true, false);
-                            self.selected_entries.clear();
-                            // Switch to destination tab so user sees where the files landed
-                            if let Some(tab_idx) = drop_tab_idx {
-                                self.switch_to_tab(tab_idx);
+                    if cursor_inside {
+                        if drop_tab_idx.is_some() {
+                            // Safety rule: dropping on the tab bar must never move/delete files.
+                            // If exactly one folder is dropped with left button, open it in a new tab.
+                            if !self.dnd_is_right_click
+                                && all_sources.len() == 1
+                                && all_sources[0].is_dir()
+                            {
+                                self.new_tab(Some(all_sources[0].clone()));
                                 self.tab_scroll_to_active = true;
+                            }
+                        } else {
+                            // Normal in-content drop: use detected folder target, or current directory.
+                            let dest = self.dnd_drop_target.take()
+                                .filter(|d| d.is_dir())
+                                .unwrap_or_else(|| self.current_path.clone());
+
+                            let sources: Vec<PathBuf> = self.dnd_sources
+                                .iter()
+                                .filter(|s| **s != dest)
+                                .cloned()
+                                .collect();
+
+                            if !sources.is_empty() {
+                                if self.dnd_is_right_click {
+                                    // Right-click drop: open the move/copy/shortcut menu
+                                    // Use latest pointer position (may be over the tree panel)
+                                    let drop_pos = ctx.input(|i|
+                                        i.pointer.latest_pos().or(i.pointer.hover_pos()).unwrap_or_default()
+                                    );
+                                    self.dnd_right_drop_menu = Some((sources, dest, drop_pos));
+                                } else {
+                                    // Left-click drop: always move
+                                    self.start_copy_job(sources, dest.clone(), true, false);
+                                    self.selected_entries.clear();
+                                }
                             }
                         }
                     }
@@ -2669,6 +2703,7 @@ impl eframe::App for RusplorerApp {
         }
     }
 }
+
 
 
 

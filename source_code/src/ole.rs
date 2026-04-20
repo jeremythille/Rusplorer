@@ -464,23 +464,9 @@ pub fn register_ole_drop_target(
             pdweffect: *mut DROPEFFECT,
         ) -> windows::core::Result<()> {
             self.last_key_state.set(grfkeystate.0);
-            // If this drag originated from another Rusplorer window, refuse it so
-            // the underlying application (e.g. Affinity) can receive the drop.
-            if let Some(obj) = pdataobj {
-                let fmt = FORMATETC {
-                    cfFormat: rusplorer_source_drag_format(),
-                    ptd: std::ptr::null_mut(),
-                    dwAspect: 1,
-                    lindex: -1,
-                    tymed: TYMED_HGLOBAL.0 as u32,
-                };
-                if unsafe { obj.QueryGetData(&fmt) == S_OK } {
-                    log_dnd("DragEnter: refusing drop from another Rusplorer (RusplorerDragSource format found)");
-                    self.refused_drag.set(true);
-                    unsafe { *pdweffect = DROPEFFECT_NONE; }
-                    return Ok(());
-                }
-            }
+            // Note: we no longer refuse Rusplorer-originated drags here.
+            // Cross-window Rusplorer moves/copies are handled by accepting the
+            // OLE drop and routing through the normal copy-job engine.
             // Detect right-button drag via multiple signals:
             // 1. Custom clipboard format (reliable across processes)
             // 2. grfkeystate from OLE (may miss MK_RBUTTON in some cases)
@@ -565,12 +551,7 @@ pub fn register_ole_drop_target(
         ) -> windows::core::Result<()> {
             unsafe {
                 *pdweffect = DROPEFFECT_NONE;
-                // If this drag was refused in DragEnter (came from another Rusplorer), ignore it.
-                if self.refused_drag.get() {
-                    self.refused_drag.set(false);
-                    log_dnd("Drop: refusing (Rusplorer source drag)");
-                    return Ok(());
-                }
+                // (Cross-Rusplorer drops are now accepted and handled normally.)
                 let obj = match pdataobj { Some(o) => o, None => return Ok(()) };
                 let fmt = FORMATETC {
                     cfFormat: CF_HDROP_RAW,

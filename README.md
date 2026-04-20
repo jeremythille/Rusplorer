@@ -1,6 +1,6 @@
 # Rusplorer 🚀
 
-A lightweight, blazingly-fast file explorer written in Rust / egui for Windows.
+A lightweight, robust, blazingly-fast file explorer written in Rust / egui for Windows.
 
 <div align="center">
 

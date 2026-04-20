@@ -132,7 +132,7 @@ impl RusplorerApp {
 
         // Context menu
         if self.show_context_menu {
-            if let Some(ref entry) = self.context_menu_entry {
+            if let Some(entry) = self.context_menu_entry.clone() {
                 // When opened from the tree, use the full path directly;
                 // when opened from the file list, join current_path + name.
                 let full_path = self.context_menu_tree_path
@@ -155,6 +155,9 @@ impl RusplorerApp {
                     "Delete",
                     "Properties",
                 ];
+                if entry.is_dir {
+                    labels.push("Open in a new tab");
+                }
                 if entry.is_dir || Self::is_code_file(&full_path) {
                     labels.push("Open with VS Code");
                 }
@@ -220,6 +223,17 @@ impl RusplorerApp {
                                         .args(["shell32.dll,OpenAs_RunDLL", full_path.to_string_lossy().as_ref()])
                                         .spawn();
                                 }
+                                self.show_context_menu = false;
+                                self.context_menu_tree_path = None;
+                                self.context_menu_tree_highlight = None;
+                            }
+
+                            // Open with VS Code
+                            if entry.is_dir
+                                && ui.add_sized([menu_w, 0.0], egui::Button::new("Open in a new tab")).clicked()
+                            {
+                                self.new_tab(Some(full_path.clone()));
+                                self.tab_scroll_to_active = true;
                                 self.show_context_menu = false;
                                 self.context_menu_tree_path = None;
                                 self.context_menu_tree_highlight = None;
@@ -465,9 +479,18 @@ impl RusplorerApp {
                         ui.style_mut().spacing.button_padding = egui::vec2(4.0, 2.0);
 
                         if ui.add_sized([menu_w, 0.0], egui::Button::new("📁  New folder")).clicked() {
-                            self.new_item_is_dir = true;
-                            self.new_item_name_buffer = "New folder".to_string();
-                            self.show_new_item_dialog = true;
+                            // Open rename dialog directly so the user types the name
+                            self.new_folder_mode = true;
+                            self.rename_buffer = String::new();
+                            self.rename_ext = String::new();
+                            self.rename_show_ext = false;
+                            self.context_menu_entry = Some(crate::types::FileEntry {
+                                name: String::new(),
+                                is_dir: true,
+                                size: 0,
+                                modified: None,
+                            });
+                            self.show_rename_dialog = true;
                             self.show_bg_context_menu = false;
                         }
                         if ui.add_sized([menu_w, 0.0], egui::Button::new("📄  New text file")).clicked() {
@@ -661,7 +684,7 @@ impl RusplorerApp {
         // Rename dialog
         // ── Modal backdrop ────────────────────────────────────────────────
         if self.show_rename_dialog || self.show_new_item_dialog
-            || self.show_archive_dialog || self.show_extract_dialog
+            || self.show_archive_dialog
             || self.show_save_session_dialog || self.show_unlock_dialog
         {
             let painter = ctx.layer_painter(egui::LayerId::new(
@@ -690,7 +713,7 @@ impl RusplorerApp {
                     // Auto-focus on first frame
                     resp.request_focus();
 
-                    let confirmed = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let confirmed = resp.lost_focus();
 
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() || confirmed {
@@ -724,29 +747,46 @@ impl RusplorerApp {
         if self.show_rename_dialog {
             if let Some(entry) = self.context_menu_entry.clone() {
                 let entry_name = entry.name.clone();
-                let has_ext = !self.rename_ext.is_empty();
+                let has_ext = !self.rename_ext.is_empty() && !self.new_folder_mode;
                 let mut close_dialog = false;
                 let mut do_rename = false;
-                egui::Window::new("Rename")
+                let window_title = if self.new_folder_mode { "New folder" } else { "Rename" };
+                egui::Window::new(window_title)
                     .collapsible(false)
                     .resizable(false)
                     .min_width(280.0)
                     .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                     .show(ctx, |ui| {
-                        // ESC closes without renaming
-                        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        // Consume ESC before the TextEdit can swallow it
+                        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
                             close_dialog = true;
                         }
 
-                        // Label shows current full name as hint
-                        ui.label(format!("Renaming: {}", &entry_name));
+                        if self.new_folder_mode {
+                            ui.label("Folder name:");
+                        } else {
+                            ui.label(format!("Renaming: {}", &entry_name));
+                        }
                         ui.add_space(4.0);
 
-                        let response = ui.add(
-                            egui::TextEdit::singleline(&mut self.rename_buffer)
-                                .desired_width(f32::INFINITY)
-                        );
-                        response.request_focus();
+                        // Text field + clear button on same row
+                        // Return the TextEdit response so we can detect Enter via lost_focus
+                        let text_response = ui.horizontal(|ui| {
+                            let response = ui.add(
+                                egui::TextEdit::singleline(&mut self.rename_buffer)
+                                    .desired_width(ui.available_width() - 28.0)
+                            );
+                            response.request_focus();
+                            if ui.add_sized([24.0, 0.0], egui::Button::new("✕")).clicked() {
+                                self.rename_buffer.clear();
+                            }
+                            response
+                        }).inner;
+
+                        // TextEdit loses focus on Enter; just check lost_focus()
+                        if text_response.lost_focus() {
+                            do_rename = true;
+                        }
 
                         // Extension toggle (only shown for files that have an extension)
                         if has_ext {
@@ -755,11 +795,9 @@ impl RusplorerApp {
                                 format!("Show extension ({})", self.rename_ext));
                             if self.rename_show_ext != prev {
                                 if self.rename_show_ext {
-                                    // unchecked → checked: append stored extension
                                     let ext = self.rename_ext.clone();
                                     self.rename_buffer.push_str(&ext);
                                 } else {
-                                    // checked → unchecked: strip stored extension from end
                                     let ext = self.rename_ext.clone();
                                     if !ext.is_empty() && self.rename_buffer.ends_with(&ext) {
                                         let new_len = self.rename_buffer.len() - ext.len();
@@ -771,9 +809,7 @@ impl RusplorerApp {
 
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
-                            if ui.button("OK").clicked()
-                                || ui.input(|i| i.key_pressed(egui::Key::Enter))
-                            {
+                            if ui.button("OK").clicked() {
                                 do_rename = true;
                             }
                             if ui.button("Cancel").clicked() {
@@ -785,18 +821,33 @@ impl RusplorerApp {
                 if do_rename {
                     let stem = self.rename_buffer.trim().to_string();
                     if !stem.is_empty() {
-                        let final_name = if self.rename_show_ext || !has_ext {
-                            stem
+                        if self.new_folder_mode {
+                            let target = self.current_path.join(&stem);
+                            let _ = std::fs::create_dir(&target);
+                            self.tree_children_cache.remove(&self.current_path);
+                            self.refresh_contents();
+                            self.selected_entries.clear();
+                            self.selected_entries.insert(stem);
                         } else {
-                            format!("{}{}", stem, self.rename_ext)
-                        };
-                        let old_path = self.current_path.join(&entry_name);
-                        let new_path = self.current_path.join(&final_name);
-                        let _ = std::fs::rename(&old_path, &new_path);
-                        self.refresh_contents();
+                            let final_name = if self.rename_show_ext || !has_ext {
+                                stem
+                            } else {
+                                format!("{}{}", stem, self.rename_ext)
+                            };
+                            let old_path = self.current_path.join(&entry_name);
+                            let new_path = self.current_path.join(&final_name);
+                            let _ = std::fs::rename(&old_path, &new_path);
+                            // Invalidate tree cache for the parent and the old path
+                            self.tree_children_cache.remove(&self.current_path);
+                            self.tree_children_cache.remove(&old_path);
+                            self.refresh_contents();
+
+                        }
                     }
+                    self.new_folder_mode = false;
                     self.show_rename_dialog = false;
                 } else if close_dialog {
+                    self.new_folder_mode = false;
                     self.show_rename_dialog = false;
                 }
             }

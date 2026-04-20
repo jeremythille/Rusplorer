@@ -268,6 +268,8 @@ pub struct CopyJobState {
     pub bytes_copied: AtomicU64,
     /// Total bytes across all source files.
     pub total_bytes: AtomicU64,
+    /// Unix timestamp in milliseconds when actual transfer started.
+    pub started_at_ms: AtomicU64,
     /// Name of the file currently being processed (for display).
     pub current_file: Mutex<String>,
     /// User requested pause.
@@ -308,6 +310,7 @@ impl CopyJobState {
             files_total: AtomicUsize::new(0),
             bytes_copied: AtomicU64::new(0),
             total_bytes: AtomicU64::new(0),
+            started_at_ms: AtomicU64::new(0),
             current_file: Mutex::new(String::new()),
             paused: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
@@ -571,6 +574,35 @@ pub fn spawn_copy_job(sources: Vec<PathBuf>, dest: PathBuf, state: Arc<CopyJobSt
     std::thread::spawn(move || { run_copy_job(sources, dest, &state); });
 }
 
+/// After a successful move-copy, remove the original source in a recoverable way.
+///
+/// Safety policy: never permanently delete originals as part of a move fallback.
+/// If Recycle Bin move fails, keep the source in place and report an error.
+fn safe_remove_source_after_move(source: &Path, state: &CopyJobState) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        if delete_to_recycle_bin(&[source.to_path_buf()]) {
+            return Ok(());
+        }
+        let msg = format!(
+            "Move safety stop: couldn't send original to Recycle Bin: {}",
+            source.display()
+        );
+        *state.error.lock().unwrap() = Some(msg.clone());
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, msg));
+    }
+
+    #[cfg(not(windows))]
+    {
+        // Non-Windows fallback keeps previous behavior.
+        if source.is_dir() {
+            std::fs::remove_dir_all(source)
+        } else {
+            std::fs::remove_file(source)
+        }
+    }
+}
+
 /// When copying a file/folder into the same directory it already lives in,
 /// generate a unique name by appending " copy", " copy 2", " copy 3", …
 /// For files the suffix is inserted before the extension.
@@ -596,12 +628,29 @@ fn make_copy_path(source: &Path, dest_dir: &Path) -> PathBuf {
 }
 
 fn run_copy_job(sources: Vec<PathBuf>, dest: PathBuf, state: &CopyJobState) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    state.started_at_ms.store(now_ms, Ordering::Relaxed);
+
     let (total_files, total_bytes) = tally_sources(&sources);
     state.files_total.store(total_files, Ordering::Relaxed);
     state.total_bytes.store(total_bytes, Ordering::Relaxed);
 
     for source in &sources {
         if state.cancelled.load(Ordering::Relaxed) { break; }
+
+        // Hard safety guard: never allow dropping/copying a directory into
+        // itself or one of its descendants (can cause recursive growth and
+        // data loss when move cleanup runs).
+        if source.is_dir() && (dest == *source || dest.starts_with(source)) {
+            *state.error.lock().unwrap() = Some(format!(
+                "Refusing unsafe operation: destination is inside source ({})",
+                source.display()
+            ));
+            continue;
+        }
 
         let file_name = match source.file_name() {
             Some(n) => n.to_owned(),
@@ -618,6 +667,12 @@ fn run_copy_job(sources: Vec<PathBuf>, dest: PathBuf, state: &CopyJobState) {
         } else {
             target
         };
+
+        // No-op safety: if source and target are identical, never recurse/copy.
+        if *source == target {
+            state.files_done.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
 
         // Same-filesystem move: try rename first (fails if target exists on Windows).
         if state.is_move && source != &target {
@@ -639,7 +694,16 @@ fn run_copy_job(sources: Vec<PathBuf>, dest: PathBuf, state: &CopyJobState) {
             // Directories are merged; per-file conflicts handled inside copy_dir_chunked.
             match copy_dir_chunked(source, &target, state) {
                 Ok(()) => {
-                    if state.is_move { let _ = std::fs::remove_dir_all(source); }
+                    if state.is_move {
+                        if let Err(e) = safe_remove_source_after_move(source, state) {
+                            *state.error.lock().unwrap() = Some(format!(
+                                "{}: {}",
+                                file_name.to_string_lossy(),
+                                e
+                            ));
+                            break;
+                        }
+                    }
                     state.pasted_names.lock().unwrap()
                         .push(target.file_name().unwrap_or_default().to_string_lossy().to_string());
                 }
@@ -660,7 +724,16 @@ fn run_copy_job(sources: Vec<PathBuf>, dest: PathBuf, state: &CopyJobState) {
                     match copy_file_chunked(source, &target, state) {
                         Ok(()) => {
                             state.files_done.fetch_add(1, Ordering::Relaxed);
-                            if state.is_move { let _ = std::fs::remove_file(source); }
+                            if state.is_move {
+                                if let Err(e) = safe_remove_source_after_move(source, state) {
+                                    *state.error.lock().unwrap() = Some(format!(
+                                        "{}: {}",
+                                        file_name.to_string_lossy(),
+                                        e
+                                    ));
+                                    break;
+                                }
+                            }
                             state.pasted_names.lock().unwrap()
                                 .push(target.file_name().unwrap_or_default().to_string_lossy().to_string());
                         }

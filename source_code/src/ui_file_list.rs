@@ -374,12 +374,24 @@ impl RusplorerApp {
                                 );
                             }
 
-                            self.entry_rects.insert(entry.name.clone(), response.rect);
-                            // Use direct cursor-rect check so hover works even during drag
-                            let cursor_over = ui.input(|i| {
-                                i.pointer.hover_pos().map_or(false, |p| response.rect.contains(p))
+                            // For DnD drop-target detection use the full row width, not just
+                            // the name-button width (which is as narrow as the text).
+                            // Hovering anywhere on the row — name, size, or date column —
+                            // should be sufficient to identify it as a drop target.
+                            let full_row_rect = egui::Rect::from_min_size(
+                                response.rect.min,
+                                egui::vec2(name_col_w + size_col_w + date_col_w, response.rect.height()),
+                            );
+                            self.entry_rects.insert(entry.name.clone(), full_row_rect);
+                            // Keep hover feedback broad, but only the name cell should start
+                            // a drag. Otherwise drawing a rectangle in empty row space starts
+                            // an unintended file drag.
+                            let cursor_over_name = ui.input(|i| {
+                                i.pointer
+                                    .hover_pos()
+                                    .map_or(false, |p| response.rect.contains(p))
                             });
-                            if cursor_over || response.hovered() {
+                            if cursor_over_name || response.hovered() {
                                 self.any_button_hovered = true;
                             }
 
@@ -405,7 +417,7 @@ impl RusplorerApp {
                             };
 
                             // Detect new press on this entry
-                            if cursor_over
+                            if cursor_over_name
                                 && any_btn_down
                                 && !self.dnd_active
                                 && self.dnd_suppress == 0
