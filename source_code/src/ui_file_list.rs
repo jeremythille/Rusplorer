@@ -383,15 +383,15 @@ impl RusplorerApp {
                                 egui::vec2(name_col_w + size_col_w + date_col_w, response.rect.height()),
                             );
                             self.entry_rects.insert(entry.name.clone(), full_row_rect);
-                            // Keep hover feedback broad, but only the name cell should start
-                            // a drag. Otherwise drawing a rectangle in empty row space starts
-                            // an unintended file drag.
+                            // Use the full row rect (name + size + date columns) so that
+                            // clicking anywhere on a row starts DnD and prevents the
+                            // rubber-band from starting (instead of only the name text area).
                             let cursor_over_name = ui.input(|i| {
                                 i.pointer
                                     .hover_pos()
-                                    .map_or(false, |p| response.rect.contains(p))
-                            });
-                            if cursor_over_name || response.hovered() {
+                                    .map_or(false, |p| full_row_rect.contains(p))
+                            }) || response.hovered();
+                            if cursor_over_name {
                                 self.any_button_hovered = true;
                             }
 
@@ -533,7 +533,7 @@ impl RusplorerApp {
                                 && ctx.input(|i| i.pointer.secondary_released())
                                 && ctx.input(|i| {
                                     i.pointer.hover_pos()
-                                        .map_or(false, |p| response.rect.contains(p))
+                                        .map_or(false, |p| full_row_rect.contains(p))
                                 });
 
                             if raw_secondary {

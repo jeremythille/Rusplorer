@@ -56,19 +56,85 @@ pub fn delete_to_recycle_bin(paths: &[PathBuf]) -> bool {
             }
         }
 
-        let ok = if any_queued {
+        let op_ok = if any_queued {
             file_op.PerformOperations().is_ok()
         } else {
             false
         };
 
         CoUninitialize();
+
+        // IFileOperation::PerformOperations can return S_OK even when items were
+        // not actually deleted (e.g. Recycle Bin disabled, file too large, or
+        // FOF_NO_UI suppressed the required confirmation dialog).
+        // Verify every path is truly gone before claiming success.
+        let ok = op_ok && paths.iter().all(|p| !p.exists());
         ok
     }
 }
 
 #[cfg(not(windows))]
 pub fn delete_to_recycle_bin(_paths: &[PathBuf]) -> bool { false }
+
+/// Delete to Recycle Bin with a force-unlock retry:
+/// 1) try normal delete,
+/// 2) if locked, terminate locking processes,
+/// 3) retry delete.
+#[cfg(windows)]
+pub fn force_unlock_and_delete(paths: &[PathBuf]) -> bool {
+    if paths.is_empty() {
+        return true;
+    }
+
+    // First attempt: fast path.
+    if delete_to_recycle_bin(paths) {
+        return true;
+    }
+
+    // Gather locking process IDs for still-existing paths.
+    let mut pids = std::collections::HashSet::<u32>::new();
+    for p in paths.iter().filter(|p| p.exists()) {
+        for (pid, _) in find_locking_processes(p) {
+            pids.insert(pid);
+        }
+    }
+
+    if pids.is_empty() {
+        return false;
+    }
+
+    // Terminate lockers (best-effort), then retry delete.
+    #[allow(clippy::needless_collect)]
+    let pid_list: Vec<u32> = pids.into_iter().collect();
+    unsafe {
+        use winapi::um::handleapi::CloseHandle;
+        use winapi::um::processthreadsapi::{GetCurrentProcessId, OpenProcess, TerminateProcess};
+        use winapi::um::winnt::PROCESS_TERMINATE;
+
+        let self_pid = GetCurrentProcessId();
+        for pid in pid_list {
+            if pid == self_pid {
+                continue;
+            }
+            let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if !h.is_null() {
+                let _ = TerminateProcess(h, 1);
+                CloseHandle(h);
+            }
+        }
+    }
+
+    let remaining: Vec<PathBuf> = paths.iter().filter(|p| p.exists()).cloned().collect();
+    if remaining.is_empty() {
+        return true;
+    }
+    delete_to_recycle_bin(&remaining)
+}
+
+#[cfg(not(windows))]
+pub fn force_unlock_and_delete(paths: &[PathBuf]) -> bool {
+    delete_to_recycle_bin(paths)
+}
 
 /// Use the Windows Restart Manager API to enumerate which processes currently
 /// hold a handle to `path` (i.e. are "locking" it).  Returns a list of
@@ -718,6 +784,21 @@ fn run_copy_job(sources: Vec<PathBuf>, dest: PathBuf, state: &CopyJobState) {
             match check_file_conflict(source, &target, state) {
                 FileAction::Skip => {
                     state.files_done.fetch_add(1, Ordering::Relaxed);
+                    // For a move, "skip" means the destination already has an
+                    // identical copy of this file (same size + mtime preserved).
+                    // The copy is done — remove the source to complete the move.
+                    if state.is_move {
+                        if let Err(e) = safe_remove_source_after_move(source, state) {
+                            *state.error.lock().unwrap() = Some(format!(
+                                "{}: {}",
+                                file_name.to_string_lossy(),
+                                e
+                            ));
+                            break;
+                        }
+                        state.pasted_names.lock().unwrap()
+                            .push(target.file_name().unwrap_or_default().to_string_lossy().to_string());
+                    }
                     if state.cancelled.load(Ordering::Relaxed) { break; }
                 }
                 FileAction::Copy => {

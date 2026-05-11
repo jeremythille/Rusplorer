@@ -26,6 +26,35 @@ fn drives_of(sources: &[PathBuf], dest: &PathBuf) -> std::collections::HashSet<c
 }
 
 impl RusplorerApp {
+    /// Start an async delete-to-recycle-bin job. Returns immediately.
+    pub(crate) fn start_delete_job(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() || self.delete_done_receiver.is_some() {
+            return;
+        }
+
+        let (tx, rx) = channel::<(Vec<PathBuf>, bool)>();
+        let (status_tx, status_rx) = channel::<String>();
+        let worker_paths = paths.clone();
+        std::thread::spawn(move || {
+            let _ = status_tx.send("Deletion attempt...".to_string());
+            let _ = status_tx.send("Deletion in progress...".to_string());
+
+            let mut ok = crate::fs_ops::delete_to_recycle_bin(&worker_paths);
+            if !ok {
+                let _ = status_tx.send("Folder is locked. Attempting unlock + delete...".to_string());
+                ok = crate::fs_ops::force_unlock_and_delete(&worker_paths);
+            }
+
+            let _ = tx.send((worker_paths, ok));
+        });
+
+        self.delete_done_receiver = Some(rx);
+        self.delete_status_receiver = Some(status_rx);
+        self.delete_feedback_msg = Some("Deletion attempt...".to_string());
+        self.delete_feedback_until = None;
+        self.delete_feedback_is_error = false;
+    }
+
     /// Start an async background copy/move job.  Returns immediately.
     /// `clear_clipboard` – set `true` for cut-paste so the clipboard is cleared on completion.
     pub(crate) fn start_copy_job(

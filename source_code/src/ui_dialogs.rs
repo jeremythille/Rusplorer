@@ -371,6 +371,7 @@ impl RusplorerApp {
                                     .unwrap_or_else(|| entry.name.clone());
                                 self.rename_show_ext = false;
                                 self.show_rename_dialog = true;
+                                self.rename_focus_pending = true;
                                 self.show_context_menu = false;
                                 self.context_menu_tree_highlight = None;
                             }
@@ -423,11 +424,7 @@ impl RusplorerApp {
 
                 // Process pending delete (set inside closure; executed out here to avoid &mut self conflict)
                 if !pending_delete.is_empty() {
-                    if crate::fs_ops::delete_to_recycle_bin(&pending_delete) {
-                        self.last_deleted_paths = pending_delete;
-                        self.selected_entries.clear();
-                        self.refresh_contents();
-                    }
+                    self.start_delete_job(pending_delete);
                 }
             }
 
@@ -491,12 +488,14 @@ impl RusplorerApp {
                                 modified: None,
                             });
                             self.show_rename_dialog = true;
+                            self.rename_focus_pending = true;
                             self.show_bg_context_menu = false;
                         }
                         if ui.add_sized([menu_w, 0.0], egui::Button::new("📄  New text file")).clicked() {
                             self.new_item_is_dir = false;
                             self.new_item_name_buffer = "New file.txt".to_string();
                             self.show_new_item_dialog = true;
+                            self.new_item_focus_pending = true;
                             self.show_bg_context_menu = false;
                         }
                         // Thin separator line
@@ -710,8 +709,11 @@ impl RusplorerApp {
                     ui.label("Name:");
                     let resp = ui.text_edit_singleline(&mut self.new_item_name_buffer);
 
-                    // Auto-focus on first frame
-                    resp.request_focus();
+                    // Auto-focus only once when the dialog opens.
+                    if self.new_item_focus_pending {
+                        resp.request_focus();
+                        self.new_item_focus_pending = false;
+                    }
 
                     let confirmed = resp.lost_focus();
 
@@ -722,8 +724,9 @@ impl RusplorerApp {
                                 let target = self.current_path.join(&name);
                                 if self.new_item_is_dir {
                                     let _ = std::fs::create_dir(&target);
-                                    // Invalidate tree cache so the new folder appears in the tree
-                                    self.tree_children_cache.remove(&self.current_path);
+                                    // Refresh tree cache so the new folder appears immediately
+                                    let updated = crate::fs_ops::read_dir_children(&self.current_path);
+                                    self.tree_children_cache.insert(self.current_path.clone(), updated);
                                 } else {
                                     let _ = std::fs::File::create(&target);
                                 }
@@ -754,7 +757,7 @@ impl RusplorerApp {
                 egui::Window::new(window_title)
                     .collapsible(false)
                     .resizable(false)
-                    .min_width(280.0)
+                    .fixed_size(egui::vec2(320.0, 0.0))
                     .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                     .show(ctx, |ui| {
                         // Consume ESC before the TextEdit can swallow it
@@ -774,9 +777,12 @@ impl RusplorerApp {
                         let text_response = ui.horizontal(|ui| {
                             let response = ui.add(
                                 egui::TextEdit::singleline(&mut self.rename_buffer)
-                                    .desired_width(ui.available_width() - 28.0)
+                                    .desired_width(268.0)
                             );
-                            response.request_focus();
+                            if self.rename_focus_pending {
+                                response.request_focus();
+                                self.rename_focus_pending = false;
+                            }
                             if ui.add_sized([24.0, 0.0], egui::Button::new("✕")).clicked() {
                                 self.rename_buffer.clear();
                             }
@@ -824,7 +830,8 @@ impl RusplorerApp {
                         if self.new_folder_mode {
                             let target = self.current_path.join(&stem);
                             let _ = std::fs::create_dir(&target);
-                            self.tree_children_cache.remove(&self.current_path);
+                            let updated = crate::fs_ops::read_dir_children(&self.current_path);
+                            self.tree_children_cache.insert(self.current_path.clone(), updated);
                             self.refresh_contents();
                             self.selected_entries.clear();
                             self.selected_entries.insert(stem);
@@ -834,13 +841,29 @@ impl RusplorerApp {
                             } else {
                                 format!("{}{}", stem, self.rename_ext)
                             };
-                            let old_path = self.current_path.join(&entry_name);
-                            let new_path = self.current_path.join(&final_name);
-                            let _ = std::fs::rename(&old_path, &new_path);
-                            // Invalidate tree cache for the parent and the old path
-                            self.tree_children_cache.remove(&self.current_path);
-                            self.tree_children_cache.remove(&old_path);
-                            self.refresh_contents();
+                            // Use context_menu_tree_path when renaming from the tree panel.
+                            let old_path = self.context_menu_tree_path
+                                .clone()
+                                .unwrap_or_else(|| self.current_path.join(&entry_name));
+                            let parent = old_path.parent()
+                                .map(|p| p.to_path_buf())
+                                .unwrap_or_else(|| self.current_path.clone());
+                            let new_path = parent.join(&final_name);
+                            if std::fs::rename(&old_path, &new_path).is_ok() {
+                                // Refresh tree cache: update parent's children list (rename
+                                // changed its contents), and drop the now-gone old path entry.
+                                let updated = crate::fs_ops::read_dir_children(&parent);
+                                self.tree_children_cache.insert(parent.clone(), updated);
+                                self.tree_children_cache.remove(&old_path);
+                                self.context_menu_tree_path = None;
+                                self.refresh_contents();
+
+                                // Keep renamed item selected when it belongs to the current view.
+                                if parent == self.current_path {
+                                    self.selected_entries.clear();
+                                    self.selected_entries.insert(final_name);
+                                }
+                            }
 
                         }
                     }
@@ -879,6 +902,49 @@ impl RusplorerApp {
                             .color(egui::Color32::WHITE).size(12.0));
                     });
                 });
+        }
+
+        // Delete feedback strip (in-progress and success/error).
+        if let Some(msg) = self.delete_feedback_msg.clone() {
+            let in_progress = self.delete_done_receiver.is_some();
+            let still_visible = match self.delete_feedback_until {
+                Some(until) => std::time::Instant::now() <= until,
+                None => true,
+            };
+
+            if still_visible {
+                let fill = if self.delete_feedback_is_error {
+                    egui::Color32::from_rgb(140, 40, 40)
+                } else if in_progress {
+                    egui::Color32::from_rgb(40, 80, 140)
+                } else {
+                    egui::Color32::from_rgb(40, 110, 60)
+                };
+
+                egui::Window::new("##delete_feedback_strip")
+                    .title_bar(false)
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -40.0))
+                    .frame(egui::Frame::none()
+                        .fill(fill)
+                        .inner_margin(egui::Margin::symmetric(16.0, 6.0))
+                        .rounding(egui::Rounding::same(6.0)))
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            if in_progress {
+                                ui.spinner();
+                            }
+                            ui.label(egui::RichText::new(msg)
+                                .color(egui::Color32::WHITE)
+                                .size(12.0));
+                        });
+                    });
+                ctx.request_repaint();
+            } else {
+                self.delete_feedback_msg = None;
+                self.delete_feedback_until = None;
+            }
         }
 
         // ── Unlock file dialog ────────────────────────────────────────────

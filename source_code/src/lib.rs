@@ -233,10 +233,14 @@ struct RusplorerApp {
     rename_ext: String,
     /// Whether the extension is shown in the rename text field.
     rename_show_ext: bool,
+    /// One-shot autofocus when rename dialog is opened.
+    rename_focus_pending: bool,
     // New folder / new file dialogs (triggered from background right-click menu)
     show_new_item_dialog: bool,
     new_item_is_dir: bool,
     new_item_name_buffer: String,
+    /// One-shot autofocus when new-item dialog is opened.
+    new_item_focus_pending: bool,
     show_bg_context_menu: bool,
     bg_context_position: egui::Pos2,
     bg_context_menu_size: egui::Vec2,
@@ -245,6 +249,14 @@ struct RusplorerApp {
     last_clicked_entry: Option<String>,
     /// Paths of the files/folders deleted in the last delete operation (for undo).
     last_deleted_paths: Vec<PathBuf>,
+    /// Completion channel for async delete-to-recycle-bin operation.
+    delete_done_receiver: Option<Receiver<(Vec<PathBuf>, bool)>>,
+    /// Streaming status updates for delete workflow.
+    delete_status_receiver: Option<Receiver<String>>,
+    /// Transient feedback message shown after delete attempts.
+    delete_feedback_msg: Option<String>,
+    delete_feedback_until: Option<std::time::Instant>,
+    delete_feedback_is_error: bool,
     show_archive_dialog: bool,
     archive_type: usize,      // 0 = 7z, 1 = zip
     compression_level: usize, // 0 = store, 1 = medium, 2 = high
@@ -445,9 +457,11 @@ impl RusplorerApp {
             rename_buffer: String::new(),
             rename_ext: String::new(),
             rename_show_ext: false,
+            rename_focus_pending: false,
             show_new_item_dialog: false,
             new_item_is_dir: false,
             new_item_name_buffer: String::new(),
+            new_item_focus_pending: false,
             show_bg_context_menu: false,
             bg_context_position: egui::Pos2::ZERO,
             bg_context_menu_size: egui::vec2(100.0, 80.0),
@@ -509,6 +523,11 @@ impl RusplorerApp {
             _ole_drop_target: None,
             show_save_session_dialog: false,
             last_deleted_paths: Vec::new(),
+            delete_done_receiver: None,
+            delete_status_receiver: None,
+            delete_feedback_msg: None,
+            delete_feedback_until: None,
+            delete_feedback_is_error: false,
             save_session_filename: String::new(),
             save_session_status: None,
             tab_drag_index: None,
@@ -734,6 +753,51 @@ impl eframe::App for RusplorerApp {
                 self.refresh_contents();
                 self.show_extract_dialog = false;
                 self.extract_done_receiver = None;
+            }
+        }
+
+        // Consume in-flight delete status updates.
+        if let Some(ref rx) = self.delete_status_receiver {
+            while let Ok(msg) = rx.try_recv() {
+                self.delete_feedback_msg = Some(msg);
+                self.delete_feedback_until = None;
+                self.delete_feedback_is_error = false;
+            }
+        }
+
+        // Check if async delete-to-recycle-bin finished
+        if let Some(ref rx) = self.delete_done_receiver {
+            if let Ok((paths, ok)) = rx.try_recv() {
+                if ok {
+                    self.last_deleted_paths = paths;
+                    self.selected_entries.clear();
+                    self.delete_feedback_msg = Some("Deleted to Recycle Bin".to_string());
+                    self.delete_feedback_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+                    self.delete_feedback_is_error = false;
+                } else {
+                    let mut msg = "Delete failed".to_string();
+                    if paths.len() == 1 {
+                        let p = &paths[0];
+                        let locked_by = crate::fs_ops::find_locking_processes(p);
+                        if !locked_by.is_empty() {
+                            let names: Vec<String> = locked_by.iter()
+                                .take(3)
+                                .map(|(_, n)| n.clone())
+                                .collect();
+                            msg = format!(
+                                "Delete failed: item is in use by {}",
+                                names.join(", ")
+                            );
+                        }
+                    }
+                    self.delete_feedback_msg = Some(msg);
+                    self.delete_feedback_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(6));
+                    self.delete_feedback_is_error = true;
+                }
+                // Always refresh after an attempted delete to avoid stale UI.
+                self.refresh_contents();
+                self.delete_done_receiver = None;
+                self.delete_status_receiver = None;
             }
         }
 
@@ -1275,12 +1339,7 @@ impl eframe::App for RusplorerApp {
                 .iter()
                 .map(|name| self.current_path.join(name))
                 .collect();
-
-            if crate::fs_ops::delete_to_recycle_bin(&files_to_delete) {
-                self.last_deleted_paths = files_to_delete;
-                self.selected_entries.clear();
-                self.refresh_contents();
-            }
+            self.start_delete_job(files_to_delete);
         }
 
         // F2 ? rename the single selected entry
@@ -1303,6 +1362,7 @@ impl eframe::App for RusplorerApp {
                     self.context_menu_entry = Some(entry.clone());
                     self.context_menu_tree_path = None;
                     self.show_rename_dialog = true;
+                    self.rename_focus_pending = true;
                     self.show_context_menu = false;
                 }
             }
@@ -2574,12 +2634,36 @@ impl eframe::App for RusplorerApp {
 
                     if cursor_inside {
                         if drop_tab_idx.is_some() {
-                            // Safety rule: dropping on the tab bar must never move/delete files.
-                            // If exactly one folder is dropped with left button, open it in a new tab.
-                            if !self.dnd_is_right_click
+                            let tab_idx = drop_tab_idx.unwrap();
+                            let tab_dest = self.tabs.get(tab_idx).map(|t| t.path.clone());
+                            let is_other_tab = tab_dest.as_ref()
+                                .map(|p| *p != self.current_path)
+                                .unwrap_or(false);
+
+                            if is_other_tab {
+                                // Drop onto a different tab: move files there.
+                                if let Some(dest) = tab_dest {
+                                    let sources: Vec<PathBuf> = all_sources.iter()
+                                        .filter(|s| **s != dest)
+                                        .cloned()
+                                        .collect();
+                                    if !sources.is_empty() {
+                                        if self.dnd_is_right_click {
+                                            let drop_pos = ctx.input(|i|
+                                                i.pointer.latest_pos().or(i.pointer.hover_pos()).unwrap_or_default()
+                                            );
+                                            self.dnd_right_drop_menu = Some((sources, dest, drop_pos));
+                                        } else {
+                                            self.start_copy_job(sources, dest, true, false);
+                                            self.selected_entries.clear();
+                                        }
+                                    }
+                                }
+                            } else if !self.dnd_is_right_click
                                 && all_sources.len() == 1
                                 && all_sources[0].is_dir()
                             {
+                                // Single folder dropped on current tab → open in new tab.
                                 self.new_tab(Some(all_sources[0].clone()));
                                 self.tab_scroll_to_active = true;
                             }
