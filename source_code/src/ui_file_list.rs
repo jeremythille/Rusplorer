@@ -355,6 +355,12 @@ impl RusplorerApp {
                                 )
                                 .fill(egui::Color32::from_rgb(255, 245, 150))
                                 .frame(false)
+                            } else if entry.name.to_ascii_lowercase().ends_with(".sfk")
+                                || entry.name.to_ascii_lowercase().ends_with(".sfap0") {
+                                egui::Button::new(
+                                    Self::name_layout_job(&display_name, false, egui::Color32::from_rgb(0xBF, 0xBF, 0xBF), false, dark_mode)
+                                )
+                                .frame(false)
                             } else {
                                 egui::Button::new(
                                     Self::name_layout_job(&display_name, false, text_color, false, dark_mode)
@@ -428,7 +434,17 @@ impl RusplorerApp {
                             {
                                 self.dnd_start_pos = ui.input(|i| i.pointer.hover_pos());
                                 self.dnd_drag_entry = Some(entry.name.clone());
-                                self.dnd_is_right_click = secondary_down;
+                                // Use hardware state to avoid stale egui button state
+                                // (e.g. after a right-click context menu whose button-up
+                                // egui never saw, secondary_down remains true).
+                                self.dnd_is_right_click = {
+                                    #[cfg(windows)] {
+                                        use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+                                        let s = unsafe { GetAsyncKeyState(0x02) };
+                                        s & (0x8000u16 as i16) != 0
+                                    }
+                                    #[cfg(not(windows))] { secondary_down }
+                                };
                             }
 
                             // Clear stale press when pointer is released without triggering a drag
@@ -464,6 +480,11 @@ impl RusplorerApp {
                                                 self.selected_entries.insert(entry.name.clone());
                                             }
                                             let count = self.dnd_sources.len();
+                                            #[cfg(windows)]
+                                            crate::ole::log_dnd(&format!(
+                                                "DnDActivate: selected={} sources={}",
+                                                self.selected_entries.len(), count
+                                            ));
                                             self.dnd_label = if count == 1 {
                                                 if entry.is_dir {
                                                     format!("📁 {}", &entry.name)
@@ -533,7 +554,7 @@ impl RusplorerApp {
                                 && ctx.input(|i| i.pointer.secondary_released())
                                 && ctx.input(|i| {
                                     i.pointer.hover_pos()
-                                        .map_or(false, |p| full_row_rect.contains(p))
+                                        .map_or(false, |p| response.rect.contains(p))
                                 });
 
                             if raw_secondary {

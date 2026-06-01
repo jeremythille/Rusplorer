@@ -1,4 +1,3 @@
-#!/usr/bin/env pwsh
 
 # Change to the script's directory
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -7,11 +6,14 @@ Set-Location $scriptDir
 # Get root path (parent of current directory)
 $rootPath = Split-Path -Parent (Get-Location)
 
-# Kill rusplorer.exe if it's running
-$process = Get-Process rusplorer -ErrorAction SilentlyContinue
-if ($process) {
-    Stop-Process $process -Force
-    Write-Host "Closed running Rusplorer instance"
+# Kill all rusplorer.exe instances if any are running
+$processes = Get-Process rusplorer -ErrorAction SilentlyContinue
+if ($processes) {
+    $count = @($processes).Count
+    Stop-Process -InputObject $processes -Force
+    # Wait until all instances have fully exited
+    $processes | ForEach-Object { $_ | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue }
+    Write-Host "Closed $count running Rusplorer instance(s)"
 }
 
 # Build production (full optimization, slower build)
@@ -20,7 +22,7 @@ cargo build --release
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "`nBuild successful!"
-    
+
     # Clean up build artifacts (keep only the exe)
     Write-Host "Cleaning up build artifacts..."
     $releaseDir = "target/release"
@@ -38,7 +40,7 @@ if ($LASTEXITCODE -eq 0) {
     # Remove .cargo-lock if present
     Remove-Item ".cargo-lock" -Force -ErrorAction SilentlyContinue
     Remove-Item ".\target\release\.cargo-lock" -Force -ErrorAction SilentlyContinue
-    
+
     # Copy rusplorer.exe to root
     $exePath = Join-Path $releaseDir "rusplorer.exe"
     if (Test-Path $exePath) {
@@ -46,12 +48,12 @@ if ($LASTEXITCODE -eq 0) {
         Copy-Item $exePath -Destination "$rootPath/rusplorer.exe" -Force
         Write-Host "Binary ready: $rootPath/rusplorer.exe"
     }
-    
+
     # Remove the entire target folder since we have the exe
     Write-Host "Cleaning up target folder..."
     Remove-Item "target" -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item "$rootPath/target" -Recurse -Force -ErrorAction SilentlyContinue
-    
+
     Write-Host "`nLaunching Rusplorer...`n"
     Start-Process "$rootPath/rusplorer.exe"
     Write-Host "Rusplorer launched in background. Close this window when done."

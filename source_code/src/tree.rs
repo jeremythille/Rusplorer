@@ -25,12 +25,23 @@ pub fn render_tree_node(
     hovered_drop: &mut Option<PathBuf>,
     tree_right_clicked: &mut Option<(PathBuf, egui::Pos2)>,
     highlight_path: &Option<PathBuf>,
+    tree_dnd_pressed: &mut Option<PathBuf>,
+    drive_labels: &std::collections::HashMap<PathBuf, String>,
 ) {
     let is_expanded = expanded.contains(path);
-    let display_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.to_string_lossy().trim_end_matches(|c| c == '\\' || c == '/').to_string());
+    // At depth 0 (drive roots), show "C:  VolumeLabel" if a label is available.
+    let display_name = if depth == 0 {
+        let letter = path.to_string_lossy().trim_end_matches(|c: char| c == '\\' || c == '/').to_string();
+        if let Some(lbl) = drive_labels.get(path).filter(|l| !l.is_empty()) {
+            format!("{} \u{2013} {}", letter, lbl)
+        } else {
+            letter
+        }
+    } else {
+        path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string_lossy().trim_end_matches(|c: char| c == '\\' || c == '/').to_string())
+    };
 
     let indent = depth as f32 * 10.0;
     let max_w = ui.available_width();
@@ -127,6 +138,20 @@ pub fn render_tree_node(
         },
     );
 
+    // Detect left-button press on this tree node for potential DnD initiation.
+    // We use raw pointer state (not egui's click sense) so we can track
+    // press-and-hold before the threshold drag distance is reached.
+    {
+        let primary_down = ui.ctx().input(|i| i.pointer.primary_down() && !i.pointer.secondary_down());
+        if primary_down {
+            if let Some(pos) = ui.ctx().input(|i| i.pointer.hover_pos()) {
+                if response.inner.rect.contains(pos) {
+                    *tree_dnd_pressed = Some(path.clone());
+                }
+            }
+        }
+    }
+
     // Detect drag-and-drop hover using raw rect (response.inner.hovered() is
     // suppressed while a mouse button is held).
     let is_valid_drop = dnd_active && !is_current && !dnd_sources.contains(path);
@@ -192,6 +217,8 @@ pub fn render_tree_node(
                     hovered_drop,
                     tree_right_clicked,
                     highlight_path,
+                    tree_dnd_pressed,
+                    drive_labels,
                 );
             }
         }

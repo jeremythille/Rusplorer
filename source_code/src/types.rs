@@ -81,6 +81,8 @@ pub(crate) struct DriveInfo {
     pub(crate) kind: DriveKind,
     pub(crate) free_bytes: u64,
     pub(crate) total_bytes: u64,
+    /// Volume label (e.g. "W11_NVMe"); empty string if the drive has no label.
+    pub(crate) label: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -131,5 +133,60 @@ impl TabState {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| self.path.to_string_lossy().to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Undo stack
+// ---------------------------------------------------------------------------
+
+/// One reversible operation recorded on the undo stack.
+#[derive(Clone)]
+pub(crate) enum UndoAction {
+    /// A single file or folder was renamed.
+    Rename { old_path: PathBuf, new_path: PathBuf },
+    /// One or more items were moved into `dest`.
+    /// `sources` are the original full paths before the move.
+    Move { sources: Vec<PathBuf>, dest: PathBuf },
+    /// One or more items were sent to the Recycle Bin.
+    Delete { paths: Vec<PathBuf> },
+}
+
+impl UndoAction {
+    /// Short human-readable verb for display.
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            UndoAction::Rename { .. } => "rename",
+            UndoAction::Move   { .. } => "move",
+            UndoAction::Delete { .. } => "delete",
+        }
+    }
+
+    /// Full human-readable description, e.g. "Rename \"a.png\" → \"b.png\"".
+    pub(crate) fn description(&self) -> String {
+        fn fname(p: &PathBuf) -> String {
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.to_string_lossy().into_owned())
+        }
+        match self {
+            UndoAction::Rename { old_path, new_path } =>
+                format!("Rename \"{}\" → \"{}\"", fname(old_path), fname(new_path)),
+            UndoAction::Move { sources, dest } => {
+                let dest_name = fname(dest);
+                if sources.len() == 1 {
+                    format!("Move \"{}\" into \"{}\"", fname(&sources[0]), dest_name)
+                } else {
+                    format!("Move {} items into \"{}\"", sources.len(), dest_name)
+                }
+            }
+            UndoAction::Delete { paths } => {
+                if paths.len() == 1 {
+                    format!("Delete \"{}\"", fname(&paths[0]))
+                } else {
+                    format!("Delete {} items", paths.len())
+                }
+            }
+        }
     }
 }

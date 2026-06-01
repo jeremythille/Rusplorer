@@ -261,7 +261,15 @@ impl RusplorerApp {
                                 {
                                     self.dnd_start_pos = ctx.input(|i| i.pointer.hover_pos());
                                     self.dnd_drag_entry = Some(entry.name.clone());
-                                    self.dnd_is_right_click = secondary_down;
+                                    // Use hardware state to avoid stale egui button state.
+                                    self.dnd_is_right_click = {
+                                        #[cfg(windows)] {
+                                            use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+                                            let s = unsafe { GetAsyncKeyState(0x02) };
+                                            s & (0x8000u16 as i16) != 0
+                                        }
+                                        #[cfg(not(windows))] { secondary_down }
+                                    };
                                 }
                                 if !self.dnd_active && !any_btn {
                                     self.dnd_start_pos = None;

@@ -1,0 +1,2 @@
+PANIC: panicked at src\lib.rs:1802:55:
+byte index 19 is not a char boundary; it is inside 'é' (bytes 18..20) of `2025-08-01 porte téléphone pour Tuqueque`

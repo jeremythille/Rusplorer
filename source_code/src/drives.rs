@@ -193,6 +193,35 @@ impl RusplorerApp {
     #[cfg(not(windows))]
     pub(crate) fn query_bus_type(_: char) -> Option<u32> { None }
 
+    /// Returns the volume label for the given drive root (e.g. `"C:\\"`).
+    /// Returns an empty string if the drive has no label or the call fails.
+    #[cfg(windows)]
+    pub(crate) fn get_volume_label(drive: &str) -> String {
+        use winapi::um::fileapi::GetVolumeInformationW;
+        let root: Vec<u16> = drive.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut name_buf = [0u16; 256];
+        let ok = unsafe {
+            GetVolumeInformationW(
+                root.as_ptr(),
+                name_buf.as_mut_ptr(),
+                name_buf.len() as u32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if ok != 0 {
+            let len = name_buf.iter().position(|&c| c == 0).unwrap_or(0);
+            String::from_utf16_lossy(&name_buf[..len]).to_string()
+        } else {
+            String::new()
+        }
+    }
+    #[cfg(not(windows))]
+    pub(crate) fn get_volume_label(_drive: &str) -> String { String::new() }
+
     /// Returns `(free_bytes, total_bytes)` for the given drive root (e.g. `"C:\\"`).
     #[cfg(windows)]
     pub(crate) fn get_drive_space(drive: &str) -> (u64, u64) {

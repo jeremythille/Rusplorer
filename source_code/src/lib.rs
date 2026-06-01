@@ -247,8 +247,10 @@ struct RusplorerApp {
     selected_entries: HashSet<String>,
     /// Anchor entry name for shift-click range selection.
     last_clicked_entry: Option<String>,
-    /// Paths of the files/folders deleted in the last delete operation (for undo).
-    last_deleted_paths: Vec<PathBuf>,
+    /// Undo stack: most-recent reversible operation is at the end.
+    undo_stack: Vec<UndoAction>,
+    /// Whether the undo history popup is open.
+    show_undo_dialog: bool,
     /// Completion channel for async delete-to-recycle-bin operation.
     delete_done_receiver: Option<Receiver<(Vec<PathBuf>, bool)>>,
     /// Streaming status updates for delete workflow.
@@ -285,6 +287,10 @@ struct RusplorerApp {
     dnd_label: String,
     dnd_start_pos: Option<egui::Pos2>,
     dnd_drag_entry: Option<String>,  // entry name when pointer was pressed (raw tracking)
+    /// Tree-panel DnD: where the pointer first pressed down on a tree node.
+    tree_dnd_start_pos: Option<egui::Pos2>,
+    /// Tree-panel DnD: the folder being tracked for a potential drag from the tree.
+    tree_dnd_source: Option<PathBuf>,
     dnd_drop_target: Option<PathBuf>,
     dnd_drop_target_prev: Option<PathBuf>, // previous frame's value, used for color display
     dnd_is_right_click: bool,
@@ -494,6 +500,8 @@ impl RusplorerApp {
             dnd_label: String::new(),
             dnd_start_pos: None,
             dnd_drag_entry: None,
+            tree_dnd_start_pos: None,
+            tree_dnd_source: None,
             dnd_drop_target: None,
             dnd_drop_target_prev: None,
             dnd_is_right_click: false,
@@ -522,7 +530,8 @@ impl RusplorerApp {
             ole_drag_in_active: Arc::new(AtomicBool::new(false)),
             _ole_drop_target: None,
             show_save_session_dialog: false,
-            last_deleted_paths: Vec::new(),
+            undo_stack: Vec::new(),
+            show_undo_dialog: false,
             delete_done_receiver: None,
             delete_status_receiver: None,
             delete_feedback_msg: None,
@@ -593,7 +602,7 @@ impl RusplorerApp {
             let kind = Self::classify_drive(letter);
             let (free_bytes, total_bytes) = Self::get_drive_space(&drive);
             app.drive_types.insert(drive.clone(), kind);
-            app.drives_info.push(DriveInfo { drive, kind, free_bytes, total_bytes });
+            app.drives_info.push(DriveInfo { drive: drive.clone(), kind, free_bytes, total_bytes, label: Self::get_volume_label(&drive) });
         }
 
         app
@@ -769,7 +778,7 @@ impl eframe::App for RusplorerApp {
         if let Some(ref rx) = self.delete_done_receiver {
             if let Ok((paths, ok)) = rx.try_recv() {
                 if ok {
-                    self.last_deleted_paths = paths;
+                    self.undo_stack.push(UndoAction::Delete { paths: paths.clone() });
                     self.selected_entries.clear();
                     self.delete_feedback_msg = Some("Deleted to Recycle Bin".to_string());
                     self.delete_feedback_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
@@ -815,6 +824,16 @@ impl eframe::App for RusplorerApp {
                         self.selected_entries.clear();
                         for name in names {
                             self.selected_entries.insert(name);
+                        }
+                    }
+                    // Record undo action for moves so Ctrl+Z can reverse them.
+                    if job.is_move {
+                        let original_sources = job.original_sources.lock().unwrap().clone();
+                        if !original_sources.is_empty() {
+                            self.undo_stack.push(UndoAction::Move {
+                                sources: original_sources,
+                                dest: PathBuf::from(&job.dest_display),
+                            });
                         }
                     }
                     if job.clear_clipboard.load(Ordering::Relaxed) {
@@ -1064,7 +1083,8 @@ impl eframe::App for RusplorerApp {
             || self.show_new_item_dialog
             || self.show_archive_dialog
             || self.show_save_session_dialog
-            || self.show_unlock_dialog;
+            || self.show_unlock_dialog
+            || self.show_undo_dialog;
 
         // Type-to-select: pressing a letter jumps to the next entry starting with that letter.
         // Ignored when a modal is open, when Ctrl/Alt is held, or when the filter box is focused.
@@ -1126,6 +1146,66 @@ impl eframe::App for RusplorerApp {
                 if !entry.name.starts_with("[..]") {
                     self.selected_entries.insert(entry.name.clone());
                 }
+            }
+        }
+
+        // Handle F5 to refresh the file list and the tree for the current folder
+        if !any_modal_open && ctx.input(|i| i.key_pressed(egui::Key::F5)) {
+            self.refresh_contents();
+            let updated = crate::fs_ops::read_dir_children(&self.current_path.clone());
+            self.tree_children_cache.insert(self.current_path.clone(), updated);
+        }
+
+        // Handle Up/Down arrow keys to move selection through the file list
+        if !any_modal_open && !ctx.input(|i| i.modifiers.alt) {
+            let up   = ctx.input(|i| i.key_pressed(egui::Key::ArrowUp));
+            let down = ctx.input(|i| i.key_pressed(egui::Key::ArrowDown));
+            if up || down {
+                // Build the list of navigable rows (skip [..] parent entry)
+                let navigable: Vec<usize> = self.contents
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| !e.name.starts_with("[..]"))
+                    .map(|(i, _)| i)
+                    .collect();
+                if !navigable.is_empty() {
+                    let is_shift = ctx.input(|i| i.modifiers.shift);
+                    // Find the index inside `navigable` of the current anchor (last_clicked_entry).
+                    let current_nav_idx = self.last_clicked_entry.as_ref().and_then(|anchor| {
+                        navigable.iter().position(|&ci| self.contents[ci].name == *anchor)
+                    });
+                    let next_nav_idx = match current_nav_idx {
+                        None => 0,
+                        Some(ni) if up   => ni.saturating_sub(1),
+                        Some(ni) => (ni + 1).min(navigable.len() - 1),
+                    };
+                    let row = navigable[next_nav_idx];
+                    let name = self.contents[row].name.clone();
+                    if is_shift {
+                        // Extend selection from current anchor to new position
+                        if let Some(ref anchor) = self.last_clicked_entry.clone() {
+                            let anchor_nav = navigable.iter().position(|&ci| self.contents[ci].name == *anchor).unwrap_or(next_nav_idx);
+                            let lo = anchor_nav.min(next_nav_idx);
+                            let hi = anchor_nav.max(next_nav_idx);
+                            self.selected_entries.clear();
+                            for ni in lo..=hi {
+                                self.selected_entries.insert(self.contents[navigable[ni]].name.clone());
+                            }
+                        }
+                    } else {
+                        self.selected_entries.clear();
+                        self.selected_entries.insert(name.clone());
+                        self.last_clicked_entry = Some(name);
+                    }
+                    self.type_select_scroll = Some(row);
+                }
+            }
+        }
+
+        // Handle Ctrl+Z: open undo history popup (if there is anything to undo)
+        if !any_modal_open && ctx.input(|i| i.key_pressed(egui::Key::Z) && i.modifiers.ctrl) {
+            if !self.undo_stack.is_empty() {
+                self.show_undo_dialog = true;
             }
         }
 
@@ -1216,6 +1296,7 @@ impl eframe::App for RusplorerApp {
 
             #[cfg(windows)]
             {
+                crate::ole::log_dnd(&format!("Ctrl+C: {} selected, {} files", self.selected_entries.len(), files.len()));
                 let _ = copy_files_to_clipboard(&files, false); // best-effort; internal clipboard always set
                 self.clipboard_files = files;
                 self.clipboard_mode = Some(ClipboardMode::Copy);
@@ -1276,6 +1357,11 @@ impl eframe::App for RusplorerApp {
                             sorted_int.sort();
                             sorted_win == sorted_int
                         });
+
+                crate::ole::log_dnd(&format!(
+                    "Ctrl+V: win_clipboard={} internal={} use_internal={} dest={}",
+                    win_clipboard.len(), self.clipboard_files.len(), use_internal, dest.display()
+                ));
 
                 if use_internal {
                     // Use our own internal clipboard ï¿½ reliable cut/copy detection
@@ -1781,8 +1867,9 @@ impl eframe::App for RusplorerApp {
                     for i in 0..self.tabs.len() {
                         let is_active = i == self.active_tab;
                         let label_text = self.tabs[i].label();
-                        let display = if label_text.len() > 20 {
-                            format!("{}…", &label_text[..19])
+                        let display = if label_text.chars().count() > 20 {
+                            let truncated: String = label_text.chars().take(19).collect();
+                            format!("{}…", truncated)
                         } else {
                             label_text.clone()
                         };
@@ -2080,7 +2167,7 @@ impl eframe::App for RusplorerApp {
                             let letter = drive.chars().next().unwrap_or('C');
                             let kind = Self::classify_drive(letter);
                             let (free_bytes, total_bytes) = Self::get_drive_space(&drive);
-                            self.drives_info.push(DriveInfo { drive, kind, free_bytes, total_bytes });
+                            self.drives_info.push(DriveInfo { drive: drive.clone(), kind, free_bytes, total_bytes, label: Self::get_volume_label(&drive) });
                         }
                     }
                 }
@@ -2188,9 +2275,14 @@ impl eframe::App for RusplorerApp {
                             } else {
                                 "No media".to_string()
                             };
-                            let drive_label = info.drive
+                            let drive_letter = info.drive
                                 .trim_end_matches(|c: char| c == '\\' || c == '/')
                                 .to_string();
+                            let drive_label = if info.label.is_empty() {
+                                drive_letter.clone()
+                            } else {
+                                format!("{}  {}", drive_letter, info.label)
+                            };
 
                             let (row_rect, resp) = ui.allocate_exact_size(
                                 egui::vec2(avail_w, ROW_H + PAD_Y * 2.0),
@@ -2444,6 +2536,7 @@ impl eframe::App for RusplorerApp {
                     let in_tab_bar = self.tab_bar_rect.contains(pointer_pos);
                     if i.pointer.primary_pressed() && !self.any_button_hovered && !in_tab_bar
                         && !self.filter_edit_rect.contains(pointer_pos)
+                        && pointer_pos.x > self.left_panel_width + 2.0  // don't start rubber-band in the tree panel
                     {
                         self.is_dragging_selection = true;
                         self.selection_drag_start = Some(pointer_pos);
@@ -2779,7 +2872,7 @@ impl eframe::App for RusplorerApp {
                         let letter = d.chars().next().unwrap_or('C');
                         let kind = Self::classify_drive(letter);
                         let (free_bytes, total_bytes) = Self::get_drive_space(d);
-                        self.drives_info.push(DriveInfo { drive: d.clone(), kind, free_bytes, total_bytes });
+                        self.drives_info.push(DriveInfo { drive: d.clone(), kind, free_bytes, total_bytes, label: Self::get_volume_label(d) });
                     }
                 }
                 self.available_drives = current;

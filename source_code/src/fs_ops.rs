@@ -352,6 +352,8 @@ pub struct CopyJobState {
     pub error: Mutex<Option<String>>,
     /// Names of files/dirs successfully placed in the destination.
     pub pasted_names: Mutex<Vec<String>>,
+    /// Original source paths captured at job-start (used by the undo stack).
+    pub original_sources: Mutex<Vec<PathBuf>>,
     /// Whether the internal clipboard should be cleared when the job finishes
     /// (cut-paste operations).
     pub clear_clipboard: AtomicBool,
@@ -385,6 +387,7 @@ impl CopyJobState {
             dest_display,
             error: Mutex::new(None),
             pasted_names: Mutex::new(Vec::new()),
+            original_sources: Mutex::new(Vec::new()),
             clear_clipboard: AtomicBool::new(false),
             conflict_query: Mutex::new(None),
             conflict_answer: Mutex::new(None),
@@ -700,6 +703,12 @@ fn run_copy_job(sources: Vec<PathBuf>, dest: PathBuf, state: &CopyJobState) {
         .unwrap_or(0);
     state.started_at_ms.store(now_ms, Ordering::Relaxed);
 
+    #[cfg(windows)]
+    crate::ole::log_dnd(&format!(
+        "RunCopyJob: {} sources is_move={} dest={}",
+        sources.len(), state.is_move, dest.display()
+    ));
+
     let (total_files, total_bytes) = tally_sources(&sources);
     state.files_total.store(total_files, Ordering::Relaxed);
     state.total_bytes.store(total_bytes, Ordering::Relaxed);
@@ -711,6 +720,8 @@ fn run_copy_job(sources: Vec<PathBuf>, dest: PathBuf, state: &CopyJobState) {
         // itself or one of its descendants (can cause recursive growth and
         // data loss when move cleanup runs).
         if source.is_dir() && (dest == *source || dest.starts_with(source)) {
+            #[cfg(windows)]
+            crate::ole::log_dnd(&format!("RunCopyJob: SKIP (unsafe) {}", source.display()));
             *state.error.lock().unwrap() = Some(format!(
                 "Refusing unsafe operation: destination is inside source ({})",
                 source.display()
@@ -733,6 +744,12 @@ fn run_copy_job(sources: Vec<PathBuf>, dest: PathBuf, state: &CopyJobState) {
         } else {
             target
         };
+
+        #[cfg(windows)]
+        crate::ole::log_dnd(&format!(
+            "RunCopyJob: processing {} -> {}",
+            source.display(), target.display()
+        ));
 
         // No-op safety: if source and target are identical, never recurse/copy.
         if *source == target {

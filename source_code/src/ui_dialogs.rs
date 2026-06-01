@@ -439,13 +439,17 @@ impl RusplorerApp {
 
         // ── Background context menu (right-click on empty space) ─────────────
         if self.show_bg_context_menu {
-            let can_undo = !self.last_deleted_paths.is_empty();
+            let undo_label: Option<String> = self.undo_stack.last()
+                .map(|a| format!("↩  Undo {}", a.label()));
+            let can_undo = undo_label.is_some();
             // Pre-compute required width from button labels
             let btn_padding = 8.0 + 8.0;
             let font_id = egui::TextStyle::Button.resolve(&ctx.style());
             let mut bg_labels = vec!["📁  New folder", "📄  New text file", "↻  Refresh"];
-            if can_undo {
-                bg_labels.push("↩  Undo delete");
+            let undo_label_str;  // lifetime anchor
+            if let Some(ref lbl) = undo_label {
+                undo_label_str = lbl.as_str();
+                bg_labels.push(undo_label_str);
             }
             let max_text_w = bg_labels.iter()
                 .map(|l| ctx.fonts(|f| f.layout_no_wrap(l.to_string(), font_id.clone(), egui::Color32::WHITE).size().x))
@@ -511,15 +515,9 @@ impl RusplorerApp {
                             let (line_rect2, _) = ui.allocate_exact_size(egui::vec2(menu_w, 1.0), egui::Sense::hover());
                             ui.painter().rect_filled(line_rect2, 0.0, egui::Color32::from_gray(160));
                             ui.add_space(2.0);
-                            if ui.add_sized([menu_w, 0.0], egui::Button::new("↩  Undo delete")).clicked() {
-                                #[cfg(windows)]
-                                {
-                                    let paths = self.last_deleted_paths.clone();
-                                    if Self::restore_from_recycle_bin(&paths) {
-                                        self.last_deleted_paths.clear();
-                                    }
-                                    self.refresh_contents();
-                                }
+                            let lbl = undo_label.as_deref().unwrap_or("↩  Undo");
+                            if ui.add_sized([menu_w, 0.0], egui::Button::new(lbl)).clicked() {
+                                self.show_undo_dialog = true;
                                 self.show_bg_context_menu = false;
                             }
                         }
@@ -685,6 +683,7 @@ impl RusplorerApp {
         if self.show_rename_dialog || self.show_new_item_dialog
             || self.show_archive_dialog
             || self.show_save_session_dialog || self.show_unlock_dialog
+            || self.show_undo_dialog
         {
             let painter = ctx.layer_painter(egui::LayerId::new(
                 egui::Order::PanelResizeLine,
@@ -789,8 +788,8 @@ impl RusplorerApp {
                             response
                         }).inner;
 
-                        // TextEdit loses focus on Enter; just check lost_focus()
-                        if text_response.lost_focus() {
+                        // TextEdit loses focus on Enter; skip when ESC already closed the dialog.
+                        if text_response.lost_focus() && !close_dialog {
                             do_rename = true;
                         }
 
@@ -850,6 +849,11 @@ impl RusplorerApp {
                                 .unwrap_or_else(|| self.current_path.clone());
                             let new_path = parent.join(&final_name);
                             if std::fs::rename(&old_path, &new_path).is_ok() {
+                                // Record undo action before cache/UI updates.
+                                self.undo_stack.push(crate::types::UndoAction::Rename {
+                                    old_path: old_path.clone(),
+                                    new_path: new_path.clone(),
+                                });
                                 // Refresh tree cache: update parent's children list (rename
                                 // changed its contents), and drop the now-gone old path entry.
                                 let updated = crate::fs_ops::read_dir_children(&parent);
@@ -944,6 +948,79 @@ impl RusplorerApp {
             } else {
                 self.delete_feedback_msg = None;
                 self.delete_feedback_until = None;
+            }
+        }
+
+        // ── Undo history dialog ───────────────────────────────────────────
+        if self.show_undo_dialog {
+            let mut close_dialog = false;
+            // Collect up to 5 most-recent actions (most recent first) by index
+            let stack_len = self.undo_stack.len();
+            let show_count = stack_len.min(5);
+            // Indices into undo_stack, from most-recent (stack_len-1) downward
+            let indices: Vec<usize> = (0..show_count)
+                .map(|i| stack_len - 1 - i)
+                .collect();
+            // Build labels before borrowing self mutably
+            let descriptions: Vec<String> = indices.iter()
+                .map(|&i| self.undo_stack[i].description())
+                .collect();
+
+            let mut apply_index: Option<usize> = None; // index into undo_stack to apply
+
+            egui::Window::new("Undo history")
+                .collapsible(false)
+                .resizable(false)
+                .min_width(340.0)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                        close_dialog = true;
+                    }
+
+                    ui.label("Click an action to undo it:");
+                    ui.add_space(6.0);
+
+                    for (pos, (&stack_idx, desc)) in indices.iter().zip(descriptions.iter()).enumerate() {
+                        let label = format!("↩  {}", desc);
+                        let btn_color = if pos == 0 {
+                            egui::Color32::from_rgb(60, 130, 210)
+                        } else {
+                            egui::Color32::from_rgb(80, 110, 160)
+                        };
+                        let resp = ui.add_sized(
+                            [ui.available_width(), 0.0],
+                            egui::Button::new(
+                                egui::RichText::new(&label).color(egui::Color32::WHITE)
+                            ).fill(btn_color),
+                        );
+                        if resp.clicked() {
+                            apply_index = Some(stack_idx);
+                            close_dialog = true;
+                        }
+                        ui.add_space(2.0);
+                    }
+
+                    if stack_len > 5 {
+                        ui.add_space(2.0);
+                        ui.label(egui::RichText::new(format!("…and {} more", stack_len - 5))
+                            .color(egui::Color32::GRAY).italics());
+                    }
+
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    if ui.button("Cancel").clicked() {
+                        close_dialog = true;
+                    }
+                });
+
+            if let Some(idx) = apply_index {
+                let action = self.undo_stack.remove(idx);
+                self.apply_undo(action);
+            }
+            if close_dialog {
+                self.show_undo_dialog = false;
             }
         }
 

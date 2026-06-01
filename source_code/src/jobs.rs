@@ -64,9 +64,16 @@ impl RusplorerApp {
         is_move: bool,
         clear_clipboard: bool,
     ) {
+        #[cfg(windows)]
+        crate::ole::log_dnd(&format!(
+            "StartCopyJob: {} sources is_move={} dest={}",
+            sources.len(), is_move, dest.display()
+        ));
         let dest_display = dest.to_string_lossy().to_string();
         let state = Arc::new(CopyJobState::new(is_move, dest_display));
         state.clear_clipboard.store(clear_clipboard, Ordering::Relaxed);
+        // Record original sources so the undo system can reverse a move.
+        *state.original_sources.lock().unwrap() = sources.clone();
         let new_drives = drives_of(&sources, &dest);
         // Queue if any running job touches the same drive(s) to avoid thrashing.
         let conflict = self.copy_job_drives.iter()
@@ -273,5 +280,45 @@ impl RusplorerApp {
         }
 
         restored == total
+    }
+
+    /// Apply the topmost undo action in reverse.
+    pub(crate) fn apply_undo(&mut self, action: crate::types::UndoAction) {
+        use crate::types::UndoAction;
+        match action {
+            UndoAction::Rename { old_path, new_path } => {
+                let _ = std::fs::rename(&new_path, &old_path);
+                // Refresh tree if the item lived in a visible folder.
+                if let Some(parent) = new_path.parent() {
+                    let updated = crate::fs_ops::read_dir_children(&parent.to_path_buf());
+                    self.tree_children_cache.insert(parent.to_path_buf(), updated);
+                }
+                self.refresh_contents();
+            }
+            UndoAction::Move { sources, dest } => {
+                // Move each file from dest back to its original location.
+                for original in &sources {
+                    if let Some(fname) = original.file_name() {
+                        let at_dest = dest.join(fname);
+                        if at_dest.exists() {
+                            if let Some(parent) = original.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            let _ = std::fs::rename(&at_dest, original);
+                        }
+                    }
+                }
+                // Refresh tree cache for the destination folder.
+                let updated_dest = crate::fs_ops::read_dir_children(&dest);
+                self.tree_children_cache.insert(dest, updated_dest);
+                // Refresh current view.
+                self.refresh_contents();
+            }
+            UndoAction::Delete { paths } => {
+                #[cfg(windows)]
+                let _ = Self::restore_from_recycle_bin(&paths);
+                self.refresh_contents();
+            }
+        }
     }
 }

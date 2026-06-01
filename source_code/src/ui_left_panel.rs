@@ -90,6 +90,12 @@ impl RusplorerApp {
                 let dnd_drop_target = self.dnd_drop_target_prev.clone(); // use prev for display
                 let dnd_sources: Vec<PathBuf> = self.dnd_sources.clone();
                 let mut tree_hovered_drop: Option<PathBuf> = None;
+                let mut tree_dnd_pressed: Option<PathBuf> = None;
+                // Build a map of drive root path → volume label for depth-0 tree nodes.
+                let drive_labels: std::collections::HashMap<PathBuf, String> = self.drives_info
+                    .iter()
+                    .map(|info| (PathBuf::from(&info.drive), info.label.clone()))
+                    .collect();
 
                 // Use a child_ui with a strict clip rect so the tree scroll
                 // area cannot paint over the favorites section above.
@@ -123,6 +129,8 @@ impl RusplorerApp {
                                 &mut tree_hovered_drop,
                                 &mut tree_right_clicked,
                                 &self.context_menu_tree_highlight.clone(),
+                                &mut tree_dnd_pressed,
+                                &drive_labels,
                             );
                         }
                         if let Some((rclick_path, rclick_pos)) = tree_right_clicked {
@@ -151,6 +159,48 @@ impl RusplorerApp {
                     });
                 if let Some(target) = tree_hovered_drop {
                     self.dnd_drop_target = Some(target);
+                }
+
+                // ── Tree folder drag-and-drop initiation ─────────────────
+                let primary_down = ctx.input(|i| i.pointer.primary_down());
+
+                // Record where the pointer first pressed down on a tree node.
+                if let Some(pressed_path) = tree_dnd_pressed {
+                    if primary_down && !self.dnd_active && self.dnd_suppress == 0
+                        && self.tree_dnd_start_pos.is_none()
+                    {
+                        self.tree_dnd_start_pos = ctx.input(|i| i.pointer.hover_pos());
+                        self.tree_dnd_source = Some(pressed_path);
+                    }
+                }
+
+                // Clear tracking when the button is released without activating DnD.
+                if !primary_down && !self.dnd_active {
+                    self.tree_dnd_start_pos = None;
+                    self.tree_dnd_source = None;
+                }
+
+                // Activate DnD once the pointer has moved far enough.
+                if let Some(src) = self.tree_dnd_source.clone() {
+                    if primary_down && !self.dnd_active {
+                        if let (Some(start), Some(cur)) = (
+                            self.tree_dnd_start_pos,
+                            ctx.input(|i| i.pointer.hover_pos()),
+                        ) {
+                            if start.distance(cur) > 5.0 {
+                                let name = src
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| src.to_string_lossy().into_owned());
+                                self.dnd_sources = vec![src];
+                                self.dnd_label = format!("\u{1F4C1} {}", name);
+                                self.dnd_active = true;
+                                self.dnd_is_right_click = false;
+                                self.tree_dnd_start_pos = None;
+                                self.tree_dnd_source = None;
+                            }
+                        }
+                    }
                 }
             });
         nav_from_panel
