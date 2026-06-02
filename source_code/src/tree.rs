@@ -153,7 +153,7 @@ pub fn render_tree_node(
             }
             #[cfg(not(windows))] { true }
         } else { false };
-        if primary_down {
+        if primary_down && !dnd_active {
             if let Some(pos) = ui.ctx().input(|i| i.pointer.hover_pos()) {
                 if response.inner.rect.contains(pos) {
                     *tree_dnd_pressed = Some(path.clone());

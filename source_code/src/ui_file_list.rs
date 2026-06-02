@@ -508,7 +508,10 @@ impl RusplorerApp {
                                 }
                             }
 
-                            if response.clicked() {
+                            // Skip click handling while rubber-band is active (or in its
+                            // release frame) — the LMB release that ends rubber-band
+                            // must not also select/deselect an entry underneath the cursor.
+                            if response.clicked() && !self.is_dragging_selection {
                                 let is_ctrl = ui.input(|i| i.modifiers.ctrl);
                                 let is_shift = ui.input(|i| i.modifiers.shift);
                                 if is_shift {

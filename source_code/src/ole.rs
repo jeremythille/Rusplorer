@@ -464,9 +464,29 @@ pub fn register_ole_drop_target(
             pdweffect: *mut DROPEFFECT,
         ) -> windows::core::Result<()> {
             self.last_key_state.set(grfkeystate.0);
-            // Note: we no longer refuse Rusplorer-originated drags here.
-            // Cross-window Rusplorer moves/copies are handled by accepting the
-            // OLE drop and routing through the normal copy-job engine.
+            // Refuse drops whose IDataObject was produced by THIS Rusplorer
+            // process (carries our source_drag_fmt marker). Otherwise a botched
+            // cross-window drag whose drop happens to land back on our own
+            // window can self-feed our IDropTarget, copying/moving the dragged
+            // item into self.current_path.
+            let from_self = if let Some(obj) = pdataobj {
+                let fmt = FORMATETC {
+                    cfFormat: rusplorer_source_drag_format(),
+                    ptd: std::ptr::null_mut(),
+                    dwAspect: 1,
+                    lindex: -1,
+                    tymed: TYMED_HGLOBAL.0 as u32,
+                };
+                unsafe { obj.QueryGetData(&fmt) == S_OK }
+            } else {
+                false
+            };
+            if from_self {
+                self.refused_drag.set(true);
+                log_dnd("DragEnter: refusing — IDataObject originated in this Rusplorer process");
+                unsafe { *pdweffect = DROPEFFECT_NONE; }
+                return Ok(());
+            }
             // Detect right-button drag via multiple signals:
             // 1. Custom clipboard format (reliable across processes)
             // 2. grfkeystate from OLE (may miss MK_RBUTTON in some cases)
@@ -551,7 +571,13 @@ pub fn register_ole_drop_target(
         ) -> windows::core::Result<()> {
             unsafe {
                 *pdweffect = DROPEFFECT_NONE;
-                // (Cross-Rusplorer drops are now accepted and handled normally.)
+                // Refuse drops from this very Rusplorer process — see DragEnter.
+                if self.refused_drag.get() {
+                    log_dnd("Drop: refused (own process)");
+                    self.refused_drag.set(false);
+                    self.drag_in_active.store(false, std::sync::atomic::Ordering::SeqCst);
+                    return Ok(());
+                }
                 let obj = match pdataobj { Some(o) => o, None => return Ok(()) };
                 let fmt = FORMATETC {
                     cfFormat: CF_HDROP_RAW,

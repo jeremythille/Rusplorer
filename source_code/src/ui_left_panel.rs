@@ -185,8 +185,10 @@ impl RusplorerApp {
                     }
                 }
 
-                // Clear tracking when the button is released without activating DnD.
-                if !primary_down && !self.dnd_active {
+                // Clear tracking when the button is released without activating DnD,
+                // OR when another DnD (file list / thumbnails) became active after we
+                // recorded a press on a tree node — that press was not a tree drag.
+                if (!primary_down && !self.dnd_active) || (self.dnd_active && self.tree_dnd_source.is_some() && self.dnd_sources.first() != self.tree_dnd_source.as_ref()) {
                     self.tree_dnd_start_pos = None;
                     self.tree_dnd_source = None;
                 }
