@@ -162,7 +162,18 @@ impl RusplorerApp {
                 }
 
                 // ── Tree folder drag-and-drop initiation ─────────────────
-                let primary_down = ctx.input(|i| i.pointer.primary_down());
+                // Cross-check with hardware key state to avoid ghost drags
+                // caused by stale egui button state after a blocking OLE
+                // DoDragDrop call (the real WM_LBUTTONUP is consumed by OLE).
+                let egui_lmb = ctx.input(|i| i.pointer.primary_down());
+                let primary_down = if egui_lmb {
+                    #[cfg(windows)] {
+                        use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+                        let s = unsafe { GetAsyncKeyState(0x01) };
+                        s & (0x8000u16 as i16) != 0
+                    }
+                    #[cfg(not(windows))] { true }
+                } else { false };
 
                 // Record where the pointer first pressed down on a tree node.
                 if let Some(pressed_path) = tree_dnd_pressed {

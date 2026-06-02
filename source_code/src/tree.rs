@@ -141,8 +141,18 @@ pub fn render_tree_node(
     // Detect left-button press on this tree node for potential DnD initiation.
     // We use raw pointer state (not egui's click sense) so we can track
     // press-and-hold before the threshold drag distance is reached.
+    // Cross-check with hardware key state to avoid ghost drags from stale
+    // egui state after a blocking OLE DoDragDrop call returns.
     {
-        let primary_down = ui.ctx().input(|i| i.pointer.primary_down() && !i.pointer.secondary_down());
+        let egui_lmb = ui.ctx().input(|i| i.pointer.primary_down() && !i.pointer.secondary_down());
+        let primary_down = if egui_lmb {
+            #[cfg(windows)] {
+                use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+                let s = unsafe { GetAsyncKeyState(0x01) };
+                s & (0x8000u16 as i16) != 0
+            }
+            #[cfg(not(windows))] { true }
+        } else { false };
         if primary_down {
             if let Some(pos) = ui.ctx().input(|i| i.pointer.hover_pos()) {
                 if response.inner.rect.contains(pos) {

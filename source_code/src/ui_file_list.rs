@@ -369,9 +369,13 @@ impl RusplorerApp {
                             };
 
                             let button = button.sense(egui::Sense::click_and_drag());
+                            // Capture the full name-column rect before rendering the button
+                            // so click/right-click detection covers the whole column, not
+                            // just the narrow text area, without changing the button appearance.
+                            let name_col_rect = ui.max_rect();
                             let response = ui.horizontal(|ui| ui.add(button)).inner;
 
-                            // Show the full name in a tooltip when the name was truncated.
+                            // Sh when the name was truncated.
                             if display_name != entry.name && response.hovered() {
                                 egui::show_tooltip_text(
                                     ui.ctx(),
@@ -554,7 +558,7 @@ impl RusplorerApp {
                                 && ctx.input(|i| i.pointer.secondary_released())
                                 && ctx.input(|i| {
                                     i.pointer.hover_pos()
-                                        .map_or(false, |p| response.rect.contains(p))
+                                        .map_or(false, |p| name_col_rect.contains(p))
                                 });
 
                             if raw_secondary {
