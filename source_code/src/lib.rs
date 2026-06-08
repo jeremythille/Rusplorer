@@ -208,7 +208,7 @@ struct RusplorerApp {
     filter: String,
     #[allow(dead_code)]
     file_watcher: Option<notify::RecommendedWatcher>,
-    watch_receiver: Option<Receiver<PathBuf>>,
+    watch_receiver: Option<Receiver<jobs::WatchEvent>>,
     stop_watcher: Option<Sender<()>>,
     /// When Some, a file-system event arrived. We delay the actual refresh
     /// until this instant is >500 ms in the past (debounce).
@@ -293,6 +293,11 @@ struct RusplorerApp {
     tree_dnd_source: Option<PathBuf>,
     dnd_drop_target: Option<PathBuf>,
     dnd_drop_target_prev: Option<PathBuf>, // previous frame's value, used for color display
+    /// True when the active internal DnD was initiated from the left tree panel.
+    /// Used to require an explicit drop target (no fallback to current_path) so
+    /// dragging a tree folder over itself doesn't accidentally copy into the
+    /// currently-displayed folder.
+    dnd_from_tree: bool,
     dnd_is_right_click: bool,
     dnd_suppress: u8, // frame counter: suppresses new drag/context-menu detection while > 0
     // Pending right-click drop menu: (sources, destination, screen position)
@@ -504,6 +509,7 @@ impl RusplorerApp {
             tree_dnd_source: None,
             dnd_drop_target: None,
             dnd_drop_target_prev: None,
+            dnd_from_tree: false,
             dnd_is_right_click: false,
             dnd_suppress: 0,
             dnd_right_drop_menu: None,
@@ -803,8 +809,38 @@ impl eframe::App for RusplorerApp {
                     self.delete_feedback_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(6));
                     self.delete_feedback_is_error = true;
                 }
+
+                if ok {
+                    let current_was_deleted = paths.iter().any(|deleted| {
+                        self.current_path == *deleted || self.current_path.starts_with(deleted)
+                    });
+
+                    self.invalidate_tree_after_delete(&paths);
+
+                    if current_was_deleted {
+                        let mut fallback = self.current_path.clone();
+                        while let Some(parent) = fallback.parent().map(|p| p.to_path_buf()) {
+                            let parent_is_deleted = paths.iter().any(|deleted| {
+                                parent == *deleted || parent.starts_with(deleted)
+                            });
+                            if !parent_is_deleted {
+                                self.commit_navigation(parent);
+                                break;
+                            }
+                            if parent == fallback {
+                                break;
+                            }
+                            fallback = parent;
+                        }
+                    }
+                }
+
                 // Always refresh after an attempted delete to avoid stale UI.
-                self.refresh_contents();
+                if !paths.iter().any(|deleted| {
+                    self.current_path == *deleted || self.current_path.starts_with(deleted)
+                }) {
+                    self.refresh_contents();
+                }
                 self.delete_done_receiver = None;
                 self.delete_status_receiver = None;
             }
@@ -827,7 +863,8 @@ impl eframe::App for RusplorerApp {
                         }
                     }
                     // Record undo action for moves so Ctrl+Z can reverse them.
-                    if job.is_move {
+                    // Skip if the job itself was started by the undo system (no_undo flag).
+                    if job.is_move && !job.no_undo.load(Ordering::Relaxed) {
                         let original_sources = job.original_sources.lock().unwrap().clone();
                         if !original_sources.is_empty() {
                             self.undo_stack.push(UndoAction::Move {
@@ -894,7 +931,7 @@ impl eframe::App for RusplorerApp {
                     // Explorer drops from real paths, use copy (is_move=false).
                     let staging = std::env::temp_dir().join("rusplorer_drop");
                     let is_move = files.iter().all(|f| f.starts_with(&staging));
-                    self.start_copy_job(files, dest, is_move, false);
+                    self.start_copy_job(files, dest, is_move, false, false);
                     ctx.request_repaint();
                 }
             }
@@ -986,21 +1023,51 @@ impl eframe::App for RusplorerApp {
 
         // Receive file sizes from background thread
         let mut sizes_updated = false;
-        if let Some(ref rx) = self.size_receiver {
-            while let Ok((path, size)) = rx.try_recv() {
-                self.file_sizes.insert(path, size);
-                if size > self.max_file_size {
-                    self.max_file_size = size;
+        let size_scan_done = if let Some(ref rx) = self.size_receiver {
+            let mut disconnected = false;
+            loop {
+                match rx.try_recv() {
+                    Ok((path, size)) => {
+                        self.file_sizes.insert(path, size);
+                        if size > self.max_file_size {
+                            self.max_file_size = size;
+                        }
+                        sizes_updated = true;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
                 }
-                sizes_updated = true;
             }
+            disconnected
+        } else {
+            false
+        };
+        if size_scan_done {
+            self.size_receiver = None;
         }
 
         // Receive directory completion signals
-        if let Some(ref rx) = self.dirs_done_receiver {
-            while let Ok(path) = rx.try_recv() {
-                self.dirs_done.insert(path);
+        let dirs_done_scan_done = if let Some(ref rx) = self.dirs_done_receiver {
+            let mut disconnected = false;
+            loop {
+                match rx.try_recv() {
+                    Ok(path) => { self.dirs_done.insert(path); }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
             }
+            disconnected
+        } else {
+            false
+        };
+        if dirs_done_scan_done {
+            self.dirs_done_receiver = None;
         }
 
         // Poll the spin-up probe for slow (HDD/USB/Network) drives.
@@ -1217,6 +1284,7 @@ impl eframe::App for RusplorerApp {
             self.dnd_start_pos = None;
             self.dnd_drag_entry = None;
             self.dnd_is_right_click = false;
+            self.dnd_from_tree = false;
             self.dnd_sources.clear();
             self.dnd_label.clear();
             self.dnd_drop_target = None;
@@ -1367,14 +1435,14 @@ impl eframe::App for RusplorerApp {
                     // Use our own internal clipboard ï¿½ reliable cut/copy detection
                     let files = self.clipboard_files.clone();
                     let is_cut = self.clipboard_mode == Some(ClipboardMode::Cut);
-                    self.start_copy_job(files, dest, is_cut, is_cut);
+                    self.start_copy_job(files, dest, is_cut, is_cut, false);
                     if is_cut {
                         self.clipboard_files.clear();
                         self.clipboard_mode = None;
                     }
                 } else if !win_clipboard.is_empty() {
                     // Use Windows clipboard (files from another app)
-                    self.start_copy_job(win_clipboard.clone(), dest, win_is_cut, win_is_cut);
+                    self.start_copy_job(win_clipboard.clone(), dest, win_is_cut, win_is_cut, false);
                     // Sync internal clipboard so subsequent paste in
                     // same session (if copy) re-pastes the same files.
                     self.clipboard_files = win_clipboard;
@@ -1398,11 +1466,11 @@ impl eframe::App for RusplorerApp {
 
                         let pasted_names = match mode {
                             ClipboardMode::Copy => {
-                                self.start_copy_job(files, dest, false, false);
+                                self.start_copy_job(files, dest, false, false, false);
                                 Vec::new()
                             }
                             ClipboardMode::Cut => {
-                                self.start_copy_job(files, dest, true, true);
+                                self.start_copy_job(files, dest, true, true, false);
                                 self.clipboard_files.clear();
                                 self.clipboard_mode = None;
                                 Vec::new()
@@ -1648,16 +1716,49 @@ impl eframe::App for RusplorerApp {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_millis() as u64)
                                 .unwrap_or(0);
-                            let started_at_ms = job.started_at_ms.load(Ordering::Relaxed);
-                            let elapsed_s = if started_at_ms > 0 && now_ms > started_at_ms {
-                                (now_ms - started_at_ms) as f64 / 1000.0
-                            } else {
+                            // Speed display: EMA sampled every repaint frame (~100 ms).
+                            //
+                            // Windows write-back caching causes burst-stall cycles where
+                            // the OS accepts data at RAM speed, then stalls the writer while
+                            // it flushes to disk.  A short fixed window (e.g. 750 ms) lands
+                            // at a different phase of the cycle every time, producing wildly
+                            // erratic values.  An EMA with a ~2 s time constant smooths the
+                            // bursts and stalls into the actual sustained throughput.
+                            //
+                            // alpha = dt / tau  →  consistent time constant regardless of
+                            // the actual repaint interval.  dt is clamped to [50, 500] ms
+                            // so an occasional slow frame doesn't over-weight one sample.
+                            let paused_now = job.paused.load(Ordering::Relaxed);
+                            let speed_mbps = if paused_now {
+                                // Reset the sample so resuming doesn't show a spike.
+                                job.speed_sample_ms.store(now_ms, Ordering::Relaxed);
+                                job.speed_sample_bytes.store(bytes_done, Ordering::Relaxed);
+                                job.current_speed_bps.store(0, Ordering::Relaxed);
                                 0.0
-                            };
-                            let speed_mbps = if elapsed_s > 0.0 {
-                                (bytes_done as f64 / (1024.0 * 1024.0)) / elapsed_s
                             } else {
-                                0.0
+                                let last_ms    = job.speed_sample_ms.load(Ordering::Relaxed);
+                                let last_bytes = job.speed_sample_bytes.load(Ordering::Relaxed);
+                                // Always advance the snapshot so the next delta is fresh.
+                                job.speed_sample_ms.store(now_ms, Ordering::Relaxed);
+                                job.speed_sample_bytes.store(bytes_done, Ordering::Relaxed);
+                                let old_bps = job.current_speed_bps.load(Ordering::Relaxed) as f64;
+                                if last_ms > 0 && now_ms > last_ms && bytes_done >= last_bytes {
+                                    let dt_s       = (now_ms - last_ms) as f64 / 1000.0;
+                                    let dt_clamped = dt_s.clamp(0.05, 0.5);
+                                    let db         = (bytes_done - last_bytes) as f64;
+                                    let instant    = db / dt_s;
+                                    // tau = 2 s; alpha scales with actual frame time.
+                                    let alpha    = (dt_clamped / 2.0).min(1.0);
+                                    let smoothed = if old_bps == 0.0 {
+                                        instant // bootstrap: accept first reading as-is
+                                    } else {
+                                        alpha * instant + (1.0 - alpha) * old_bps
+                                    };
+                                    job.current_speed_bps.store(smoothed as u64, Ordering::Relaxed);
+                                    smoothed / (1024.0 * 1024.0)
+                                } else {
+                                    old_bps / (1024.0 * 1024.0)
+                                }
                             };
                             let bar_text = format!(
                                 "{} / {}  ({:.1} MB/s)",
@@ -2656,17 +2757,39 @@ impl eframe::App for RusplorerApp {
                 #[cfg(windows)]
                 {
                     let screen_rect = ctx.input(|i| i.screen_rect());
-                    let cursor_outside = match hover_pos {
-                        Some(pos) => !screen_rect.contains(pos),
-                        None => true,
+                    let cursor_outside = if let Some(hwnd) = crate::ole::find_own_hwnd() {
+                        unsafe {
+                            use winapi::shared::windef::{POINT, RECT};
+                            use winapi::um::winuser::{GetCursorPos, GetWindowRect};
+                            let mut pt = POINT { x: 0, y: 0 };
+                            let mut wr: RECT = std::mem::zeroed();
+                            if GetCursorPos(&mut pt) != 0 && GetWindowRect(hwnd, &mut wr) != 0 {
+                                pt.x < wr.left || pt.x >= wr.right || pt.y < wr.top || pt.y >= wr.bottom
+                            } else {
+                                match hover_pos {
+                                    Some(pos) => !screen_rect.contains(pos),
+                                    None => true,
+                                }
+                            }
+                        }
+                    } else {
+                        match hover_pos {
+                            Some(pos) => !screen_rect.contains(pos),
+                            None => true,
+                        }
                     };
-                    let btn_held = if self.dnd_is_right_click { right_down } else { left_down };
+                    let hw_btn_held = unsafe {
+                        let vk = if self.dnd_is_right_click { 0x02 } else { 0x01 };
+                        windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(vk)
+                    } & (0x8000u16 as i16) != 0;
+                    let btn_held = if self.dnd_is_right_click { right_down } else { left_down } || hw_btn_held;
                     if btn_held && cursor_outside && !self.dnd_sources.is_empty() {
                         let sources = self.dnd_sources.clone();
                         let is_right = self.dnd_is_right_click;
                         // Reset internal DnD state before blocking OLE call
                         self.dnd_active = false;
                         self.dnd_is_right_click = false;
+                        self.dnd_from_tree = false;
                         self.dnd_sources.clear();
                         self.dnd_label.clear();
                         self.dnd_start_pos = None;
@@ -2701,8 +2824,8 @@ impl eframe::App for RusplorerApp {
                         self.dnd_suppress = 3;
                         if was_move {
                             self.selected_entries.clear();
+                            self.refresh_contents();
                         }
-                        self.refresh_contents();
                     }
                 }
 
@@ -2729,42 +2852,53 @@ impl eframe::App for RusplorerApp {
                         if drop_tab_idx.is_some() {
                             let tab_idx = drop_tab_idx.unwrap();
                             let tab_dest = self.tabs.get(tab_idx).map(|t| t.path.clone());
-                            let is_other_tab = tab_dest.as_ref()
-                                .map(|p| *p != self.current_path)
-                                .unwrap_or(false);
-
-                            if is_other_tab {
-                                // Drop onto a different tab: move files there.
-                                if let Some(dest) = tab_dest {
-                                    let sources: Vec<PathBuf> = all_sources.iter()
-                                        .filter(|s| **s != dest)
-                                        .cloned()
-                                        .collect();
-                                    if !sources.is_empty() {
-                                        if self.dnd_is_right_click {
-                                            let drop_pos = ctx.input(|i|
-                                                i.pointer.latest_pos().or(i.pointer.hover_pos()).unwrap_or_default()
-                                            );
-                                            self.dnd_right_drop_menu = Some((sources, dest, drop_pos));
-                                        } else {
-                                            self.start_copy_job(sources, dest, true, false);
-                                            self.selected_entries.clear();
-                                        }
+                            if let Some(dest) = tab_dest {
+                                let sources: Vec<PathBuf> = all_sources.iter()
+                                    .filter(|s| **s != dest)
+                                    .cloned()
+                                    .collect();
+                                if !sources.is_empty() {
+                                    if self.dnd_is_right_click {
+                                        let drop_pos = ctx.input(|i|
+                                            i.pointer.latest_pos().or(i.pointer.hover_pos()).unwrap_or_default()
+                                        );
+                                        self.dnd_right_drop_menu = Some((sources, dest, drop_pos));
+                                    } else {
+                                        // Any drop over a tab should transfer to that tab's folder,
+                                        // even if the tab has already been activated by hover.
+                                        self.start_copy_job(sources, dest, true, false, false);
+                                        self.selected_entries.clear();
                                     }
                                 }
-                            } else if !self.dnd_is_right_click
-                                && all_sources.len() == 1
-                                && all_sources[0].is_dir()
-                            {
-                                // Single folder dropped on current tab → open in new tab.
-                                self.new_tab(Some(all_sources[0].clone()));
-                                self.tab_scroll_to_active = true;
                             }
                         } else {
                             // Normal in-content drop: use detected folder target, or current directory.
-                            let dest = self.dnd_drop_target.take()
-                                .filter(|d| d.is_dir())
-                                .unwrap_or_else(|| self.current_path.clone());
+                            // Tree-originated drags must NOT fall back to current_path: if the
+                            // user drags a tree folder over itself (or any non-target area), the
+                            // drop should be a no-op rather than silently copying into whatever
+                            // folder is currently displayed.
+                            let dest_opt = self.dnd_drop_target.take()
+                                .filter(|d| d.is_dir());
+                            let dest = if self.dnd_from_tree {
+                                match dest_opt {
+                                    Some(d) => d,
+                                    None => {
+                                        self.dnd_active = false;
+                                        self.dnd_is_right_click = false;
+                                        self.dnd_from_tree = false;
+                                        self.dnd_tab_hover = None;
+                                        self.dnd_sources.clear();
+                                        self.dnd_label.clear();
+                                        self.dnd_start_pos = None;
+                                        self.dnd_drag_entry = None;
+                                        self.dnd_drop_target = None;
+                                        self.dnd_suppress = 2;
+                                        return;
+                                    }
+                                }
+                            } else {
+                                dest_opt.unwrap_or_else(|| self.current_path.clone())
+                            };
 
                             let sources: Vec<PathBuf> = self.dnd_sources
                                 .iter()
@@ -2782,7 +2916,7 @@ impl eframe::App for RusplorerApp {
                                     self.dnd_right_drop_menu = Some((sources, dest, drop_pos));
                                 } else {
                                     // Left-click drop: always move
-                                    self.start_copy_job(sources, dest.clone(), true, false);
+                                    self.start_copy_job(sources, dest.clone(), true, false, false);
                                     self.selected_entries.clear();
                                 }
                             }
@@ -2791,6 +2925,7 @@ impl eframe::App for RusplorerApp {
 
                     self.dnd_active = false;
                     self.dnd_is_right_click = false;
+                    self.dnd_from_tree = false;
                     self.dnd_tab_hover = None;
                     self.dnd_sources.clear();
                     self.dnd_label.clear();

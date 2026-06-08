@@ -178,6 +178,152 @@ fn rusplorer_source_drag_format() -> u16 {
     })
 }
 
+/// Register / retrieve the standard shell "Shell IDList Array" clipboard format
+/// (CFSTR_SHELLIDLIST).  Explorer always offers this format on file drags; the
+/// desktop / Explorer drop targets need it to enable the "Create shortcut here"
+/// verb in the right-drag menu (plain CF_HDROP alone is not enough).
+#[cfg(windows)]
+fn shell_idlist_format() -> u16 {
+    use std::sync::OnceLock;
+    static FMT: OnceLock<u16> = OnceLock::new();
+    *FMT.get_or_init(|| {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        let name: Vec<u16> = OsStr::new("Shell IDList Array")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe { winapi::um::winuser::RegisterClipboardFormatW(name.as_ptr()) as u16 }
+    })
+}
+
+/// Register / retrieve CFSTR_PREFERREDDROPEFFECT.
+///
+/// This lets the source suggest copy/move/link as the default shell action for
+/// drag-and-drop. On right-button drags, setting this to LINK helps Explorer/
+/// desktop expose "Create shortcut here" in the shortcut menu.
+#[cfg(windows)]
+fn preferred_drop_effect_format() -> u16 {
+    use std::sync::OnceLock;
+    static FMT: OnceLock<u16> = OnceLock::new();
+    *FMT.get_or_init(|| {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        let name: Vec<u16> = OsStr::new("Preferred DropEffect")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe { winapi::um::winuser::RegisterClipboardFormatW(name.as_ptr()) as u16 }
+    })
+}
+
+/// Build a CFSTR_SHELLIDLIST (CIDA) blob for the given files.
+///
+/// All files must share the same parent directory (they always do in Rusplorer —
+/// every drag originates from the current folder).  Returns `None` on any failure
+/// so the caller can fall back to a CF_HDROP-only data object with no regression.
+///
+/// CIDA layout:
+///   UINT cidl;                 // number of child items
+///   UINT aoffset[cidl + 1];    // [0] = parent PIDL, [1..=cidl] = child PIDLs
+///   <parent absolute PIDL bytes>
+///   <child-relative PIDL bytes>...
+#[cfg(windows)]
+fn build_shell_idlist(files: &[PathBuf]) -> Option<Vec<u8>> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+    use windows::Win32::UI::Shell::{ILCreateFromPathW, ILFindLastID, ILFree, ILGetSize};
+
+    if files.is_empty() {
+        return None;
+    }
+    let parent = files[0].parent()?;
+    // Require all files to share the parent directory.
+    for f in files {
+        if f.parent()? != parent {
+            return None;
+        }
+    }
+
+    let to_wide = |p: &std::path::Path| -> Vec<u16> {
+        OsStr::new(p.as_os_str())
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    };
+
+    unsafe {
+        // Parent absolute PIDL.
+        let parent_w = to_wide(parent);
+        let parent_pidl = ILCreateFromPathW(PCWSTR(parent_w.as_ptr()));
+        if parent_pidl.is_null() {
+            return None;
+        }
+        // Guard to free all allocated PIDLs on any early return.
+        let mut child_pidls: Vec<*const ITEMIDLIST> = Vec::with_capacity(files.len());
+        let free_all = |parent: *const ITEMIDLIST, children: &[*const ITEMIDLIST]| {
+            ILFree(Some(parent));
+            for c in children {
+                ILFree(Some(*c));
+            }
+        };
+
+        let parent_size = ILGetSize(Some(parent_pidl)) as usize;
+
+        // Child PIDLs (absolute), plus the relative (last id) slice info.
+        let mut child_rel: Vec<(*const u8, usize)> = Vec::with_capacity(files.len());
+        for f in files {
+            let fw = to_wide(f);
+            let abs = ILCreateFromPathW(PCWSTR(fw.as_ptr()));
+            if abs.is_null() {
+                free_all(parent_pidl, &child_pidls);
+                return None;
+            }
+            child_pidls.push(abs);
+            // Relative child PIDL = the last SHITEMID within the absolute PIDL.
+            let last = ILFindLastID(abs);
+            let rel_size = ILGetSize(Some(last)) as usize; // includes 2-byte terminator
+            child_rel.push((last as *const u8, rel_size));
+        }
+
+        let cidl = files.len();
+        let header_size = 4 * (cidl + 2); // cidl (UINT) + (cidl+1) offsets
+        let total = header_size
+            + parent_size
+            + child_rel.iter().map(|(_, s)| *s).sum::<usize>();
+
+        let mut blob = vec![0u8; total];
+        // cidl
+        blob[0..4].copy_from_slice(&(cidl as u32).to_le_bytes());
+        // offsets
+        let mut data_off = header_size;
+        // aoffset[0] = parent
+        blob[4..8].copy_from_slice(&(data_off as u32).to_le_bytes());
+        std::ptr::copy_nonoverlapping(
+            parent_pidl as *const u8,
+            blob.as_mut_ptr().add(data_off),
+            parent_size,
+        );
+        data_off += parent_size;
+        // aoffset[1..=cidl] = children
+        for (i, (rel_ptr, rel_size)) in child_rel.iter().enumerate() {
+            let off_pos = 8 + i * 4;
+            blob[off_pos..off_pos + 4].copy_from_slice(&(data_off as u32).to_le_bytes());
+            std::ptr::copy_nonoverlapping(
+                *rel_ptr,
+                blob.as_mut_ptr().add(data_off),
+                *rel_size,
+            );
+            data_off += *rel_size;
+        }
+
+        free_all(parent_pidl, &child_pidls);
+        Some(blob)
+    }
+}
+
 // ── OLE drag-out ─────────────────────────────────────────────────────────────
 
 /// Initiate an OLE drag-and-drop of the given files out to other applications (e.g. Explorer).
@@ -198,16 +344,16 @@ pub fn ole_drag_files_out(files: &[PathBuf], right_button: bool) -> bool {
     };
     use windows::Win32::System::Ole::{
         DoDragDrop, IDropSource, IDropSource_Impl, DROPEFFECT, DROPEFFECT_COPY,
-        DROPEFFECT_MOVE, DROPEFFECT_NONE,
+        DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE,
     };
     use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 
-    const CF_HDROP_RAW: u16 = 15;
     const MK_LBUTTON: u32 = 0x0001;
     const MK_RBUTTON: u32 = 0x0002;
     const DRAGDROP_S_DROP: HRESULT = HRESULT(0x00040100_i32);
     const DRAGDROP_S_CANCEL: HRESULT = HRESULT(0x00040101_i32);
     const DRAGDROP_S_USEDEFAULTCURSORS: HRESULT = HRESULT(0x00040102_i32);
+    const CF_HDROP_RAW: u16 = 15;
 
     let track_button: u32 = if right_button { MK_RBUTTON } else { MK_LBUTTON };
 
@@ -241,6 +387,14 @@ pub fn ole_drag_files_out(files: &[PathBuf], right_button: bool) -> bool {
         /// Custom clipboard format ID marking this drag as originating from Rusplorer.
         /// Always non-zero; used by other Rusplorer windows to refuse the drop.
         source_drag_fmt: u16,
+        /// Standard CFSTR_SHELLIDLIST format ID (0 = not available).
+        shellidlist_fmt: u16,
+        /// CIDA blob for CFSTR_SHELLIDLIST (empty when shellidlist_fmt == 0).
+        cida: Vec<u8>,
+        /// Standard CFSTR_PREFERREDDROPEFFECT format ID.
+        preferred_effect_fmt: u16,
+        /// Suggested drop effect as a DWORD DROPEFFECT_* value.
+        preferred_effect: u32,
     }
 
     impl IDataObject_Impl for HdropData_Impl {
@@ -265,12 +419,54 @@ pub fn ole_drag_files_out(files: &[PathBuf], right_button: bool) -> bool {
                     medium.tymed = TYMED_HGLOBAL.0 as u32;
                     medium.u.hGlobal = hmem;
                     Ok(medium)
-                } else if self.right_drag_fmt != 0 && fmt.cfFormat == self.right_drag_fmt
-                    || fmt.cfFormat == self.source_drag_fmt
-                {
-                    // Return a tiny HGLOBAL — the drop target only tests for the
-                    // format's existence via QueryGetData, but COM may call GetData
-                    // when marshalling across processes.
+                } else if self.shellidlist_fmt != 0 && fmt.cfFormat == self.shellidlist_fmt {
+                    // CFSTR_SHELLIDLIST (CIDA) — enables the "Create shortcut here"
+                    // verb on the desktop / Explorer drop targets.
+                    let hmem = GlobalAlloc(
+                        GLOBAL_ALLOC_FLAGS(0x0042),
+                        self.cida.len(),
+                    )?;
+                    let ptr = GlobalLock(hmem) as *mut u8;
+                    if ptr.is_null() {
+                        return Err(windows::core::Error::from_hresult(E_NOTIMPL));
+                    }
+                    std::ptr::copy_nonoverlapping(self.cida.as_ptr(), ptr, self.cida.len());
+                    let _ = GlobalUnlock(hmem);
+                    let mut medium: STGMEDIUM = std::mem::zeroed();
+                    medium.tymed = TYMED_HGLOBAL.0 as u32;
+                    medium.u.hGlobal = hmem;
+                    Ok(medium)
+                } else if fmt.cfFormat == self.preferred_effect_fmt {
+                    let hmem = GlobalAlloc(GLOBAL_ALLOC_FLAGS(0x0042), 4)?;
+                    let ptr = GlobalLock(hmem) as *mut u8;
+                    if ptr.is_null() {
+                        return Err(windows::core::Error::from_hresult(E_NOTIMPL));
+                    }
+                    let bytes = self.preferred_effect.to_le_bytes();
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, 4);
+                    let _ = GlobalUnlock(hmem);
+                    let mut medium: STGMEDIUM = std::mem::zeroed();
+                    medium.tymed = TYMED_HGLOBAL.0 as u32;
+                    medium.u.hGlobal = hmem;
+                    Ok(medium)
+                } else if fmt.cfFormat == self.source_drag_fmt {
+                    // Payload is the source PID (u32 LE) so the drop target can
+                    // distinguish drags from THIS process (must refuse to avoid
+                    // recursive self-feeding) from drags from ANOTHER Rusplorer
+                    // process (must accept — that's a real cross-window copy).
+                    let hmem = GlobalAlloc(GLOBAL_ALLOC_FLAGS(0x0042), 4)?;
+                    let ptr = GlobalLock(hmem) as *mut u8;
+                    if !ptr.is_null() {
+                        let pid = std::process::id().to_le_bytes();
+                        std::ptr::copy_nonoverlapping(pid.as_ptr(), ptr, 4);
+                        let _ = GlobalUnlock(hmem);
+                    }
+                    let mut medium: STGMEDIUM = std::mem::zeroed();
+                    medium.tymed = TYMED_HGLOBAL.0 as u32;
+                    medium.u.hGlobal = hmem;
+                    Ok(medium)
+                } else if self.right_drag_fmt != 0 && fmt.cfFormat == self.right_drag_fmt {
+                    // Tiny marker — only existence is checked.
                     let hmem = GlobalAlloc(GLOBAL_ALLOC_FLAGS(0x0042), 1)?;
                     let ptr = GlobalLock(hmem) as *mut u8;
                     if !ptr.is_null() {
@@ -297,6 +493,10 @@ pub fn ole_drag_files_out(files: &[PathBuf], right_button: bool) -> bool {
             unsafe {
                 let cf = (*pformatetc).cfFormat;
                 if cf == CF_HDROP_RAW {
+                    S_OK
+                } else if self.shellidlist_fmt != 0 && cf == self.shellidlist_fmt {
+                    S_OK
+                } else if cf == self.preferred_effect_fmt {
                     S_OK
                 } else if self.right_drag_fmt != 0 && cf == self.right_drag_fmt {
                     S_OK
@@ -337,6 +537,17 @@ pub fn ole_drag_files_out(files: &[PathBuf], right_button: bool) -> bool {
                 lindex: -1,
                 tymed: TYMED_HGLOBAL.0 as u32,
             }];
+            if self.shellidlist_fmt != 0 {
+                // Offer the Shell IDList Array first — Explorer-parity ordering;
+                // required for the desktop's "Create shortcut here" verb.
+                fmts.insert(0, FORMATETC {
+                    cfFormat: self.shellidlist_fmt,
+                    ptd: std::ptr::null_mut(),
+                    dwAspect: 1,
+                    lindex: -1,
+                    tymed: TYMED_HGLOBAL.0 as u32,
+                });
+            }
             if self.right_drag_fmt != 0 {
                 fmts.push(FORMATETC {
                     cfFormat: self.right_drag_fmt,
@@ -346,6 +557,13 @@ pub fn ole_drag_files_out(files: &[PathBuf], right_button: bool) -> bool {
                     tymed: TYMED_HGLOBAL.0 as u32,
                 });
             }
+            fmts.push(FORMATETC {
+                cfFormat: self.preferred_effect_fmt,
+                ptd: std::ptr::null_mut(),
+                dwAspect: 1,
+                lindex: -1,
+                tymed: TYMED_HGLOBAL.0 as u32,
+            });
             fmts.push(FORMATETC {
                 cfFormat: self.source_drag_fmt,
                 ptd: std::ptr::null_mut(),
@@ -402,17 +620,47 @@ pub fn ole_drag_files_out(files: &[PathBuf], right_button: bool) -> bool {
     // ── Perform OLE drag ─────────────────────────────────────────────────
     let right_drag_fmt = if right_button { rusplorer_right_drag_format() } else { 0 };
     let source_drag_fmt = rusplorer_source_drag_format();
-    let data_obj: IDataObject = HdropData { blob, right_drag_fmt, source_drag_fmt }.into();
+    let preferred_effect_fmt = preferred_drop_effect_format();
+    // Prefer LINK for right-drag so the shell can offer shortcut creation.
+    let preferred_effect = if right_button {
+        DROPEFFECT_LINK.0 as u32
+    } else {
+        DROPEFFECT_COPY.0 as u32
+    };
+    // Build the optional Shell IDList Array (CIDA). Any failure falls back to a
+    // CF_HDROP-only data object with no behavioural regression.
+    let (shellidlist_fmt, cida) = match build_shell_idlist(files) {
+        Some(blob) if !blob.is_empty() => (shell_idlist_format(), blob),
+        _ => (0u16, Vec::new()),
+    };
+    let data_obj: IDataObject = HdropData {
+        blob,
+        right_drag_fmt,
+        source_drag_fmt,
+        shellidlist_fmt,
+        cida,
+        preferred_effect_fmt,
+        preferred_effect,
+    }
+    .into();
     let source: IDropSource = DropSource { button_mask: track_button }.into();
     let mut effect = DROPEFFECT_NONE;
     let hr = unsafe {
         DoDragDrop(
             &data_obj,
             &source,
-            DROPEFFECT_COPY | DROPEFFECT_MOVE,
+            // Include LINK so shell right-drag menus can offer
+            // "Create shortcut here" on Desktop/Explorer targets.
+            DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK,
             &mut effect,
         )
     };
+    log_dnd(&format!(
+        "DoDragDrop: right={} hr=0x{:08X} effect=0x{:08X}",
+        right_button,
+        hr.0 as u32,
+        effect.0 as u32
+    ));
     hr == DRAGDROP_S_DROP && effect == DROPEFFECT_MOVE
 }
 
@@ -464,11 +712,14 @@ pub fn register_ole_drop_target(
             pdweffect: *mut DROPEFFECT,
         ) -> windows::core::Result<()> {
             self.last_key_state.set(grfkeystate.0);
-            // Refuse drops whose IDataObject was produced by THIS Rusplorer
-            // process (carries our source_drag_fmt marker). Otherwise a botched
-            // cross-window drag whose drop happens to land back on our own
-            // window can self-feed our IDropTarget, copying/moving the dragged
-            // item into self.current_path.
+            // Refuse drops whose IDataObject was produced by THIS very Rusplorer
+            // process (PID payload of the source_drag_fmt marker matches our
+            // own PID). Otherwise a botched cross-window drag whose drop happens
+            // to land back on our own window can self-feed our IDropTarget,
+            // copying/moving the dragged item into self.current_path.
+            //
+            // Drags coming from a DIFFERENT Rusplorer process must NOT be
+            // refused — that's a legitimate cross-instance copy.
             let from_self = if let Some(obj) = pdataobj {
                 let fmt = FORMATETC {
                     cfFormat: rusplorer_source_drag_format(),
@@ -477,13 +728,31 @@ pub fn register_ole_drop_target(
                     lindex: -1,
                     tymed: TYMED_HGLOBAL.0 as u32,
                 };
-                unsafe { obj.QueryGetData(&fmt) == S_OK }
+                unsafe {
+                    match obj.GetData(&fmt) {
+                        Ok(medium) => {
+                            let hmem = medium.u.hGlobal;
+                            let locked = GlobalLock(hmem) as *const u8;
+                            let same_pid = if !locked.is_null() {
+                                let src_pid = std::ptr::read_unaligned(locked as *const u32);
+                                let _ = GlobalUnlock(hmem);
+                                src_pid == std::process::id()
+                            } else {
+                                // Couldn't read payload — be conservative and
+                                // treat as foreign so cross-instance drops work.
+                                false
+                            };
+                            same_pid
+                        }
+                        Err(_) => false,
+                    }
+                }
             } else {
                 false
             };
             if from_self {
                 self.refused_drag.set(true);
-                log_dnd("DragEnter: refusing — IDataObject originated in this Rusplorer process");
+                log_dnd("DragEnter: refusing own-process IDataObject");
                 unsafe { *pdweffect = DROPEFFECT_NONE; }
                 return Ok(());
             }

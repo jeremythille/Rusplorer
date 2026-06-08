@@ -336,6 +336,13 @@ pub struct CopyJobState {
     pub total_bytes: AtomicU64,
     /// Unix timestamp in milliseconds when actual transfer started.
     pub started_at_ms: AtomicU64,
+    /// Unix timestamp (ms) of the last instantaneous-speed sample taken by the UI.
+    /// 0 = no sample yet.
+    pub speed_sample_ms: AtomicU64,
+    /// `bytes_copied` value at the last speed sample.
+    pub speed_sample_bytes: AtomicU64,
+    /// Last computed instantaneous speed in bytes/second (rolling sample).
+    pub current_speed_bps: AtomicU64,
     /// Name of the file currently being processed (for display).
     pub current_file: Mutex<String>,
     /// User requested pause.
@@ -369,6 +376,9 @@ pub struct CopyJobState {
     pub overwrite_all: AtomicBool,
     /// Set by worker after user chose "Skip all".
     pub skip_all: AtomicBool,
+    /// When true, completion of this job must NOT push a new undo entry.
+    /// Used by the undo system itself so undo-of-undo chains are prevented.
+    pub no_undo: AtomicBool,
 }
 
 impl CopyJobState {
@@ -379,6 +389,9 @@ impl CopyJobState {
             bytes_copied: AtomicU64::new(0),
             total_bytes: AtomicU64::new(0),
             started_at_ms: AtomicU64::new(0),
+            speed_sample_ms: AtomicU64::new(0),
+            speed_sample_bytes: AtomicU64::new(0),
+            current_speed_bps: AtomicU64::new(0),
             current_file: Mutex::new(String::new()),
             paused: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
@@ -394,6 +407,7 @@ impl CopyJobState {
             skipped_identical: Mutex::new(Vec::new()),
             overwrite_all: AtomicBool::new(false),
             skip_all: AtomicBool::new(false),
+            no_undo: AtomicBool::new(false),
         }
     }
 }

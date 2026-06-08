@@ -31,14 +31,14 @@ impl RusplorerApp {
                     if ui.button("Move here").clicked() {
                         let files = self.dragged_files.clone();
                         let dest = self.current_path.clone();
-                        self.start_copy_job(files, dest, true, false);
+                        self.start_copy_job(files, dest, true, false, false);
                         self.show_drop_menu = false;
                         self.dragged_files.clear();
                     }
                     if ui.button("Copy here").clicked() {
                         let files = self.dragged_files.clone();
                         let dest = self.current_path.clone();
-                        self.start_copy_job(files, dest, false, false);
+                        self.start_copy_job(files, dest, false, false, false);
                         self.show_drop_menu = false;
                         self.dragged_files.clear();
                     }
@@ -107,12 +107,12 @@ impl RusplorerApp {
             });
             match action {
                 Some("move") => {
-                    self.start_copy_job(sources, dest, true, false);
+                    self.start_copy_job(sources, dest, true, false, false);
                     self.selected_entries.clear();
                     self.dnd_right_drop_menu = None;
                 }
                 Some("copy") => {
-                    self.start_copy_job(sources, dest, false, false);
+                    self.start_copy_job(sources, dest, false, false, false);
                     self.dnd_right_drop_menu = None;
                 }
                 #[cfg(windows)]
@@ -431,9 +431,13 @@ impl RusplorerApp {
             // Close context menu if clicked elsewhere
             if ctx.input(|i| i.pointer.primary_clicked() || i.key_pressed(egui::Key::Escape)) {
                 self.show_context_menu = false;
-                self.context_menu_tree_path = None;
-                self.context_menu_tree_highlight = None;
-                self.context_menu_selection.clear();
+                // Don't wipe context_menu_tree_path here when the rename dialog was just
+                // opened by this very click — the rename logic needs it to build old_path.
+                if !self.show_rename_dialog {
+                    self.context_menu_tree_path = None;
+                    self.context_menu_tree_highlight = None;
+                    self.context_menu_selection.clear();
+                }
             }
         }
 
@@ -848,34 +852,54 @@ impl RusplorerApp {
                                 .map(|p| p.to_path_buf())
                                 .unwrap_or_else(|| self.current_path.clone());
                             let new_path = parent.join(&final_name);
-                            if std::fs::rename(&old_path, &new_path).is_ok() {
-                                // Record undo action before cache/UI updates.
-                                self.undo_stack.push(crate::types::UndoAction::Rename {
-                                    old_path: old_path.clone(),
-                                    new_path: new_path.clone(),
-                                });
-                                // Refresh tree cache: update parent's children list (rename
-                                // changed its contents), and drop the now-gone old path entry.
-                                let updated = crate::fs_ops::read_dir_children(&parent);
-                                self.tree_children_cache.insert(parent.clone(), updated);
-                                self.tree_children_cache.remove(&old_path);
-                                self.context_menu_tree_path = None;
-                                self.refresh_contents();
+                            match std::fs::rename(&old_path, &new_path) {
+                                Ok(()) => {
+                                    // Record undo action before cache/UI updates.
+                                    self.undo_stack.push(crate::types::UndoAction::Rename {
+                                        old_path: old_path.clone(),
+                                        new_path: new_path.clone(),
+                                    });
+                                    // Refresh tree cache: update parent's children list (rename
+                                    // changed its contents), and drop the now-gone old path entry.
+                                    let updated = crate::fs_ops::read_dir_children(&parent);
+                                    self.tree_children_cache.insert(parent.clone(), updated);
+                                    self.tree_children_cache.remove(&old_path);
+                                    self.context_menu_tree_path = None;
+                                    self.refresh_contents();
 
-                                // Keep renamed item selected when it belongs to the current view.
-                                if parent == self.current_path {
-                                    self.selected_entries.clear();
-                                    self.selected_entries.insert(final_name);
+                                    // Keep renamed item selected when it belongs to the current view.
+                                    if parent == self.current_path {
+                                        self.selected_entries.clear();
+                                        self.selected_entries.insert(final_name);
+                                    }
+                                }
+                                Err(e) => {
+                                    // Surface the OS error message so the user knows why
+                                    // the rename didn't happen (e.g. file open in Excel).
+                                    self.delete_feedback_msg = Some(
+                                        format!("Rename failed: {}", e)
+                                    );
+                                    self.delete_feedback_until = Some(
+                                        std::time::Instant::now()
+                                            + std::time::Duration::from_secs(8)
+                                    );
+                                    self.delete_feedback_is_error = true;
+                                    // Keep dialog open so the user can try a different name
+                                    // or close it manually.
+                                    do_rename = false;
                                 }
                             }
 
                         }
                     }
                     self.new_folder_mode = false;
-                    self.show_rename_dialog = false;
+                    if do_rename {
+                        self.show_rename_dialog = false;
+                    }
                 } else if close_dialog {
                     self.new_folder_mode = false;
                     self.show_rename_dialog = false;
+                    self.context_menu_tree_path = None;
                 }
             }
         }

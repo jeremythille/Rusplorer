@@ -209,6 +209,7 @@ impl RusplorerApp {
                                 self.dnd_label = format!("\u{1F4C1} {}", name);
                                 self.dnd_active = true;
                                 self.dnd_is_right_click = false;
+                                self.dnd_from_tree = true;
                                 self.tree_dnd_start_pos = None;
                                 self.tree_dnd_source = None;
                             }

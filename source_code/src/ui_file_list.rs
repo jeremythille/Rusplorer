@@ -355,8 +355,7 @@ impl RusplorerApp {
                                 )
                                 .fill(egui::Color32::from_rgb(255, 245, 150))
                                 .frame(false)
-                            } else if entry.name.to_ascii_lowercase().ends_with(".sfk")
-                                || entry.name.to_ascii_lowercase().ends_with(".sfap0") {
+                            } else if [".sfk", ".sfap0", ".bak"].iter().any(|ext| entry.name.to_ascii_lowercase().ends_with(ext)) {
                                 egui::Button::new(
                                     Self::name_layout_job(&display_name, false, egui::Color32::from_rgb(0xBF, 0xBF, 0xBF), false, dark_mode)
                                 )
@@ -369,10 +368,6 @@ impl RusplorerApp {
                             };
 
                             let button = button.sense(egui::Sense::click_and_drag());
-                            // Capture the full name-column rect before rendering the button
-                            // so click/right-click detection covers the whole column, not
-                            // just the narrow text area, without changing the button appearance.
-                            let name_col_rect = ui.max_rect();
                             let response = ui.horizontal(|ui| ui.add(button)).inner;
 
                             // Sh when the name was truncated.
@@ -384,23 +379,25 @@ impl RusplorerApp {
                                 );
                             }
 
-                            // For DnD drop-target detection use the full row width, not just
-                            // the name-button width (which is as narrow as the text).
-                            // Hovering anywhere on the row — name, size, or date column —
-                            // should be sufficient to identify it as a drop target.
+                            // For DnD drop-target detection and rubber-band hit-testing use
+                            // the full row width so hovering anywhere on the row highlights it.
                             let full_row_rect = egui::Rect::from_min_size(
                                 response.rect.min,
                                 egui::vec2(name_col_w + size_col_w + date_col_w, response.rect.height()),
                             );
                             self.entry_rects.insert(entry.name.clone(), full_row_rect);
-                            // Use the full row rect (name + size + date columns) so that
-                            // clicking anywhere on a row starts DnD and prevents the
-                            // rubber-band from starting (instead of only the name text area).
-                            let cursor_over_name = ui.input(|i| {
-                                i.pointer
-                                    .hover_pos()
-                                    .map_or(false, |p| full_row_rect.contains(p))
-                            }) || response.hovered();
+                            // For DnD initiation and rubber-band suppression, check the
+                            // *press origin* (where the mouse was first pressed) against the
+                            // actual rendered button rect.  This means only pressing directly
+                            // on the file-name text starts a DnD; pressing anywhere else in
+                            // the row (empty name column space, size column, date column)
+                            // lets rubber-band selection start instead.
+                            let press_origin_on_entry = ui.input(|i| {
+                                i.pointer.press_origin()
+                                    .map_or(false, |p| full_row_rect.contains(p)
+                                        && response.rect.contains(p))
+                            });
+                            let cursor_over_name = press_origin_on_entry || response.hovered();
                             if cursor_over_name {
                                 self.any_button_hovered = true;
                             }
@@ -556,12 +553,16 @@ impl RusplorerApp {
                             // Use raw pointer-position check instead of response.secondary_clicked()
                             // because secondary_clicked() relies on hovered() which returns false
                             // when a Foreground Area (bg context menu) overlaps this entry.
+                            // Use response.rect (just the button area), not the whole name column,
+                            // so right-clicking the empty padding to the right of a short name
+                            // opens the background "Refresh / New …" menu instead of this entry's
+                            // context menu.
                             let raw_secondary = !self.dnd_is_right_click
                                 && self.dnd_suppress == 0
                                 && ctx.input(|i| i.pointer.secondary_released())
                                 && ctx.input(|i| {
                                     i.pointer.hover_pos()
-                                        .map_or(false, |p| name_col_rect.contains(p))
+                                        .map_or(false, |p| response.rect.contains(p))
                                 });
 
                             if raw_secondary {

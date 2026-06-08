@@ -10,6 +10,17 @@ use notify::{RecursiveMode, Watcher, recommended_watcher};
 use crate::fs_ops::{spawn_copy_job, read_dir_children, CopyJobState};
 use super::RusplorerApp;
 
+#[derive(Clone, Copy)]
+pub(crate) enum WatchEventKind {
+    Modify,
+    Structural,
+}
+
+pub(crate) struct WatchEvent {
+    pub(crate) kind: WatchEventKind,
+    pub(crate) path: PathBuf,
+}
+
 /// Returns the set of uppercase drive letters touched by a copy job.
 /// On non-Windows or UNC paths the set may be empty (no queuing penalty).
 fn drives_of(sources: &[PathBuf], dest: &PathBuf) -> std::collections::HashSet<char> {
@@ -55,14 +66,56 @@ impl RusplorerApp {
         self.delete_feedback_is_error = false;
     }
 
+    /// Refresh tree state after removing one or more paths from disk.
+    /// This keeps the left panel from showing stale folders after delete.
+    pub(crate) fn invalidate_tree_after_delete(&mut self, paths: &[PathBuf]) {
+        use std::collections::HashSet;
+
+        if paths.is_empty() {
+            return;
+        }
+
+        let deleted: HashSet<PathBuf> = paths.iter().cloned().collect();
+        let mut parents_to_refresh: HashSet<PathBuf> = HashSet::new();
+
+        for deleted_path in paths {
+            let stale_keys: Vec<PathBuf> = self
+                .tree_children_cache
+                .keys()
+                .filter(|cached| cached.as_path().starts_with(deleted_path))
+                .cloned()
+                .collect();
+
+            for stale in stale_keys {
+                self.tree_children_cache.remove(&stale);
+                self.tree_expanded.remove(&stale);
+            }
+
+            if let Some(parent) = deleted_path.parent() {
+                let parent = parent.to_path_buf();
+                if !deleted.contains(&parent) {
+                    parents_to_refresh.insert(parent);
+                }
+            }
+        }
+
+        for parent in parents_to_refresh {
+            let updated = read_dir_children(&parent);
+            self.tree_children_cache.insert(parent, updated);
+        }
+    }
+
     /// Start an async background copy/move job.  Returns immediately.
     /// `clear_clipboard` – set `true` for cut-paste so the clipboard is cleared on completion.
+    /// `no_undo` – set `true` when called from the undo system itself so the reverse job
+    /// does not push another entry onto the undo stack (prevents undo-of-undo chains).
     pub(crate) fn start_copy_job(
         &mut self,
         sources: Vec<PathBuf>,
         dest: PathBuf,
         is_move: bool,
         clear_clipboard: bool,
+        no_undo: bool,
     ) {
         #[cfg(windows)]
         crate::ole::log_dnd(&format!(
@@ -72,6 +125,7 @@ impl RusplorerApp {
         let dest_display = dest.to_string_lossy().to_string();
         let state = Arc::new(CopyJobState::new(is_move, dest_display));
         state.clear_clipboard.store(clear_clipboard, Ordering::Relaxed);
+        state.no_undo.store(no_undo, Ordering::Relaxed);
         // Record original sources so the undo system can reverse a move.
         *state.original_sources.lock().unwrap() = sources.clone();
         let new_drives = drives_of(&sources, &dest);
@@ -125,17 +179,16 @@ impl RusplorerApp {
             let tx = tx.clone();
             if let Ok(mut watcher) = recommended_watcher(move |res| {
                 match res {
-                    Ok(notify::event::Event {
-                        kind:
-                            notify::event::EventKind::Modify(_)
-                            | notify::event::EventKind::Create(_)
-                            | notify::event::EventKind::Remove(_),
-                        paths,
-                        ..
-                    }) => {
+                    Ok(notify::event::Event { kind, paths, .. }) => {
+                        let event_kind = match kind {
+                            notify::event::EventKind::Modify(_) => WatchEventKind::Modify,
+                            notify::event::EventKind::Create(_)
+                            | notify::event::EventKind::Remove(_) => WatchEventKind::Structural,
+                            _ => return,
+                        };
                         for path in paths {
                             if let Ok(tx) = tx.lock() {
-                                let _ = tx.send(path);
+                                let _ = tx.send(WatchEvent { kind: event_kind, path });
                             }
                         }
                     }
@@ -154,20 +207,68 @@ impl RusplorerApp {
     }
 
     pub(crate) fn process_file_changes(&mut self) {
-        // Drain all watcher events without making any filesystem calls (which would
-        // block the UI thread during large copies).  Any event for the current
-        // directory simply marks that a debounced refresh is needed; the actual
-        // disk I/O happens later in flush_watch_debounce → refresh_contents.
+        // Smart watcher strategy:
+        // - file modify events update only that file's displayed size (cheap)
+        // - structural events (create/remove/unknown) trigger a debounced full refresh
+        // This avoids restarting directory-size scans every few hundred ms while
+        // a large download/copy is appending to a single file.
         if let Some(ref rx) = self.watch_receiver {
-            while let Ok(path) = rx.try_recv() {
+            let mut modified_any = false;
+            let mut must_recompute_max = false;
+            while let Ok(event) = rx.try_recv() {
+                let path = event.path;
                 if path.parent().map_or(false, |p| p == self.current_path) {
-                    self.watch_pending_refresh = Some(std::time::Instant::now());
+                    match event.kind {
+                        WatchEventKind::Modify => {
+                            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                                if let Some(entry) = self.contents.iter().find(|e| e.name == name) {
+                                    if !entry.is_dir {
+                                        let old_size = self.file_sizes.get(&path).copied().unwrap_or(0);
+                                        let new_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                                        if old_size != new_size {
+                                            self.file_sizes.insert(path.clone(), new_size);
+                                            modified_any = true;
+                                            if new_size > self.max_file_size || old_size == self.max_file_size {
+                                                must_recompute_max = true;
+                                            }
+                                        }
+                                    } else {
+                                        self.watch_pending_refresh = Some(std::time::Instant::now());
+                                    }
+                                } else {
+                                    // Unknown path in current folder: keep behavior safe.
+                                    self.watch_pending_refresh = Some(std::time::Instant::now());
+                                }
+                            }
+                        }
+                        WatchEventKind::Structural => {
+                            self.watch_pending_refresh = Some(std::time::Instant::now());
+                        }
+                    }
+                }
+            }
+
+            if modified_any {
+                if must_recompute_max {
+                    let mut max = 0u64;
+                    for entry in &self.contents {
+                        if entry.name.starts_with("[..]") { continue; }
+                        let full_path = self.current_path.join(&entry.name);
+                        if let Some(size) = self.file_sizes.get(&full_path) {
+                            max = max.max(*size);
+                        }
+                    }
+                    self.max_file_size = max;
+                }
+                if self.sort_column == crate::types::SortColumn::Size {
+                    self.sort_contents();
                 }
             }
         }
     }
 
-    /// Call each frame: fires the debounced file-watcher refresh after 500 ms of quiet.
+    /// Call each frame: fires the debounced full refresh after 500 ms of quiet
+    /// (only for structural changes, not for regular file growth).
     pub(crate) fn flush_watch_debounce(&mut self) {
         if let Some(t) = self.watch_pending_refresh {
             if t.elapsed().as_millis() >= 500 {
@@ -296,22 +397,38 @@ impl RusplorerApp {
                 self.refresh_contents();
             }
             UndoAction::Move { sources, dest } => {
-                // Move each file from dest back to its original location.
+                // Reverse the move: send each file from dest back to its original parent.
+                // Group by original parent so each parent gets one copy job (more efficient
+                // and mirrors the way the original move was done).
+                let mut by_parent: std::collections::HashMap<PathBuf, Vec<PathBuf>> =
+                    std::collections::HashMap::new();
                 for original in &sources {
-                    if let Some(fname) = original.file_name() {
+                    if let (Some(fname), Some(parent)) =
+                        (original.file_name(), original.parent())
+                    {
                         let at_dest = dest.join(fname);
                         if at_dest.exists() {
-                            if let Some(parent) = original.parent() {
-                                let _ = std::fs::create_dir_all(parent);
-                            }
-                            let _ = std::fs::rename(&at_dest, original);
+                            by_parent
+                                .entry(parent.to_path_buf())
+                                .or_default()
+                                .push(at_dest);
                         }
                     }
                 }
-                // Refresh tree cache for the destination folder.
-                let updated_dest = crate::fs_ops::read_dir_children(&dest);
-                self.tree_children_cache.insert(dest, updated_dest);
-                // Refresh current view.
+                if by_parent.is_empty() {
+                    self.delete_feedback_msg =
+                        Some("Undo failed: files no longer found at destination.".to_string());
+                    self.delete_feedback_until = Some(
+                        std::time::Instant::now() + std::time::Duration::from_secs(5),
+                    );
+                    self.delete_feedback_is_error = true;
+                } else {
+                    for (parent_dir, files_at_dest) in by_parent {
+                        let _ = std::fs::create_dir_all(&parent_dir);
+                        // no_undo=true prevents creating an undo-of-undo entry.
+                        self.start_copy_job(files_at_dest, parent_dir, true, false, true);
+                    }
+                }
                 self.refresh_contents();
             }
             UndoAction::Delete { paths } => {
