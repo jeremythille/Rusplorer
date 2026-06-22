@@ -345,6 +345,10 @@ pub struct CopyJobState {
     pub current_speed_bps: AtomicU64,
     /// Name of the file currently being processed (for display).
     pub current_file: Mutex<String>,
+    /// Bytes copied for the currently active file.
+    pub current_file_bytes: AtomicU64,
+    /// Total bytes of the currently active file.
+    pub current_file_total_bytes: AtomicU64,
     /// User requested pause.
     pub paused: AtomicBool,
     /// User requested abort.
@@ -393,6 +397,8 @@ impl CopyJobState {
             speed_sample_bytes: AtomicU64::new(0),
             current_speed_bps: AtomicU64::new(0),
             current_file: Mutex::new(String::new()),
+            current_file_bytes: AtomicU64::new(0),
+            current_file_total_bytes: AtomicU64::new(0),
             paused: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
             done: AtomicBool::new(false),
@@ -441,9 +447,84 @@ fn tally_dir(dir: &Path, count: &mut usize, bytes: &mut u64) {
     }
 }
 
-/// Copy a single file using chunked I/O (256 KB), updating `bytes_copied`.
-/// Preserves the source file's timestamps on the destination.
-fn copy_file_chunked(
+#[cfg(windows)]
+fn is_transient_device_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        // Common removable-media / transient sharing / transport hiccups.
+        Some(21) | Some(32) | Some(33) | Some(433) | Some(995) | Some(1117)
+    )
+}
+
+#[cfg(not(windows))]
+fn is_transient_device_error(_err: &std::io::Error) -> bool {
+    false
+}
+
+fn is_transient_io_error(err: &std::io::Error) -> bool {
+    if is_transient_device_error(err) {
+        return true;
+    }
+    matches!(err.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)
+}
+
+fn retry_delay_ms(attempt: u32) -> u64 {
+    150 * attempt as u64
+}
+
+fn read_dir_entries_with_retries(src: &Path) -> std::io::Result<Vec<std::fs::DirEntry>> {
+    let mut attempt: u32 = 0;
+    const MAX_RETRIES: u32 = 2;
+    loop {
+        let mut entries = Vec::new();
+        let iter = match std::fs::read_dir(src) {
+            Ok(v) => v,
+            Err(e) if is_transient_io_error(&e) && attempt < MAX_RETRIES => {
+                attempt += 1;
+                #[cfg(windows)]
+                crate::ole::log_dnd(&format!(
+                    "Transient read_dir error {} for {} (attempt {}/{})",
+                    e,
+                    src.display(),
+                    attempt,
+                    MAX_RETRIES + 1
+                ));
+                std::thread::sleep(std::time::Duration::from_millis(retry_delay_ms(attempt)));
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+
+        let mut should_retry = false;
+        for entry in iter {
+            match entry {
+                Ok(e) => entries.push(e),
+                Err(e) if is_transient_io_error(&e) && attempt < MAX_RETRIES => {
+                    attempt += 1;
+                    should_retry = true;
+                    #[cfg(windows)]
+                    crate::ole::log_dnd(&format!(
+                        "Transient read_dir entry error {} for {} (attempt {}/{})",
+                        e,
+                        src.display(),
+                        attempt,
+                        MAX_RETRIES + 1
+                    ));
+                    std::thread::sleep(std::time::Duration::from_millis(retry_delay_ms(attempt)));
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        if should_retry {
+            continue;
+        }
+        return Ok(entries);
+    }
+}
+
+fn copy_file_chunked_once(
     src: &Path,
     dst: &Path,
     state: &CopyJobState,
@@ -476,10 +557,58 @@ fn copy_file_chunked(
         if n == 0 { break; }
         writer.write_all(&buf[..n])?;
         state.bytes_copied.fetch_add(n as u64, Ordering::Relaxed);
+        state.current_file_bytes.fetch_add(n as u64, Ordering::Relaxed);
     }
     writer.flush()?;
     drop(reader);
     drop(writer);
+    Ok(())
+}
+
+/// Copy a single file using chunked I/O (256 KB), updating `bytes_copied`.
+/// Preserves the source file's timestamps on the destination.
+fn copy_file_chunked(
+    src: &Path,
+    dst: &Path,
+    state: &CopyJobState,
+) -> std::io::Result<()> {
+    let file_total = src.metadata().map(|m| m.len()).unwrap_or(0);
+    state
+        .current_file_total_bytes
+        .store(file_total, Ordering::Relaxed);
+    state.current_file_bytes.store(0, Ordering::Relaxed);
+
+    let mut attempt: u32 = 0;
+    const MAX_RETRIES: u32 = 2;
+    loop {
+        state.current_file_bytes.store(0, Ordering::Relaxed);
+        let _ = std::fs::remove_file(dst);
+        match copy_file_chunked_once(src, dst, state) {
+            Ok(()) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return Err(e),
+            Err(e) if is_transient_io_error(&e) && attempt < MAX_RETRIES => {
+                attempt += 1;
+                #[cfg(windows)]
+                crate::ole::log_dnd(&format!(
+                    "Transient copy error {} for {} (attempt {}/{})",
+                    e,
+                    src.display(),
+                    attempt,
+                    MAX_RETRIES + 1
+                ));
+                std::thread::sleep(std::time::Duration::from_millis(retry_delay_ms(attempt)));
+                continue;
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(dst);
+                return Err(e);
+            }
+        }
+    }
+
+    state
+        .current_file_bytes
+        .store(file_total, Ordering::Relaxed);
 
     // Preserve file timestamps
     preserve_file_times(src, dst);
@@ -627,24 +756,66 @@ fn copy_dir_chunked(
     src: &Path,
     dst: &Path,
     state: &CopyJobState,
+    failures: &mut Vec<String>,
 ) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)?.flatten() {
+    let mut mkdir_attempt: u32 = 0;
+    const MAX_MKDIR_RETRIES: u32 = 2;
+    loop {
+        match std::fs::create_dir_all(dst) {
+            Ok(()) => break,
+            Err(e) if is_transient_io_error(&e) && mkdir_attempt < MAX_MKDIR_RETRIES => {
+                mkdir_attempt += 1;
+                #[cfg(windows)]
+                crate::ole::log_dnd(&format!(
+                    "Transient create_dir_all error {} for {} (attempt {}/{})",
+                    e,
+                    dst.display(),
+                    mkdir_attempt,
+                    MAX_MKDIR_RETRIES + 1
+                ));
+                std::thread::sleep(std::time::Duration::from_millis(retry_delay_ms(mkdir_attempt)));
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    for entry in read_dir_entries_with_retries(src)? {
         if state.cancelled.load(Ordering::Relaxed) {
             return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
         }
         let path = entry.path();
         let dest_path = dst.join(entry.file_name());
         if path.is_dir() {
-            copy_dir_chunked(&path, &dest_path, state)?;
+            copy_dir_chunked(&path, &dest_path, state, failures)?;
         } else {
             let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
             *state.current_file.lock().unwrap() = name;
+            let file_total = path.metadata().map(|m| m.len()).unwrap_or(0);
+            state
+                .current_file_total_bytes
+                .store(file_total, Ordering::Relaxed);
+            state.current_file_bytes.store(0, Ordering::Relaxed);
             match check_file_conflict(&path, &dest_path, state) {
-                FileAction::Skip => { state.files_done.fetch_add(1, Ordering::Relaxed); }
-                FileAction::Copy => {
-                    copy_file_chunked(&path, &dest_path, state)?;
+                FileAction::Skip => {
+                    state
+                        .current_file_bytes
+                        .store(file_total, Ordering::Relaxed);
                     state.files_done.fetch_add(1, Ordering::Relaxed);
+                }
+                FileAction::Copy => {
+                    match copy_file_chunked(&path, &dest_path, state) {
+                        Ok(()) => {
+                            state.files_done.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return Err(e),
+                        Err(e) => {
+                            failures.push(format!("{}: {}", path.display(), e));
+                            state.files_done.fetch_add(1, Ordering::Relaxed);
+                            let _ = std::fs::remove_file(&dest_path);
+                            continue;
+                        }
+                    }
                 }
             }
         }
@@ -667,10 +838,20 @@ fn safe_remove_source_after_move(source: &Path, state: &CopyJobState) -> std::io
         if delete_to_recycle_bin(&[source.to_path_buf()]) {
             return Ok(());
         }
-        let msg = format!(
-            "Move safety stop: couldn't send original to Recycle Bin: {}",
-            source.display()
-        );
+
+        // Some systems disable Recycle Bin on a drive or block silent recycle
+        // operations. After a successful copy fallback, finish the move by
+        // deleting the original directly.
+        let remove_res = if source.is_dir() {
+            std::fs::remove_dir_all(source)
+        } else {
+            std::fs::remove_file(source)
+        };
+        if remove_res.is_ok() || !source.exists() {
+            return Ok(());
+        }
+
+        let msg = format!("Move cleanup failed for {}", source.display());
         *state.error.lock().unwrap() = Some(msg.clone());
         return Err(std::io::Error::new(std::io::ErrorKind::Other, msg));
     }
@@ -726,9 +907,23 @@ fn run_copy_job(sources: Vec<PathBuf>, dest: PathBuf, state: &CopyJobState) {
     let (total_files, total_bytes) = tally_sources(&sources);
     state.files_total.store(total_files, Ordering::Relaxed);
     state.total_bytes.store(total_bytes, Ordering::Relaxed);
+    let mut failures: Vec<String> = Vec::new();
 
     for source in &sources {
         if state.cancelled.load(Ordering::Relaxed) { break; }
+
+        if source.is_file() {
+            *state.current_file.lock().unwrap() = source
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let file_total = source.metadata().map(|m| m.len()).unwrap_or(0);
+            state
+                .current_file_total_bytes
+                .store(file_total, Ordering::Relaxed);
+            state.current_file_bytes.store(0, Ordering::Relaxed);
+        }
 
         // Hard safety guard: never allow dropping/copying a directory into
         // itself or one of its descendants (can cause recursive growth and
@@ -759,6 +954,25 @@ fn run_copy_job(sources: Vec<PathBuf>, dest: PathBuf, state: &CopyJobState) {
             target
         };
 
+        // Explicit type-collision guard: a file and a directory cannot share the
+        // same name in one destination directory.
+        if source.is_dir() && target.exists() && target.is_file() {
+            *state.error.lock().unwrap() = Some(format!(
+                "Cannot create folder '{}' because a file with the same name already exists in '{}'",
+                file_name.to_string_lossy(),
+                dest.display()
+            ));
+            break;
+        }
+        if source.is_file() && target.exists() && target.is_dir() {
+            *state.error.lock().unwrap() = Some(format!(
+                "Cannot copy file '{}' because a folder with the same name already exists in '{}'",
+                file_name.to_string_lossy(),
+                dest.display()
+            ));
+            break;
+        }
+
         #[cfg(windows)]
         crate::ole::log_dnd(&format!(
             "RunCopyJob: processing {} -> {}",
@@ -773,11 +987,46 @@ fn run_copy_job(sources: Vec<PathBuf>, dest: PathBuf, state: &CopyJobState) {
 
         // Same-filesystem move: try rename first (fails if target exists on Windows).
         if state.is_move && source != &target {
-            if std::fs::rename(source, &target).is_ok() {
+            let mut renamed = false;
+            let mut rename_attempt: u32 = 0;
+            const MAX_RENAME_RETRIES: u32 = 2;
+            while rename_attempt <= MAX_RENAME_RETRIES {
+                match std::fs::rename(source, &target) {
+                    Ok(()) => {
+                        renamed = true;
+                        break;
+                    }
+                    Err(e) if is_transient_io_error(&e) && rename_attempt < MAX_RENAME_RETRIES => {
+                        rename_attempt += 1;
+                        #[cfg(windows)]
+                        crate::ole::log_dnd(&format!(
+                            "Transient rename error {} for {} -> {} (attempt {}/{})",
+                            e,
+                            source.display(),
+                            target.display(),
+                            rename_attempt,
+                            MAX_RENAME_RETRIES + 1
+                        ));
+                        std::thread::sleep(std::time::Duration::from_millis(retry_delay_ms(rename_attempt)));
+                        continue;
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            if renamed {
                 let (fi, bi) = if source.is_dir() {
                     let mut c = 0usize; let mut b = 0u64;
                     tally_dir(source, &mut c, &mut b); (c, b)
                 } else { (1, source.metadata().map(|m| m.len()).unwrap_or(0)) };
+                if source.is_file() {
+                    state
+                        .current_file_bytes
+                        .store(bi, Ordering::Relaxed);
+                    state
+                        .current_file_total_bytes
+                        .store(bi, Ordering::Relaxed);
+                }
                 state.files_done.fetch_add(fi, Ordering::Relaxed);
                 state.bytes_copied.fetch_add(bi, Ordering::Relaxed);
                 state.pasted_names.lock().unwrap()
@@ -789,16 +1038,12 @@ fn run_copy_job(sources: Vec<PathBuf>, dest: PathBuf, state: &CopyJobState) {
 
         if source.is_dir() {
             // Directories are merged; per-file conflicts handled inside copy_dir_chunked.
-            match copy_dir_chunked(source, &target, state) {
+            match copy_dir_chunked(source, &target, state, &mut failures) {
                 Ok(()) => {
                     if state.is_move {
                         if let Err(e) = safe_remove_source_after_move(source, state) {
-                            *state.error.lock().unwrap() = Some(format!(
-                                "{}: {}",
-                                file_name.to_string_lossy(),
-                                e
-                            ));
-                            break;
+                            failures.push(format!("{}: {}", file_name.to_string_lossy(), e));
+                            continue;
                         }
                     }
                     state.pasted_names.lock().unwrap()
@@ -806,26 +1051,26 @@ fn run_copy_job(sources: Vec<PathBuf>, dest: PathBuf, state: &CopyJobState) {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => break,
                 Err(e) => {
-                    *state.error.lock().unwrap() = Some(format!("{}: {}", file_name.to_string_lossy(), e));
-                    break;
+                    failures.push(format!("{}: {}", file_name.to_string_lossy(), e));
+                    continue;
                 }
             }
         } else {
             *state.current_file.lock().unwrap() = file_name.to_string_lossy().to_string();
             match check_file_conflict(source, &target, state) {
                 FileAction::Skip => {
+                    state
+                        .current_file_bytes
+                        .store(state.current_file_total_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
                     state.files_done.fetch_add(1, Ordering::Relaxed);
                     // For a move, "skip" means the destination already has an
                     // identical copy of this file (same size + mtime preserved).
                     // The copy is done — remove the source to complete the move.
                     if state.is_move {
                         if let Err(e) = safe_remove_source_after_move(source, state) {
-                            *state.error.lock().unwrap() = Some(format!(
-                                "{}: {}",
-                                file_name.to_string_lossy(),
-                                e
-                            ));
-                            break;
+                            failures.push(format!("{}: {}", file_name.to_string_lossy(), e));
+                            state.files_done.fetch_add(1, Ordering::Relaxed);
+                            continue;
                         }
                         state.pasted_names.lock().unwrap()
                             .push(target.file_name().unwrap_or_default().to_string_lossy().to_string());
@@ -838,12 +1083,8 @@ fn run_copy_job(sources: Vec<PathBuf>, dest: PathBuf, state: &CopyJobState) {
                             state.files_done.fetch_add(1, Ordering::Relaxed);
                             if state.is_move {
                                 if let Err(e) = safe_remove_source_after_move(source, state) {
-                                    *state.error.lock().unwrap() = Some(format!(
-                                        "{}: {}",
-                                        file_name.to_string_lossy(),
-                                        e
-                                    ));
-                                    break;
+                                    failures.push(format!("{}: {}", file_name.to_string_lossy(), e));
+                                    continue;
                                 }
                             }
                             state.pasted_names.lock().unwrap()
@@ -851,13 +1092,23 @@ fn run_copy_job(sources: Vec<PathBuf>, dest: PathBuf, state: &CopyJobState) {
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => break,
                         Err(e) => {
-                            *state.error.lock().unwrap() = Some(format!("{}: {}", file_name.to_string_lossy(), e));
-                            break;
+                            failures.push(format!("{}: {}", file_name.to_string_lossy(), e));
+                            state.files_done.fetch_add(1, Ordering::Relaxed);
+                            continue;
                         }
                     }
                 }
             }
         }
     }
+
+    if !failures.is_empty() {
+        *state.error.lock().unwrap() = Some(format!(
+            "Completed with errors ({} item(s) failed). First: {}",
+            failures.len(),
+            failures[0]
+        ));
+    }
+
     state.done.store(true, Ordering::SeqCst);
 }

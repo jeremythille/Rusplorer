@@ -806,7 +806,7 @@ impl eframe::App for RusplorerApp {
                         }
                     }
                     self.delete_feedback_msg = Some(msg);
-                    self.delete_feedback_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(6));
+                    self.delete_feedback_until = None;
                     self.delete_feedback_is_error = true;
                 }
 
@@ -854,6 +854,18 @@ impl eframe::App for RusplorerApp {
                 if self.copy_jobs[i].done.load(Ordering::SeqCst) {
                     let job = self.copy_jobs.remove(i);
                     self.copy_job_drives.remove(i);
+                    if let Some(err) = job.error.lock().unwrap().clone() {
+                        let op = if job.is_move { "Move" } else { "Copy" };
+                        if err.starts_with("Completed with errors") {
+                            self.delete_feedback_msg = Some(format!("{} {}", op, err.to_lowercase()));
+                        } else {
+                            self.delete_feedback_msg = Some(format!("{} failed: {}", op, err));
+                        }
+                        // Keep copy/move failures visible until dismissed so users don't miss
+                        // them after switching apps/desktops during long transfers.
+                        self.delete_feedback_until = None;
+                        self.delete_feedback_is_error = true;
+                    }
                     // Harvest results
                     let names = job.pasted_names.lock().unwrap().clone();
                     if !names.is_empty() {
@@ -925,12 +937,10 @@ impl eframe::App for RusplorerApp {
                     self.dnd_drag_entry = None;
                     self.dnd_suppress = 2;
                     let dest = self.current_path.clone();
-                    crate::ole::log_dnd(&format!("OLE recv: starting copy of {} file(s) -> {}", files.len(), dest.display()));
-                    // If all files were staged into our temp dir (e.g. from 7-Zip), use
-                    // is_move so the staging copies get cleaned up after. For regular
-                    // Explorer drops from real paths, use copy (is_move=false).
-                    let staging = std::env::temp_dir().join("rusplorer_drop");
-                    let is_move = files.iter().all(|f| f.starts_with(&staging));
+                    crate::ole::log_dnd(&format!("OLE recv: starting move of {} file(s) -> {}", files.len(), dest.display()));
+                    // External left-drop follows Rusplorer semantics: move by default.
+                    // (Right-click drop still asks via context menu.)
+                    let is_move = true;
                     self.start_copy_job(files, dest, is_move, false, false);
                     ctx.request_repaint();
                 }
@@ -1219,8 +1229,7 @@ impl eframe::App for RusplorerApp {
         // Handle F5 to refresh the file list and the tree for the current folder
         if !any_modal_open && ctx.input(|i| i.key_pressed(egui::Key::F5)) {
             self.refresh_contents();
-            let updated = crate::fs_ops::read_dir_children(&self.current_path.clone());
-            self.tree_children_cache.insert(self.current_path.clone(), updated);
+            self.refresh_tree_children_for_dir(&self.current_path.clone());
         }
 
         // Handle Up/Down arrow keys to move selection through the file list
@@ -1365,7 +1374,14 @@ impl eframe::App for RusplorerApp {
             #[cfg(windows)]
             {
                 crate::ole::log_dnd(&format!("Ctrl+C: {} selected, {} files", self.selected_entries.len(), files.len()));
-                let _ = copy_files_to_clipboard(&files, false); // best-effort; internal clipboard always set
+                if let Err(e) = copy_files_to_clipboard(&files, false) {
+                    self.delete_feedback_msg = Some(format!(
+                        "System clipboard copy failed (internal copy still available): {}",
+                        e
+                    ));
+                    self.delete_feedback_until = None;
+                    self.delete_feedback_is_error = true;
+                }
                 self.clipboard_files = files;
                 self.clipboard_mode = Some(ClipboardMode::Copy);
             }
@@ -1385,7 +1401,14 @@ impl eframe::App for RusplorerApp {
 
             #[cfg(windows)]
             {
-                let _ = copy_files_to_clipboard(&files, true); // best-effort; internal clipboard always set
+                if let Err(e) = copy_files_to_clipboard(&files, true) {
+                    self.delete_feedback_msg = Some(format!(
+                        "System clipboard cut failed (internal cut still available): {}",
+                        e
+                    ));
+                    self.delete_feedback_until = None;
+                    self.delete_feedback_is_error = true;
+                }
                 self.clipboard_files = files;
                 self.clipboard_mode = Some(ClipboardMode::Cut);
             }
@@ -1669,6 +1692,8 @@ impl eframe::App for RusplorerApp {
                         let files_total = job.files_total.load(Ordering::Relaxed);
                         let bytes_done = job.bytes_copied.load(Ordering::Relaxed);
                         let bytes_total = job.total_bytes.load(Ordering::Relaxed);
+                        let file_bytes_done = job.current_file_bytes.load(Ordering::Relaxed);
+                        let file_bytes_total = job.current_file_total_bytes.load(Ordering::Relaxed);
                         let current_file = job.current_file.lock().unwrap().clone();
 
                         ui.horizontal(|ui| {
@@ -1711,12 +1736,26 @@ impl eframe::App for RusplorerApp {
 
                         // Per-file + overall progress bars
                         if bytes_total > 0 {
+                            if file_bytes_total > 0 {
+                                let file_fraction = (file_bytes_done as f32 / file_bytes_total as f32).clamp(0.0, 1.0);
+                                let file_text = format!(
+                                    "Current file: {} / {}",
+                                    Self::format_bytes(file_bytes_done),
+                                    Self::format_bytes(file_bytes_total),
+                                );
+                                ui.add(
+                                    egui::ProgressBar::new(file_fraction)
+                                        .text(file_text)
+                                        .desired_width(ui.available_width()),
+                                );
+                            }
+
                             let fraction = bytes_done as f32 / bytes_total as f32;
                             let now_ms = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_millis() as u64)
                                 .unwrap_or(0);
-                            // Speed display: EMA sampled every repaint frame (~100 ms).
+                            // Speed display: EMA sampled a few times per second.
                             //
                             // Windows write-back caching causes burst-stall cycles where
                             // the OS accepts data at RAM speed, then stalls the writer while
@@ -1725,9 +1764,10 @@ impl eframe::App for RusplorerApp {
                             // erratic values.  An EMA with a ~2 s time constant smooths the
                             // bursts and stalls into the actual sustained throughput.
                             //
-                            // alpha = dt / tau  →  consistent time constant regardless of
-                            // the actual repaint interval.  dt is clamped to [50, 500] ms
-                            // so an occasional slow frame doesn't over-weight one sample.
+                            // alpha = dt / tau  -> consistent time constant regardless of
+                            // the actual sample interval. dt is clamped to [50, 500] ms
+                            // so an occasional slow frame does not over-weight one sample.
+                            const SPEED_SAMPLE_MIN_MS: u64 = 250;
                             let paused_now = job.paused.load(Ordering::Relaxed);
                             let speed_mbps = if paused_now {
                                 // Reset the sample so resuming doesn't show a spike.
@@ -1738,11 +1778,17 @@ impl eframe::App for RusplorerApp {
                             } else {
                                 let last_ms    = job.speed_sample_ms.load(Ordering::Relaxed);
                                 let last_bytes = job.speed_sample_bytes.load(Ordering::Relaxed);
-                                // Always advance the snapshot so the next delta is fresh.
-                                job.speed_sample_ms.store(now_ms, Ordering::Relaxed);
-                                job.speed_sample_bytes.store(bytes_done, Ordering::Relaxed);
                                 let old_bps = job.current_speed_bps.load(Ordering::Relaxed) as f64;
-                                if last_ms > 0 && now_ms > last_ms && bytes_done >= last_bytes {
+                                if last_ms == 0 {
+                                    job.speed_sample_ms.store(now_ms, Ordering::Relaxed);
+                                    job.speed_sample_bytes.store(bytes_done, Ordering::Relaxed);
+                                    old_bps / (1024.0 * 1024.0)
+                                } else if now_ms.saturating_sub(last_ms) >= SPEED_SAMPLE_MIN_MS
+                                    && bytes_done >= last_bytes
+                                {
+                                    // Advance the snapshot only when taking a sample.
+                                    job.speed_sample_ms.store(now_ms, Ordering::Relaxed);
+                                    job.speed_sample_bytes.store(bytes_done, Ordering::Relaxed);
                                     let dt_s       = (now_ms - last_ms) as f64 / 1000.0;
                                     let dt_clamped = dt_s.clamp(0.05, 0.5);
                                     let db         = (bytes_done - last_bytes) as f64;
@@ -1760,12 +1806,38 @@ impl eframe::App for RusplorerApp {
                                     old_bps / (1024.0 * 1024.0)
                                 }
                             };
-                            let bar_text = format!(
-                                "{} / {}  ({:.1} MB/s)",
-                                Self::format_bytes(bytes_done),
-                                Self::format_bytes(bytes_total),
-                                speed_mbps,
-                            );
+                            let speed_bps = job.current_speed_bps.load(Ordering::Relaxed);
+                            let eta_text = if !paused_now && speed_bps > 0 && bytes_total > bytes_done {
+                                let secs_left = ((bytes_total - bytes_done) as f64 / speed_bps as f64).ceil() as u64;
+                                if secs_left >= 3600 {
+                                    let h = secs_left / 3600;
+                                    let m = (secs_left % 3600) / 60;
+                                    Some(format!("{}h {:02}m left", h, m))
+                                } else if secs_left >= 60 {
+                                    let m = secs_left / 60;
+                                    let s = secs_left % 60;
+                                    Some(format!("{}m {:02}s left", m, s))
+                                } else {
+                                    Some(format!("{}s left", secs_left))
+                                }
+                            } else {
+                                None
+                            };
+                            let bar_text = match eta_text {
+                                Some(eta) => format!(
+                                    "{} / {}  ({:.1} MB/s, {})",
+                                    Self::format_bytes(bytes_done),
+                                    Self::format_bytes(bytes_total),
+                                    speed_mbps,
+                                    eta,
+                                ),
+                                None => format!(
+                                    "{} / {}  ({:.1} MB/s)",
+                                    Self::format_bytes(bytes_done),
+                                    Self::format_bytes(bytes_total),
+                                    speed_mbps,
+                                ),
+                            };
                             ui.add(
                                 egui::ProgressBar::new(fraction)
                                     .text(bar_text)
@@ -1816,7 +1888,7 @@ impl eframe::App for RusplorerApp {
                         });
                         if q_idx + 1 < self.copy_pending.len() { ui.separator(); }
                     }
-                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                    ctx.request_repaint_after(std::time::Duration::from_millis(250));
                 });
         }
 
@@ -1857,7 +1929,7 @@ impl eframe::App for RusplorerApp {
                 );
 
                 let op = if job.is_move { "Moving" } else { "Copying" };
-                let title = format!("{} \"{}\" ï¿½ file already exists", op, ci.file_name);
+                let title = format!("{} \"{}\" - file already exists", op, ci.file_name);
 
                 // Measure button widths
                 let btn_labels = [
@@ -1873,6 +1945,27 @@ impl eframe::App for RusplorerApp {
                     .fold(0.0f32, f32::max) + 16.0; // 8px padding each side
 
                 let mut answer: Option<ConflictChoice> = None;
+                let scrim_rect = ctx.screen_rect();
+
+                // Darken the app behind the dialog so the modal stands out.
+                egui::Area::new(egui::Id::new("conflict_dialog_scrim"))
+                    .order(egui::Order::Middle)
+                    .fixed_pos(scrim_rect.min)
+                    .interactable(true)
+                    .show(ctx, |ui| {
+                        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, scrim_rect.size());
+                        ui.painter().rect_filled(
+                            rect,
+                            0.0,
+                            egui::Color32::from_black_alpha(150),
+                        );
+                        // Consume clicks so background widgets are not interacted with.
+                        let _ = ui.interact(
+                            rect,
+                            egui::Id::new("conflict_dialog_scrim_blocker"),
+                            egui::Sense::click(),
+                        );
+                    });
 
                 egui::Window::new("conflict_dialog")
                     .title_bar(false)

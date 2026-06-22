@@ -571,6 +571,7 @@ impl RusplorerApp {
                                     self.selected_entries.clear();
                                     self.selected_entries.insert(entry.name.clone());
                                 }
+                                self.last_clicked_entry = Some(entry.name.clone());
                                 // Snapshot the selection NOW before any click-through can clear it
                                 self.context_menu_selection = self
                                     .selected_entries

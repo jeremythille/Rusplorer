@@ -10,6 +10,21 @@ use notify::{RecursiveMode, Watcher, recommended_watcher};
 use crate::fs_ops::{spawn_copy_job, read_dir_children, CopyJobState};
 use super::RusplorerApp;
 
+fn normalize_tree_dir_key(path: &std::path::Path) -> String {
+    let mut s = path.to_string_lossy().to_string();
+    while s.ends_with('\\') || s.ends_with('/') {
+        s.pop();
+    }
+    if cfg!(windows) {
+        s.make_ascii_lowercase();
+    }
+    s
+}
+
+fn tree_dir_key_eq(a: &std::path::Path, b: &std::path::Path) -> bool {
+    normalize_tree_dir_key(a) == normalize_tree_dir_key(b)
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum WatchEventKind {
     Modify,
@@ -102,6 +117,28 @@ impl RusplorerApp {
         for parent in parents_to_refresh {
             let updated = read_dir_children(&parent);
             self.tree_children_cache.insert(parent, updated);
+        }
+    }
+
+    /// Refresh the cached children list for `dir` in the tree panel.
+    ///
+    /// We update every cache entry that points to the same directory even if
+    /// path spelling differs (case or trailing separator), then ensure an entry
+    /// exists for `dir` itself.
+    pub(crate) fn refresh_tree_children_for_dir(&mut self, dir: &PathBuf) {
+        let updated = read_dir_children(dir);
+        let mut matched_any = false;
+
+        let keys: Vec<PathBuf> = self.tree_children_cache.keys().cloned().collect();
+        for key in keys {
+            if tree_dir_key_eq(&key, dir) {
+                self.tree_children_cache.insert(key, updated.clone());
+                matched_any = true;
+            }
+        }
+
+        if !matched_any {
+            self.tree_children_cache.insert(dir.clone(), updated);
         }
     }
 
@@ -388,7 +425,11 @@ impl RusplorerApp {
         use crate::types::UndoAction;
         match action {
             UndoAction::Rename { old_path, new_path } => {
-                let _ = std::fs::rename(&new_path, &old_path);
+                if let Err(e) = std::fs::rename(&new_path, &old_path) {
+                    self.delete_feedback_msg = Some(format!("Undo rename failed: {}", e));
+                    self.delete_feedback_until = None;
+                    self.delete_feedback_is_error = true;
+                }
                 // Refresh tree if the item lived in a visible folder.
                 if let Some(parent) = new_path.parent() {
                     let updated = crate::fs_ops::read_dir_children(&parent.to_path_buf());
@@ -418,13 +459,20 @@ impl RusplorerApp {
                 if by_parent.is_empty() {
                     self.delete_feedback_msg =
                         Some("Undo failed: files no longer found at destination.".to_string());
-                    self.delete_feedback_until = Some(
-                        std::time::Instant::now() + std::time::Duration::from_secs(5),
-                    );
+                    self.delete_feedback_until = None;
                     self.delete_feedback_is_error = true;
                 } else {
                     for (parent_dir, files_at_dest) in by_parent {
-                        let _ = std::fs::create_dir_all(&parent_dir);
+                        if let Err(e) = std::fs::create_dir_all(&parent_dir) {
+                            self.delete_feedback_msg = Some(format!(
+                                "Undo move failed creating destination '{}': {}",
+                                parent_dir.display(),
+                                e
+                            ));
+                            self.delete_feedback_until = None;
+                            self.delete_feedback_is_error = true;
+                            continue;
+                        }
                         // no_undo=true prevents creating an undo-of-undo entry.
                         self.start_copy_job(files_at_dest, parent_dir, true, false, true);
                     }
@@ -433,7 +481,14 @@ impl RusplorerApp {
             }
             UndoAction::Delete { paths } => {
                 #[cfg(windows)]
-                let _ = Self::restore_from_recycle_bin(&paths);
+                if !Self::restore_from_recycle_bin(&paths) {
+                    self.delete_feedback_msg = Some(
+                        "Undo delete failed: one or more items could not be restored from Recycle Bin."
+                            .to_string(),
+                    );
+                    self.delete_feedback_until = None;
+                    self.delete_feedback_is_error = true;
+                }
                 self.refresh_contents();
             }
         }

@@ -117,8 +117,25 @@ impl RusplorerApp {
                 }
                 #[cfg(windows)]
                 Some("shortcut") => {
+                    let mut failed = Vec::new();
                     for s in &sources {
-                        let _ = create_lnk_shortcut(s, &dest);
+                        if let Err(e) = create_lnk_shortcut(s, &dest) {
+                            failed.push(format!("{}: {}", s.display(), e));
+                        }
+                    }
+                    if !failed.is_empty() {
+                        let msg = if failed.len() == 1 {
+                            format!("Create shortcut failed: {}", failed[0])
+                        } else {
+                            format!(
+                                "Create shortcut failed for {} item(s). First error: {}",
+                                failed.len(),
+                                failed[0]
+                            )
+                        };
+                        self.delete_feedback_msg = Some(msg);
+                        self.delete_feedback_until = None;
+                        self.delete_feedback_is_error = true;
                     }
                     self.refresh_contents();
                     self.dnd_right_drop_menu = None;
@@ -725,20 +742,47 @@ impl RusplorerApp {
                             let name = self.new_item_name_buffer.trim().to_string();
                             if !name.is_empty() {
                                 let target = self.current_path.join(&name);
+                                let mut created = false;
                                 if self.new_item_is_dir {
-                                    let _ = std::fs::create_dir(&target);
-                                    // Refresh tree cache so the new folder appears immediately
-                                    let updated = crate::fs_ops::read_dir_children(&self.current_path);
-                                    self.tree_children_cache.insert(self.current_path.clone(), updated);
+                                    match std::fs::create_dir(&target) {
+                                        Ok(()) => {
+                                            created = true;
+                                            // Refresh tree cache so the new folder appears immediately.
+                                            let dir = self.current_path.clone();
+                                            self.refresh_tree_children_for_dir(&dir);
+                                        }
+                                        Err(e) => {
+                                            self.delete_feedback_msg = Some(format!(
+                                                "Create folder failed: {}",
+                                                e
+                                            ));
+                                            self.delete_feedback_until = None;
+                                            self.delete_feedback_is_error = true;
+                                        }
+                                    }
                                 } else {
-                                    let _ = std::fs::File::create(&target);
+                                    match std::fs::File::create(&target) {
+                                        Ok(_) => {
+                                            created = true;
+                                        }
+                                        Err(e) => {
+                                            self.delete_feedback_msg = Some(format!(
+                                                "Create file failed: {}",
+                                                e
+                                            ));
+                                            self.delete_feedback_until = None;
+                                            self.delete_feedback_is_error = true;
+                                        }
+                                    }
                                 }
-                                self.refresh_contents();
-                                // Select the newly created item
-                                self.selected_entries.clear();
-                                self.selected_entries.insert(name);
+                                if created {
+                                    self.refresh_contents();
+                                    // Select the newly created item
+                                    self.selected_entries.clear();
+                                    self.selected_entries.insert(name);
+                                    close_dialog = true;
+                                }
                             }
-                            close_dialog = true;
                         }
                         if ui.button("Cancel").clicked() {
                             close_dialog = true;
@@ -832,12 +876,24 @@ impl RusplorerApp {
                     if !stem.is_empty() {
                         if self.new_folder_mode {
                             let target = self.current_path.join(&stem);
-                            let _ = std::fs::create_dir(&target);
-                            let updated = crate::fs_ops::read_dir_children(&self.current_path);
-                            self.tree_children_cache.insert(self.current_path.clone(), updated);
-                            self.refresh_contents();
-                            self.selected_entries.clear();
-                            self.selected_entries.insert(stem);
+                            match std::fs::create_dir(&target) {
+                                Ok(()) => {
+                                    let dir = self.current_path.clone();
+                                    self.refresh_tree_children_for_dir(&dir);
+                                    self.refresh_contents();
+                                    self.selected_entries.clear();
+                                    self.selected_entries.insert(stem);
+                                }
+                                Err(e) => {
+                                    self.delete_feedback_msg = Some(format!(
+                                        "Create folder failed: {}",
+                                        e
+                                    ));
+                                    self.delete_feedback_until = None;
+                                    self.delete_feedback_is_error = true;
+                                    do_rename = false;
+                                }
+                            }
                         } else {
                             let final_name = if self.rename_show_ext || !has_ext {
                                 stem
@@ -861,8 +917,7 @@ impl RusplorerApp {
                                     });
                                     // Refresh tree cache: update parent's children list (rename
                                     // changed its contents), and drop the now-gone old path entry.
-                                    let updated = crate::fs_ops::read_dir_children(&parent);
-                                    self.tree_children_cache.insert(parent.clone(), updated);
+                                    self.refresh_tree_children_for_dir(&parent);
                                     self.tree_children_cache.remove(&old_path);
                                     self.context_menu_tree_path = None;
                                     self.refresh_contents();
@@ -879,10 +934,7 @@ impl RusplorerApp {
                                     self.delete_feedback_msg = Some(
                                         format!("Rename failed: {}", e)
                                     );
-                                    self.delete_feedback_until = Some(
-                                        std::time::Instant::now()
-                                            + std::time::Duration::from_secs(8)
-                                    );
+                                    self.delete_feedback_until = None;
                                     self.delete_feedback_is_error = true;
                                     // Keep dialog open so the user can try a different name
                                     // or close it manually.
@@ -959,6 +1011,7 @@ impl RusplorerApp {
                         .inner_margin(egui::Margin::symmetric(16.0, 6.0))
                         .rounding(egui::Rounding::same(6.0)))
                     .show(ctx, |ui| {
+                        let mut dismiss = false;
                         ui.horizontal(|ui| {
                             if in_progress {
                                 ui.spinner();
@@ -966,7 +1019,14 @@ impl RusplorerApp {
                             ui.label(egui::RichText::new(msg)
                                 .color(egui::Color32::WHITE)
                                 .size(12.0));
+                            if ui.small_button("Dismiss").clicked() {
+                                dismiss = true;
+                            }
                         });
+                        if dismiss {
+                            self.delete_feedback_msg = None;
+                            self.delete_feedback_until = None;
+                        }
                     });
                 ctx.request_repaint();
             } else {
