@@ -29,6 +29,7 @@ mod ui_dialogs;
 mod ui_left_panel;
 mod ui_file_list;
 mod ui_thumbnails;
+mod updater;
 
 #[cfg(windows)]
 use clipboard::{copy_files_to_clipboard, read_clipboard_drop_effect_is_cut, read_files_from_clipboard};
@@ -37,6 +38,7 @@ use fs_ops::{CopyJobState, ConflictChoice, ConflictInfo};
 use ole::{find_own_hwnd, ole_drag_files_out, register_ole_drop_target, try_move_to_rusplorer_desktop};
 use config::*;
 use types::*;
+use updater::UpdateUiState;
 
 pub fn run_app() -> Result<(), eframe::Error> {
     // Initialise OLE on the main thread so DoDragDrop works
@@ -390,6 +392,10 @@ struct RusplorerApp {
     show_unlock_dialog: bool,
     unlock_dialog_path: Option<PathBuf>,
     unlock_locking_processes: Vec<(u32, String)>,
+    update_state: UpdateUiState,
+    update_check_receiver: Option<std::sync::mpsc::Receiver<updater::UpdateCheckResult>>,
+    update_apply_receiver: Option<std::sync::mpsc::Receiver<updater::UpdateApplyResult>>,
+    update_last_check: std::time::Instant,
 }
 
 impl Default for RusplorerApp {
@@ -576,6 +582,10 @@ impl RusplorerApp {
             show_unlock_dialog: false,
             unlock_dialog_path: None,
             unlock_locking_processes: Vec::new(),
+            update_state: UpdateUiState::Idle,
+            update_check_receiver: None,
+            update_apply_receiver: None,
+            update_last_check: std::time::Instant::now() - std::time::Duration::from_secs(3600),
         };
 
         // Initialise tabs ï¿½ from session if provided, then config, then single default
@@ -610,6 +620,8 @@ impl RusplorerApp {
             app.drive_types.insert(drive.clone(), kind);
             app.drives_info.push(DriveInfo { drive: drive.clone(), kind, free_bytes, total_bytes, label: Self::get_volume_label(&drive) });
         }
+
+        app.start_update_check();
 
         app
     }
@@ -648,6 +660,18 @@ impl eframe::App for RusplorerApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_update_tasks(ctx);
+        if self.update_check_receiver.is_none()
+            && self.update_apply_receiver.is_none()
+            && self.update_last_check.elapsed() >= std::time::Duration::from_secs(30 * 60)
+            && !matches!(
+                self.update_state,
+                UpdateUiState::Downloading { .. } | UpdateUiState::Applying { .. }
+            )
+        {
+            self.start_update_check();
+        }
+
         // Sample window geometry at most once every 5 seconds to avoid
         // doing it every frame; the value is only needed when the app exits.
         if self.last_window_geo_check.elapsed().as_secs() >= 5 {
@@ -1638,10 +1662,13 @@ impl eframe::App for RusplorerApp {
                 f.layout_no_wrap("?".to_string(), font14.clone(), egui::Color32::WHITE).size().x
             }) + 10.0;
 
+            // Updater status button/label width budget.
+            let update_w = 100.0 + item_sp;
+
             // Add outer panel margins / frame padding
             let margin = 20.0;
 
-            (drives_btn_w + drive_btns_w + filter_label_w + filter_edit_w + thumb_w + margin)
+            (drives_btn_w + drive_btns_w + filter_label_w + filter_edit_w + thumb_w + update_w + margin)
                 .max(200.0)
         };
 
@@ -2041,8 +2068,8 @@ impl eframe::App for RusplorerApp {
             let tab_bar_id = egui::Id::new("tab_bar_scroll");
 
             let tab_bar_resp = ui.horizontal(|ui| {
-                // Tabs in a scroll area (without + and ?? buttons)
-                let available_w = ui.available_width() - 50.0; // reserve space for + and ??
+                // Tabs in a scroll area (save button is outside the scroll area)
+                let available_w = ui.available_width() - 28.0; // reserve space for save button
                 let scroll_output = egui::ScrollArea::horizontal()
                     .id_source(tab_bar_id)
                     .auto_shrink([false, false])
@@ -2239,15 +2266,7 @@ impl eframe::App for RusplorerApp {
                     self.tab_scroll_offset = self.tab_scroll_target;
                 }
 
-                // "+" and save buttons OUTSIDE the scroll area (pinned at end)
-                ui.add_space(4.0);
-                if ui
-                    .add(egui::Button::new(egui::RichText::new("+").small()).frame(false))
-                    .on_hover_text("New tab")
-                    .clicked()
-                {
-                    open_new_tab = true;
-                }
+                // Save button OUTSIDE the scroll area (pinned at end)
                 ui.add_space(4.0);
                 if ui
                     .add(egui::Button::new(egui::RichText::new("💾").small()).frame(false))
@@ -2432,6 +2451,8 @@ impl eframe::App for RusplorerApp {
                         .collect();
                     self.config.save();
                 }
+
+                self.render_update_button(ui);
 
 
             });
@@ -3071,6 +3092,8 @@ impl eframe::App for RusplorerApp {
             || self.archive_done_receiver.is_some()
             || self.extract_done_receiver.is_some()
             || self.dir_load_receiver.is_some()
+            || self.update_check_receiver.is_some()
+            || self.update_apply_receiver.is_some()
             || !self.copy_jobs.is_empty();
         if has_bg_work {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
