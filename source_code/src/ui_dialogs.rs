@@ -234,11 +234,31 @@ impl RusplorerApp {
                             {
                                 #[cfg(windows)]
                                 {
-                                    // rundll32 OpenAs_RunDLL always shows the picker,
-                                    // even when the file has no registered association.
-                                    let _ = std::process::Command::new("rundll32.exe")
-                                        .args(["shell32.dll,OpenAs_RunDLL", full_path.to_string_lossy().as_ref()])
-                                        .spawn();
+                                    use winapi::um::shellapi::{ShellExecuteExW, SHELLEXECUTEINFOW, SEE_MASK_INVOKEIDLIST};
+                                    use winapi::um::winuser::SW_SHOW;
+
+                                    // Use the native "openas" verb to reliably launch
+                                    // Windows' "Open with" picker.
+                                    let verb: Vec<u16> = OsStr::new("openas")
+                                        .encode_wide().chain(std::iter::once(0)).collect();
+                                    let file: Vec<u16> = OsStr::new(full_path.to_str().unwrap_or(""))
+                                        .encode_wide().chain(std::iter::once(0)).collect();
+                                    let ok = unsafe {
+                                        let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
+                                        info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+                                        info.fMask = SEE_MASK_INVOKEIDLIST;
+                                        info.lpVerb = verb.as_ptr();
+                                        info.lpFile = file.as_ptr();
+                                        info.nShow = SW_SHOW as i32;
+                                        ShellExecuteExW(&mut info) != 0
+                                    };
+                                    if !ok {
+                                        self.delete_feedback_msg = Some(
+                                            "Open with failed: Windows could not open the app picker.".to_string()
+                                        );
+                                        self.delete_feedback_until = None;
+                                        self.delete_feedback_is_error = true;
+                                    }
                                 }
                                 self.show_context_menu = false;
                                 self.context_menu_tree_path = None;

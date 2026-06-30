@@ -9,7 +9,8 @@ use std::sync::Mutex;
 /// Send `paths` to the Recycle Bin using IFileOperation (COM).
 /// Returns `true` if all items were successfully queued and the operation
 /// was performed without a system error dialog.
-/// No confirmation dialog is shown; the operation is fully silent.
+/// We explicitly avoid fully-silent mode so Windows can warn instead of
+/// silently hard-deleting when recycle is unavailable for a location.
 #[cfg(windows)]
 pub fn delete_to_recycle_bin(paths: &[PathBuf]) -> bool {
     use std::os::windows::ffi::OsStrExt;
@@ -18,7 +19,7 @@ pub fn delete_to_recycle_bin(paths: &[PathBuf]) -> bool {
     use windows::Win32::UI::Shell::{
         IFileOperation, IShellItem,
         SHCreateItemFromParsingName,
-        FOF_ALLOWUNDO, FOF_NO_UI,
+        FOF_ALLOWUNDO, FOF_WANTNUKEWARNING,
     };
     use windows::core::PCWSTR;
 
@@ -34,8 +35,9 @@ pub fn delete_to_recycle_bin(paths: &[PathBuf]) -> bool {
             Err(_) => { CoUninitialize(); return false; }
         };
 
-        // Silent: no progress UI, no confirmations, but Undo is supported via Recycle Bin.
-        let flags = FOF_ALLOWUNDO | FOF_NO_UI;
+        // Keep undo/recycle intent and require an OS warning before any
+        // permanent-delete fallback path.
+        let flags = FOF_ALLOWUNDO | FOF_WANTNUKEWARNING;
         if file_op.SetOperationFlags(flags).is_err() {
             CoUninitialize();
             return false;
@@ -65,8 +67,7 @@ pub fn delete_to_recycle_bin(paths: &[PathBuf]) -> bool {
         CoUninitialize();
 
         // IFileOperation::PerformOperations can return S_OK even when items were
-        // not actually deleted (e.g. Recycle Bin disabled, file too large, or
-        // FOF_NO_UI suppressed the required confirmation dialog).
+        // not actually deleted (e.g. user cancelled a warning dialog).
         // Verify every path is truly gone before claiming success.
         let ok = op_ok && paths.iter().all(|p| !p.exists());
         ok
@@ -839,19 +840,11 @@ fn safe_remove_source_after_move(source: &Path, state: &CopyJobState) -> std::io
             return Ok(());
         }
 
-        // Some systems disable Recycle Bin on a drive or block silent recycle
-        // operations. After a successful copy fallback, finish the move by
-        // deleting the original directly.
-        let remove_res = if source.is_dir() {
-            std::fs::remove_dir_all(source)
-        } else {
-            std::fs::remove_file(source)
-        };
-        if remove_res.is_ok() || !source.exists() {
-            return Ok(());
-        }
-
-        let msg = format!("Move cleanup failed for {}", source.display());
+        // Safety policy: never hard-delete if recycle is unavailable.
+        let msg = format!(
+            "Move cleanup failed for {}: recycle was unavailable; source was left in place",
+            source.display()
+        );
         *state.error.lock().unwrap() = Some(msg.clone());
         return Err(std::io::Error::new(std::io::ErrorKind::Other, msg));
     }

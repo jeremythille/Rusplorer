@@ -189,6 +189,18 @@ fn launch(
     )
 }
 
+#[derive(Clone)]
+struct DeepFilterItem {
+    full_path: PathBuf,
+    display_name: String,
+    is_dir: bool,
+}
+
+enum DeepFilterEvent {
+    Hit { section: String, item: DeepFilterItem },
+    Done,
+}
+
 struct RusplorerApp {
     current_path: PathBuf,
     contents: Vec<FileEntry>,
@@ -392,6 +404,20 @@ struct RusplorerApp {
     show_unlock_dialog: bool,
     unlock_dialog_path: Option<PathBuf>,
     unlock_locking_processes: Vec<(u32, String)>,
+    /// Last filter text that the deep recursive worker was started for.
+    deep_filter_last_query: String,
+    /// Last folder root that the deep recursive worker was started for.
+    deep_filter_last_root: PathBuf,
+    /// Incremental recursive results grouped by first-level subfolder name.
+    deep_filter_sections: HashMap<String, Vec<DeepFilterItem>>,
+    /// Used to dedupe incremental recursive hits.
+    deep_filter_seen: HashSet<PathBuf>,
+    /// Receiver for deep recursive search events.
+    deep_filter_rx: Option<Receiver<DeepFilterEvent>>,
+    /// Cancellation token for the currently running deep recursive search worker.
+    deep_filter_cancel: Arc<AtomicBool>,
+    /// True while a deep recursive search is actively running.
+    deep_filter_running: bool,
     update_state: UpdateUiState,
     update_check_receiver: Option<std::sync::mpsc::Receiver<updater::UpdateCheckResult>>,
     update_apply_receiver: Option<std::sync::mpsc::Receiver<updater::UpdateApplyResult>>,
@@ -582,6 +608,13 @@ impl RusplorerApp {
             show_unlock_dialog: false,
             unlock_dialog_path: None,
             unlock_locking_processes: Vec::new(),
+            deep_filter_last_query: String::new(),
+            deep_filter_last_root: PathBuf::new(),
+            deep_filter_sections: HashMap::new(),
+            deep_filter_seen: HashSet::new(),
+            deep_filter_rx: None,
+            deep_filter_cancel: Arc::new(AtomicBool::new(false)),
+            deep_filter_running: false,
             update_state: UpdateUiState::Idle,
             update_check_receiver: None,
             update_apply_receiver: None,
@@ -624,6 +657,243 @@ impl RusplorerApp {
         app.start_update_check();
 
         app
+    }
+
+    fn cancel_deep_filter_search(&mut self) {
+        self.deep_filter_cancel.store(true, Ordering::SeqCst);
+        self.deep_filter_rx = None;
+        self.deep_filter_running = false;
+    }
+
+    fn start_deep_filter_search(&mut self, query: &str) {
+        self.cancel_deep_filter_search();
+        self.deep_filter_sections.clear();
+        self.deep_filter_seen.clear();
+
+        if query.is_empty() {
+            self.deep_filter_last_query.clear();
+            self.deep_filter_last_root = self.current_path.clone();
+            return;
+        }
+
+        self.deep_filter_last_query = query.to_string();
+        self.deep_filter_last_root = self.current_path.clone();
+
+        let root = self.current_path.clone();
+        let query_lower = query.to_lowercase();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.deep_filter_cancel = cancel.clone();
+
+        let (tx, rx) = std::sync::mpsc::channel::<DeepFilterEvent>();
+        self.deep_filter_rx = Some(rx);
+        self.deep_filter_running = true;
+
+        std::thread::spawn(move || {
+            let mut stack = vec![root.clone()];
+            while let Some(dir) = stack.pop() {
+                if cancel.load(Ordering::SeqCst) {
+                    return;
+                }
+
+                let read = match std::fs::read_dir(&dir) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+
+                for entry in read {
+                    if cancel.load(Ordering::SeqCst) {
+                        return;
+                    }
+
+                    let entry = match entry {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
+                    let path = entry.path();
+                    let file_type = match entry.file_type() {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
+                    let name = entry.file_name().to_string_lossy().to_string();
+
+                    if file_type.is_dir() && !file_type.is_symlink() {
+                        stack.push(path.clone());
+                    }
+
+                    if !name.to_lowercase().contains(&query_lower) {
+                        continue;
+                    }
+
+                    let rel = match path.strip_prefix(&root) {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    let mut comps = rel.components();
+                    let first = match comps.next() {
+                        Some(c) => c.as_os_str().to_string_lossy().to_string(),
+                        None => continue,
+                    };
+                    let remainder = comps.collect::<std::path::PathBuf>();
+                    // Current-folder matches are shown in the instant section,
+                    // so deep async results start from subfolders only.
+                    if remainder.as_os_str().is_empty() {
+                        continue;
+                    }
+
+                    let display_name = remainder.to_string_lossy().to_string();
+                    let item = DeepFilterItem {
+                        full_path: path,
+                        display_name,
+                        is_dir: file_type.is_dir(),
+                    };
+                    let _ = tx.send(DeepFilterEvent::Hit {
+                        section: first,
+                        item,
+                    });
+                }
+            }
+
+            let _ = tx.send(DeepFilterEvent::Done);
+        });
+    }
+
+    fn update_deep_filter_state(&mut self, ctx: &egui::Context) {
+        let query = self.filter.trim().to_string();
+
+        if query.is_empty() {
+            if self.deep_filter_running
+                || !self.deep_filter_sections.is_empty()
+                || self.deep_filter_last_query != query
+                || self.deep_filter_last_root != self.current_path
+            {
+                self.cancel_deep_filter_search();
+                self.deep_filter_sections.clear();
+                self.deep_filter_seen.clear();
+                self.deep_filter_last_query.clear();
+                self.deep_filter_last_root = self.current_path.clone();
+            }
+            return;
+        }
+
+        if query != self.deep_filter_last_query || self.current_path != self.deep_filter_last_root {
+            self.start_deep_filter_search(&query);
+            ctx.request_repaint();
+        }
+
+        if let Some(ref rx) = self.deep_filter_rx {
+            let mut changed = false;
+            loop {
+                match rx.try_recv() {
+                    Ok(DeepFilterEvent::Hit { section, item }) => {
+                        if self.deep_filter_seen.insert(item.full_path.clone()) {
+                            self.deep_filter_sections
+                                .entry(section)
+                                .or_default()
+                                .push(item);
+                            changed = true;
+                        }
+                    }
+                    Ok(DeepFilterEvent::Done) => {
+                        self.deep_filter_running = false;
+                        self.deep_filter_rx = None;
+                        changed = true;
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.deep_filter_running = false;
+                        self.deep_filter_rx = None;
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+
+            if changed {
+                for items in self.deep_filter_sections.values_mut() {
+                    items.sort_by(|a, b| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()));
+                }
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    fn render_section_header(ui: &mut egui::Ui, title: &str) {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(title).strong());
+    }
+
+    fn render_filter_results(&mut self, ui: &mut egui::Ui, this_folder_entries: &[FileEntry]) {
+        Self::render_section_header(ui, "This folder:");
+
+        if this_folder_entries.is_empty() {
+            ui.label(egui::RichText::new("(no match)").italics().color(egui::Color32::from_gray(150)));
+        } else {
+            for entry in this_folder_entries {
+                let label = if entry.is_dir {
+                    format!("📁 {}", entry.name)
+                } else {
+                    format!("📄 {}", entry.name)
+                };
+
+                let is_selected = self.selected_entries.contains(&entry.name);
+                let resp = ui.selectable_label(is_selected, label);
+
+                if resp.clicked() {
+                    self.selected_entries.clear();
+                    self.selected_entries.insert(entry.name.clone());
+                    self.last_clicked_entry = Some(entry.name.clone());
+                }
+
+                if resp.double_clicked() {
+                    if entry.is_dir {
+                        self.selected_action = Some(FileAction::OpenDir(self.current_path.join(&entry.name)));
+                    } else {
+                        let full_path = self.current_path.join(&entry.name);
+                        #[cfg(windows)]
+                        let _ = std::process::Command::new("explorer").arg(&full_path).spawn();
+                    }
+                }
+            }
+        }
+
+        let mut sections: Vec<String> = self.deep_filter_sections.keys().cloned().collect();
+        sections.sort_by_key(|s| s.to_lowercase());
+
+        for section in sections {
+            Self::render_section_header(ui, &format!("{}:", section));
+            if let Some(items) = self.deep_filter_sections.get(&section) {
+                if items.is_empty() {
+                    ui.label(egui::RichText::new("(no match)").italics().color(egui::Color32::from_gray(150)));
+                    continue;
+                }
+
+                for item in items {
+                    let label = if item.is_dir {
+                        format!("📁 {}", item.display_name)
+                    } else {
+                        format!("📄 {}", item.display_name)
+                    };
+
+                    let resp = ui.selectable_label(false, label);
+                    if resp.double_clicked() {
+                        if item.is_dir {
+                            self.selected_action = Some(FileAction::OpenDir(item.full_path.clone()));
+                        } else {
+                            #[cfg(windows)]
+                            let _ = std::process::Command::new("explorer")
+                                .arg(&item.full_path)
+                                .spawn();
+                        }
+                    }
+                }
+            }
+        }
+
+        if self.deep_filter_running {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Searching subfolders…").italics().color(egui::Color32::from_gray(160)));
+        }
     }
 }
 
@@ -1129,6 +1399,10 @@ impl eframe::App for RusplorerApp {
             ctx.set_cursor_icon(egui::CursorIcon::Progress);
             ctx.request_repaint();
         }
+
+        // Start/refresh/cancel incremental deep filtering based on the current
+        // filter text and path, and consume worker events each frame.
+        self.update_deep_filter_state(ctx);
 
         // Drain completed thumbnail loads and register them as GPU textures.
         while let Ok((path, color_image)) = self.thumb_loader_rx.try_recv() {
@@ -1994,55 +2268,56 @@ impl eframe::App for RusplorerApp {
                         );
                     });
 
-                egui::Window::new("conflict_dialog")
-                    .title_bar(false)
-                    .collapsible(false)
-                    .resizable(false)
+                egui::Area::new(egui::Id::new("conflict_dialog_area"))
+                    .order(egui::Order::Foreground)
                     .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                    .frame(egui::Frame {
-                        fill: ctx.style().visuals.window_fill(),
-                        stroke: egui::Stroke::new(1.5, egui::Color32::from_rgb(100, 140, 220)),
-                        inner_margin: egui::Margin::same(12.0),
-                        rounding: egui::Rounding::same(6.0),
-                        ..Default::default()
-                    })
+                    .interactable(true)
                     .show(ctx, |ui| {
-                        ui.set_min_width(btn_w + 24.0);
+                        egui::Frame {
+                            fill: ctx.style().visuals.window_fill(),
+                            stroke: egui::Stroke::new(1.5, egui::Color32::from_rgb(100, 140, 220)),
+                            inner_margin: egui::Margin::same(12.0),
+                            rounding: egui::Rounding::same(6.0),
+                            ..Default::default()
+                        }
+                        .show(ui, |ui| {
+                            ui.set_min_width(btn_w + 24.0);
 
-                        // Title bar
-                        ui.label(egui::RichText::new(&title).strong());
-                        ui.add_space(6.0);
-                        ui.separator();
-                        ui.add_space(4.0);
+                            // Title bar
+                            ui.label(egui::RichText::new(&title).strong());
+                            ui.add_space(6.0);
+                            ui.separator();
+                            ui.add_space(4.0);
 
-                        // File info
-                        ui.label(egui::RichText::new(&src_info).small().monospace());
-                        ui.label(egui::RichText::new(&dst_info).small().monospace());
-                        ui.add_space(8.0);
+                            // File info
+                            ui.label(egui::RichText::new(&src_info).small().monospace());
+                            ui.label(egui::RichText::new(&dst_info).small().monospace());
+                            ui.add_space(8.0);
 
-                        ui.style_mut().spacing.button_padding = egui::vec2(8.0, 4.0);
+                            ui.style_mut().spacing.button_padding = egui::vec2(8.0, 4.0);
 
-                        if ui.add_sized([btn_w, 0.0], egui::Button::new("Overwrite this file")).clicked() {
-                            answer = Some(ConflictChoice::Overwrite);
-                        }
-                        if ui.add_sized([btn_w, 0.0], egui::Button::new("Skip this file")).clicked() {
-                            answer = Some(ConflictChoice::Skip);
-                        }
-                        ui.add_space(4.0);
-                        if ui.add_sized([btn_w, 0.0], egui::Button::new("Overwrite all if different")).clicked() {
-                            answer = Some(ConflictChoice::OverwriteAll);
-                        }
-                        if ui.add_sized([btn_w, 0.0], egui::Button::new("Skip all with same name")).clicked() {
-                            answer = Some(ConflictChoice::SkipAll);
-                        }
-                        ui.add_space(4.0);
-                        ui.separator();
-                        ui.add_space(2.0);
-                        if ui.add_sized([btn_w, 0.0],
-                            egui::Button::new(egui::RichText::new("Abort").color(egui::Color32::from_rgb(210, 80, 80)))
-                        ).clicked() {
-                            answer = Some(ConflictChoice::Abort);
-                        }
+                            if ui.add_sized([btn_w, 0.0], egui::Button::new("Overwrite this file")).clicked() {
+                                answer = Some(ConflictChoice::Overwrite);
+                            }
+                            if ui.add_sized([btn_w, 0.0], egui::Button::new("Skip this file")).clicked() {
+                                answer = Some(ConflictChoice::Skip);
+                            }
+                            ui.add_space(4.0);
+                            if ui.add_sized([btn_w, 0.0], egui::Button::new("Overwrite all if different")).clicked() {
+                                answer = Some(ConflictChoice::OverwriteAll);
+                            }
+                            if ui.add_sized([btn_w, 0.0], egui::Button::new("Skip all with same name")).clicked() {
+                                answer = Some(ConflictChoice::SkipAll);
+                            }
+                            ui.add_space(4.0);
+                            ui.separator();
+                            ui.add_space(2.0);
+                            if ui.add_sized([btn_w, 0.0],
+                                egui::Button::new(egui::RichText::new("Abort").color(egui::Color32::from_rgb(210, 80, 80)))
+                            ).clicked() {
+                                answer = Some(ConflictChoice::Abort);
+                            }
+                        });
                     });
 
                 if let Some(choice) = answer {
@@ -2708,16 +2983,23 @@ impl eframe::App for RusplorerApp {
                 .contents
                 .iter()
                 .filter(|entry| {
-                    entry.name.starts_with("[..]")
-                        || self.filter.is_empty()
-                        || entry.name.to_lowercase().contains(&filter_lower)
+                    self.filter.is_empty() || entry.name.to_lowercase().contains(&filter_lower)
                 })
                 .cloned()
                 .collect();
             let entry_right_clicked;
             let mut sort_changed = false;
 
-            if is_thumb_view {
+            let this_folder_entries: Vec<FileEntry> = filtered_entries
+                .iter()
+                .filter(|entry| !entry.name.starts_with("[..]"))
+                .cloned()
+                .collect();
+
+            if !self.filter.is_empty() {
+                entry_right_clicked = false;
+                self.render_filter_results(ui, &this_folder_entries);
+            } else if is_thumb_view {
                 entry_right_clicked = self.render_thumbnails(ui, &filtered_entries);
 
             } else {

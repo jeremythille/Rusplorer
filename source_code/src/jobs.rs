@@ -10,6 +10,35 @@ use notify::{RecursiveMode, Watcher, recommended_watcher};
 use crate::fs_ops::{spawn_copy_job, read_dir_children, CopyJobState};
 use super::RusplorerApp;
 
+#[cfg(windows)]
+fn normalize_windows_path_for_compare(path: &std::path::Path) -> String {
+    let mut s = path.to_string_lossy().to_string();
+    s = s.replace('/', "\\");
+    if let Some(rest) = s.strip_prefix("\\\\?\\") {
+        s = rest.to_string();
+    }
+    if let Some(rest) = s.strip_prefix("\\??\\") {
+        s = rest.to_string();
+    }
+    while s.len() > 3 && s.ends_with('\\') {
+        s.pop();
+    }
+    s.make_ascii_lowercase();
+    s
+}
+
+#[cfg(windows)]
+fn windows_path_eq(a: &std::path::Path, b: &std::path::Path) -> bool {
+    normalize_windows_path_for_compare(a) == normalize_windows_path_for_compare(b)
+}
+
+#[cfg(windows)]
+struct RestoreSummary {
+    total: usize,
+    restored: usize,
+    failed: Vec<PathBuf>,
+}
+
 fn normalize_tree_dir_key(path: &std::path::Path) -> String {
     let mut s = path.to_string_lossy().to_string();
     while s.ends_with('\\') || s.ends_with('/') {
@@ -318,13 +347,21 @@ impl RusplorerApp {
     }
 
     /// Restore files from the Windows Recycle Bin by matching against their original paths.
-    /// Returns `true` if all items were restored successfully.
+    /// Returns a per-item summary for richer user feedback.
     #[cfg(windows)]
-    pub(crate) fn restore_from_recycle_bin(paths: &[PathBuf]) -> bool {
+    fn restore_from_recycle_bin(paths: &[PathBuf]) -> RestoreSummary {
         let mut restored = 0usize;
         let total = paths.len();
+        let mut failed: Vec<PathBuf> = Vec::new();
 
         for original_path in paths {
+            // Already present at destination: treat as already restored
+            // (can happen after partial restore attempts).
+            if original_path.exists() {
+                restored += 1;
+                continue;
+            }
+
             let mut drive = PathBuf::new();
             let mut comp_count = 0;
             for comp in original_path.components() {
@@ -332,14 +369,21 @@ impl RusplorerApp {
                 comp_count += 1;
                 if comp_count >= 2 { break; }
             }
-            if comp_count < 2 { continue; }
+            if comp_count < 2 {
+                failed.push(original_path.clone());
+                continue;
+            }
             let recycle_bin = drive.join("$Recycle.Bin");
 
             let sid_entries = match std::fs::read_dir(&recycle_bin) {
                 Ok(e) => e,
-                Err(_) => continue,
+                Err(_) => {
+                    failed.push(original_path.clone());
+                    continue;
+                }
             };
 
+            let mut restored_this = false;
             'sid_loop: for sid_entry in sid_entries.flatten() {
                 let sid_path = sid_entry.path();
                 if !sid_path.is_dir() { continue; }
@@ -397,7 +441,7 @@ impl RusplorerApp {
                     };
 
                     if let Some(orig) = orig_path_opt {
-                        if orig == *original_path {
+                        if windows_path_eq(&orig, original_path) {
                             let r_name = format!("$R{}", &file_name[2..]);
                             let r_path = sid_path.join(&r_name);
 
@@ -408,6 +452,7 @@ impl RusplorerApp {
                                 if std::fs::rename(&r_path, original_path).is_ok() {
                                     let _ = std::fs::remove_file(&item_path);
                                     restored += 1;
+                                    restored_this = true;
                                     break 'sid_loop;
                                 }
                             }
@@ -415,9 +460,19 @@ impl RusplorerApp {
                     }
                 }
             }
+
+            if !restored_this {
+                // If this exact item now exists, a previous restore likely recreated it
+                // (e.g. via restoring a parent folder). Count as success.
+                if original_path.exists() {
+                    restored += 1;
+                } else {
+                    failed.push(original_path.clone());
+                }
+            }
         }
 
-        restored == total
+        RestoreSummary { total, restored, failed }
     }
 
     /// Apply the topmost undo action in reverse.
@@ -481,11 +536,34 @@ impl RusplorerApp {
             }
             UndoAction::Delete { paths } => {
                 #[cfg(windows)]
-                if !Self::restore_from_recycle_bin(&paths) {
-                    self.delete_feedback_msg = Some(
-                        "Undo delete failed: one or more items could not be restored from Recycle Bin."
-                            .to_string(),
-                    );
+                {
+                    let summary = Self::restore_from_recycle_bin(&paths);
+                    if summary.restored < summary.total {
+                        let first = summary
+                            .failed
+                            .first()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "unknown item".to_string());
+                        self.delete_feedback_msg = Some(format!(
+                            "Undo delete incomplete: restored {}/{} item(s). First failure: {}",
+                            summary.restored,
+                            summary.total,
+                            first
+                        ));
+                        self.delete_feedback_until = None;
+                        self.delete_feedback_is_error = true;
+                    } else {
+                        self.delete_feedback_msg = Some(format!(
+                            "Undo delete restored {} item(s).",
+                            summary.restored
+                        ));
+                        self.delete_feedback_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+                        self.delete_feedback_is_error = false;
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    self.delete_feedback_msg = Some("Undo delete is only supported on Windows.".to_string());
                     self.delete_feedback_until = None;
                     self.delete_feedback_is_error = true;
                 }
