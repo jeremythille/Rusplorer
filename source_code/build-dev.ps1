@@ -1,8 +1,61 @@
 #!/usr/bin/env pwsh
 
+param(
+    [switch]$Watch,
+    [switch]$Once
+)
+
 # Change to the script's directory
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
+
+function Get-SourceStamp {
+    $files = @()
+    if (Test-Path .\src) {
+        $files += Get-ChildItem .\src -Recurse -File -ErrorAction SilentlyContinue
+    }
+    if (Test-Path .\Cargo.toml) {
+        $files += Get-Item .\Cargo.toml
+    }
+    if (Test-Path .\build.rs) {
+        $files += Get-Item .\build.rs
+    }
+    if ($files.Count -eq 0) {
+        return 0L
+    }
+    return ($files | Measure-Object -Property LastWriteTimeUtc -Maximum).Maximum.Ticks
+}
+
+# Default behavior: watch mode, unless -Once is explicitly requested.
+if (-not $Once) {
+    $Watch = $true
+}
+
+if ($Watch) {
+    $cargoWatch = Get-Command cargo-watch -ErrorAction SilentlyContinue
+    if ($cargoWatch) {
+        Write-Host "Starting watch mode (auto rebuild + relaunch on file changes)..."
+        Write-Host "Use .\build-dev.ps1 -Once for a single build+launch."
+        Write-Host "Keep this terminal open while developing."
+        cargo watch -w src -w Cargo.toml -w build.rs -s "powershell -NoProfile -ExecutionPolicy Bypass -File ./build-dev.ps1 -Once"
+        exit $LASTEXITCODE
+    }
+
+    Write-Host "cargo-watch not found, using built-in watcher fallback."
+    Write-Host "Keep this terminal open while developing."
+
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\build-dev.ps1 -Once
+    $lastStamp = Get-SourceStamp
+    while ($true) {
+        Start-Sleep -Milliseconds 700
+        $newStamp = Get-SourceStamp
+        if ($newStamp -gt $lastStamp) {
+            $lastStamp = $newStamp
+            Write-Host "Change detected - rebuilding..."
+            powershell -NoProfile -ExecutionPolicy Bypass -File .\build-dev.ps1 -Once
+        }
+    }
+}
 
 $debugDir = ".\target\debug"
 $exePath  = "$debugDir\rusplorer-dev.exe"
