@@ -1,0 +1,10 @@
+source_code/target/*
+source_code/target
+/target/
+Cargo.lock
+Cargo.toml
+*.rsess
+rusplorer.config.json
+rusplorer_error.log
+gui_tests/artifacts/
+.git_history_backup/

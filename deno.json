@@ -1,0 +1,10 @@
+{
+  "tasks": {
+    "gui:test": "deno run --allow-run --allow-read --allow-write --allow-env gui_tests/run_vision_test.ts",
+    "gui:test:vision": "deno run --allow-run --allow-read --allow-write --allow-env --allow-net gui_tests/run_vision_test.ts --evaluate"
+  },
+  "fmt": {
+    "useTabs": false,
+    "lineWidth": 100
+  }
+}

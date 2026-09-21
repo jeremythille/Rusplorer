@@ -1,0 +1,38 @@
+{
+  "name": "select three files and verify the visible result",
+  "session": "gui_tests\\selection_fixture.rsess",
+  "steps": [
+    {
+      "action": "launch"
+    },
+    {
+      "action": "wait",
+      "seconds": 2
+    },
+    {
+      "action": "click_text",
+      "text": "Aladdin (Europe).md"
+    },
+    {
+      "action": "wait",
+      "seconds": 0.2
+    },
+    {
+      "action": "ctrl_click_text",
+      "text": "Cool Spot (Europe).md"
+    },
+    {
+      "action": "wait",
+      "seconds": 0.2
+    },
+    {
+      "action": "ctrl_click_text",
+      "text": "Earthworm Jim (USA).md"
+    },
+    {
+      "action": "screenshot",
+      "name": "three-files-selected",
+      "expect": "Expect exactly three selected files, named Aladdin, Cool Spot, and Earthworm Jim. Expect the selected rows to be visibly highlighted and the bottom status bar to show that 3 items are selected. Ignore the total number of files if it differs. Return PASS or FAIL and explain what is visible."
+    }
+  ]
+}
