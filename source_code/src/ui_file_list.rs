@@ -3,8 +3,6 @@ use egui_extras::{Column, TableBuilder};
 use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use crate::types::{FileEntry, SortColumn, FileAction};
-#[cfg(windows)]
-use crate::shortcuts::resolve_lnk;
 use super::RusplorerApp;
 
 impl RusplorerApp {
@@ -16,13 +14,6 @@ impl RusplorerApp {
         let ctx = ui.ctx().clone();
         let mut entry_right_clicked = false;
         let mut sort_changed = false;
-        // Inner list content area (excludes vertical scrollbar space on the right edge)
-        let scroll_w = ui.spacing().scroll.bar_inner_margin
-            + ui.spacing().scroll.bar_width
-            + ui.spacing().scroll.bar_outer_margin;
-        let mut inner_rect = ui.available_rect_before_wrap();
-        inner_rect.max.x = (inner_rect.max.x - scroll_w).max(inner_rect.min.x);
-        self.file_list_inner_rect = inner_rect;
         // ── TABLE (list view) ────────────────────────────────────────────────
         // Table with proper column alignment
         let show_dates = self
@@ -597,33 +588,9 @@ impl RusplorerApp {
                             if response.double_clicked() {
                                 if entry.name.starts_with("[..]") {
                                     self.selected_action = Some(FileAction::GoToParent);
-                                } else if entry.is_dir {
-                                    let new_path = self.current_path.join(&entry.name);
-                                    self.selected_action = Some(FileAction::OpenDir(new_path));
                                 } else {
                                     let full_path = self.current_path.join(&entry.name);
-                                    // Resolve .lnk shortcuts
-                                    #[cfg(windows)]
-                                    let resolved = if entry.name
-                                        .to_lowercase()
-                                        .ends_with(".lnk")
-                                    {
-                                        resolve_lnk(&full_path)
-                                    } else {
-                                        None
-                                    };
-                                    #[cfg(not(windows))]
-                                    let resolved: Option<PathBuf> = None;
-                                    if let Some(target) = resolved {
-                                        if target.is_dir() {
-                                            self.selected_action =
-                                                Some(FileAction::OpenDir(target));
-                                        } else {
-                                            Self::launch_file(&target);
-                                        }
-                                    } else {
-                                        Self::launch_file(&full_path);
-                                    }
+                                    self.activate_path(&full_path, entry.is_dir);
                                 }
                             }
 

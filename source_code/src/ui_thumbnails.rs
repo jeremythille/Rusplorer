@@ -1,7 +1,7 @@
 ﻿use eframe::egui;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use crate::types::{FileEntry, FileAction};
+use crate::types::FileEntry;
 use super::RusplorerApp;
 
 impl RusplorerApp {
@@ -57,7 +57,6 @@ impl RusplorerApp {
             }
             self.entry_rects.clear();
             self.any_button_hovered = false;
-            self.file_list_inner_rect = ui.available_rect_before_wrap();
 
             let thumb_entries: Vec<&FileEntry> = filtered_entries.iter()
                 .filter(|e| !e.name.starts_with("[..]")
@@ -69,10 +68,6 @@ impl RusplorerApp {
                 .id_source("thumb_scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    // ScrollArea's clipped content viewport excludes its scrollbar.
-                    self.file_list_inner_rect = ui
-                        .clip_rect()
-                        .shrink(ui.visuals().clip_rect_margin);
                     for chunk in thumb_entries.chunks(col_count) {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = GAP;
@@ -207,13 +202,7 @@ impl RusplorerApp {
                                 }
 
                                 if resp.double_clicked() {
-                                    if entry.is_dir {
-                                        self.selected_action = Some(FileAction::OpenDir(
-                                            self.current_path.join(&entry.name)));
-                                    } else {
-                                        #[cfg(windows)]
-                                        Self::launch_file(&full_path);
-                                    }
+                                    self.activate_path(&full_path, entry.is_dir);
                                 }
 
                                 // Right-click context menu (skip when right-drag DnD active)

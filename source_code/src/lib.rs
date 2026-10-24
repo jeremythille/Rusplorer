@@ -41,6 +41,11 @@ use config::*;
 use types::*;
 use updater::UpdateUiState;
 
+#[cfg(feature = "compatibility")]
+type RendererConfigOverride = Option<egui_wgpu::WgpuConfiguration>;
+#[cfg(not(feature = "compatibility"))]
+type RendererConfigOverride = ();
+
 pub fn run_app() -> Result<(), eframe::Error> {
     // Initialise OLE on the main thread so DoDragDrop works
     #[cfg(windows)]
@@ -67,52 +72,47 @@ pub fn run_app() -> Result<(), eframe::Error> {
 
     #[cfg(feature = "compatibility")]
     {
-        let mut gl_config = egui_wgpu::WgpuConfiguration::default();
-        gl_config.supported_backends = eframe::wgpu::Backends::GL;
-        gl_config.power_preference = eframe::wgpu::PowerPreference::None;
-        gl_config.present_mode = eframe::wgpu::PresentMode::Fifo;
-        gl_config.desired_maximum_frame_latency = Some(1);
-
-        let result = launch(session.clone(), &window_title, Some(gl_config));
-        return match result {
-            Err(ref error) if format!("{error:?}").contains("NoSuitableAdapterFound") => {
-                launch(session, &window_title, None)
+        // Try primary wgpu backends first, then ANGLE as a fallback.
+        let result = launch(
+            eframe::Renderer::Wgpu,
+            None,
+            session.clone(),
+            &window_title,
+        );
+        match result {
+            Err(ref error) if format!("{:?}", error).contains("NoSuitableAdapterFound") => {
+                let mut wgpu_config = egui_wgpu::WgpuConfiguration::default();
+                wgpu_config.supported_backends = eframe::wgpu::Backends::GL;
+                wgpu_config.power_preference = eframe::wgpu::PowerPreference::None;
+                launch(
+                    eframe::Renderer::Wgpu,
+                    Some(wgpu_config),
+                    session,
+                    &window_title,
+                )
             }
             other => other,
-        };
+        }
     }
 
     #[cfg(not(feature = "compatibility"))]
-    launch(session, &window_title)
+    launch(eframe::Renderer::Glow, (), session, &window_title)
 }
 
-#[cfg(feature = "compatibility")]
 fn launch(
-    session: Option<SessionData>,
-    window_title: &str,
-    wgpu_config: Option<egui_wgpu::WgpuConfiguration>,
-) -> Result<(), eframe::Error> {
-    let mut options = eframe::NativeOptions::default();
-    options.renderer = eframe::Renderer::Wgpu;
-    options.wgpu_options = wgpu_config.unwrap_or_default();
-    launch_with_options(session, window_title, options)
-}
-
-#[cfg(not(feature = "compatibility"))]
-fn launch(
+    renderer: eframe::Renderer,
+    renderer_config_override: RendererConfigOverride,
     session: Option<SessionData>,
     window_title: &str,
 ) -> Result<(), eframe::Error> {
     let mut options = eframe::NativeOptions::default();
-    options.renderer = eframe::Renderer::Glow;
-    launch_with_options(session, window_title, options)
-}
-
-fn launch_with_options(
-    session: Option<SessionData>,
-    window_title: &str,
-    mut options: eframe::NativeOptions,
-) -> Result<(), eframe::Error> {
+    options.renderer = renderer;
+    #[cfg(feature = "compatibility")]
+    if let Some(wgpu_config) = renderer_config_override {
+        options.wgpu_options = wgpu_config;
+    }
+    #[cfg(not(feature = "compatibility"))]
+    let _ = renderer_config_override;
     // Disable multisampling ï¿½ required on some corporate/VM environments
     // where the GPU driver does not expose MSAA sample counts.
     options.multisampling = 0;
@@ -212,7 +212,6 @@ struct DeepFilterItem {
     full_path: PathBuf,
     display_name: String,
     is_dir: bool,
-    size: Option<u64>,
 }
 
 enum DeepFilterEvent {
@@ -305,8 +304,9 @@ struct RusplorerApp {
     files_to_archive: Vec<PathBuf>,
     archive_done_receiver: Option<Receiver<String>>,
     show_extract_dialog: bool,
-    extract_archive_path: PathBuf,
-    extract_done_receiver: Option<Receiver<()>>,
+    extract_archive_paths: Vec<PathBuf>,
+    extract_to_separate_folders: bool,
+    extract_done_receiver: Option<Receiver<Result<(), String>>>,
     clipboard_files: Vec<PathBuf>,
     clipboard_mode: Option<ClipboardMode>,
     prev_ctrl_c_down: bool,
@@ -320,8 +320,6 @@ struct RusplorerApp {
     selection_before_drag: HashSet<String>,
     any_button_hovered: bool,
     filter_edit_rect: egui::Rect,    // rect of the filter TextEdit × excluded from rubber-band
-    /// Visible file-list content area; the scrollbar is outside this rect.
-    file_list_inner_rect: egui::Rect,
     // Internal drag-and-drop
     dnd_active: bool,
     dnd_sources: Vec<PathBuf>,
@@ -464,36 +462,6 @@ impl Default for RusplorerApp {
 }
 
 impl RusplorerApp {
-    /// Open a file using its normal shell behavior. Executables are launched
-    /// directly so their working directory is the folder containing the EXE;
-    /// launching `explorer.exe <path>` can otherwise inherit Rusplorer's
-    /// working directory, which breaks games that load relative assets.
-    pub(crate) fn launch_file(path: &std::path::Path) {
-        #[cfg(windows)]
-        {
-            let is_executable = path
-                .extension()
-                .map(|ext| ext.eq_ignore_ascii_case("exe"))
-                .unwrap_or(false);
-            if is_executable {
-                let mut command = std::process::Command::new(path);
-                if let Some(parent) = path.parent() {
-                    command.current_dir(parent);
-                }
-                if command.spawn().is_ok() {
-                    return;
-                }
-            }
-
-            let _ = std::process::Command::new("explorer").arg(path).spawn();
-        }
-
-        #[cfg(not(windows))]
-        {
-            let _ = std::process::Command::new("xdg-open").arg(path).spawn();
-        }
-    }
-
     fn new(session: Option<SessionData>) -> Self {
         let available_drives = Self::list_drives();
         let config = Config::load();
@@ -582,7 +550,8 @@ impl RusplorerApp {
             files_to_archive: Vec::new(),
             archive_done_receiver: None,
             show_extract_dialog: false,
-            extract_archive_path: PathBuf::new(),
+            extract_archive_paths: Vec::new(),
+            extract_to_separate_folders: true,
             extract_done_receiver: None,
             clipboard_files: Vec::new(),
             clipboard_mode: None,
@@ -597,7 +566,6 @@ impl RusplorerApp {
             selection_before_drag: HashSet::new(),
             any_button_hovered: false,
             filter_edit_rect: egui::Rect::NOTHING,
-            file_list_inner_rect: egui::Rect::NOTHING,
             dnd_active: false,
             dnd_sources: Vec::new(),
             dnd_label: String::new(),
@@ -733,6 +701,69 @@ impl RusplorerApp {
         app
     }
 
+    pub(crate) fn activate_path(&mut self, path: &std::path::Path, is_dir: bool) {
+        if is_dir {
+            self.selected_action = Some(FileAction::OpenDir(path.to_path_buf()));
+            return;
+        }
+
+        #[cfg(windows)]
+        {
+            let is_shortcut = path
+                .extension()
+                .map(|extension| extension.to_string_lossy().eq_ignore_ascii_case("lnk"))
+                .unwrap_or(false);
+            let resolved = if is_shortcut {
+                crate::shortcuts::resolve_lnk(path)
+            } else {
+                None
+            };
+            let target = resolved.as_deref().unwrap_or(path);
+
+            if target.is_dir() {
+                self.selected_action = Some(FileAction::OpenDir(target.to_path_buf()));
+            } else {
+                self.launch_file(target);
+            }
+        }
+
+        #[cfg(not(windows))]
+        self.launch_file(path);
+    }
+
+    fn launch_file(&mut self, path: &std::path::Path) {
+        #[cfg(windows)]
+        {
+            let is_executable = path
+                .extension()
+                .map(|extension| extension.eq_ignore_ascii_case("exe"))
+                .unwrap_or(false);
+            if is_executable {
+                let mut command = std::process::Command::new(path);
+                if let Some(parent) = path.parent() {
+                    command.current_dir(parent);
+                }
+                if command.spawn().is_ok() {
+                    return;
+                }
+            }
+
+            if let Err(error) = std::process::Command::new("explorer").arg(path).spawn() {
+                self.delete_feedback_msg =
+                    Some(format!("Could not open {}: {}", path.display(), error));
+                self.delete_feedback_until = None;
+                self.delete_feedback_is_error = true;
+            }
+        }
+
+        #[cfg(not(windows))]
+        if let Err(error) = std::process::Command::new("xdg-open").arg(path).spawn() {
+            self.delete_feedback_msg = Some(format!("Could not open {}: {}", path.display(), error));
+            self.delete_feedback_until = None;
+            self.delete_feedback_is_error = true;
+        }
+    }
+
     fn cancel_deep_filter_search(&mut self) {
         self.deep_filter_cancel.store(true, Ordering::SeqCst);
         self.deep_filter_rx = None;
@@ -817,7 +848,6 @@ impl RusplorerApp {
 
                     let display_name = remainder.to_string_lossy().to_string();
                     let item = DeepFilterItem {
-                        size: std::fs::metadata(&path).ok().map(|metadata| metadata.len()),
                         full_path: path,
                         display_name,
                         is_dir: file_type.is_dir(),
@@ -904,41 +934,16 @@ impl RusplorerApp {
         let mut entry_right_clicked = false;
         self.entry_rects.clear();
         self.any_button_hovered = false;
-        self.file_list_inner_rect = ui.available_rect_before_wrap();
         egui::ScrollArea::vertical()
             .id_source("filter_results_scroll")
             .auto_shrink([false, false])
-            .drag_to_scroll(false)
             .show(ui, |ui| {
-        const FILTER_SIZE_COL_WIDTH: f32 = 72.0;
-        let filter_name_col_width = (ui.available_width() - FILTER_SIZE_COL_WIDTH).max(80.0);
-        // ScrollArea's clipped content viewport excludes its scrollbar.
-        self.file_list_inner_rect = ui
-            .clip_rect()
-            .shrink(ui.visuals().clip_rect_margin);
-        ui.horizontal(|row_ui| {
-            row_ui.add_sized(
-                egui::vec2(filter_name_col_width, 18.0),
-                egui::Label::new(egui::RichText::new("Name").strong()),
-            );
-            row_ui.allocate_ui_with_layout(
-                egui::vec2(FILTER_SIZE_COL_WIDTH, 18.0),
-                egui::Layout::right_to_left(egui::Align::Center),
-                |size_ui| {
-                    size_ui.label(egui::RichText::new("Size").strong());
-                },
-            );
-        });
         Self::render_section_header(ui, "This folder:");
 
         if this_folder_entries.is_empty() {
             ui.label(egui::RichText::new("(no match)").italics().color(egui::Color32::from_gray(150)));
         } else {
             for entry in this_folder_entries {
-                let full_path = self.current_path.join(&entry.name);
-                let is_in_clipboard = self.clipboard_files.contains(&full_path);
-                let dark_mode = ui.visuals().dark_mode;
-                let text_color = ui.visuals().text_color();
                 let label = if entry.is_dir {
                     format!("📁 {}", entry.name)
                 } else {
@@ -946,51 +951,10 @@ impl RusplorerApp {
                 };
 
                 let is_selected = self.selected_entries.contains(&entry.name);
-                let name_color = if is_selected {
-                    egui::Color32::WHITE
-                } else if entry.is_dir {
-                    egui::Color32::from_gray(20)
-                } else if [".sfk", ".sfap0", ".bak"]
-                    .iter()
-                    .any(|ext| entry.name.to_ascii_lowercase().ends_with(ext))
-                {
-                    egui::Color32::from_rgb(0xBF, 0xBF, 0xBF)
-                } else {
-                    text_color
-                };
-                let size_label = self
-                    .file_sizes
-                    .get(&full_path)
-                    .map(|size| Self::format_file_size(*size))
-                    .unwrap_or_else(|| if entry.is_dir { "0 B".to_string() } else { "...".to_string() });
-                let mut button = egui::Button::new(Self::name_layout_job(
-                    &label,
-                    entry.is_dir,
-                    name_color,
-                    is_in_clipboard,
-                    dark_mode,
-                ))
+                let button = egui::Button::new(label)
                     .selected(is_selected)
                     .sense(egui::Sense::click_and_drag());
-                if entry.is_dir && !is_selected {
-                    button = button.fill(egui::Color32::from_rgb(255, 245, 150));
-                }
-                let resp = ui
-                    .horizontal(|row_ui| {
-                        let response = row_ui.add_sized(
-                            egui::vec2(filter_name_col_width, 18.0),
-                            button,
-                        );
-                        row_ui.allocate_ui_with_layout(
-                            egui::vec2(FILTER_SIZE_COL_WIDTH, 18.0),
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |size_ui| {
-                                size_ui.label(egui::RichText::new(&size_label).weak());
-                            },
-                        );
-                        response
-                    })
-                    .inner;
+                let resp = ui.add(button);
 
                 self.entry_rects.insert(entry.name.clone(), resp.rect);
 
@@ -1145,13 +1109,8 @@ impl RusplorerApp {
                 }
 
                 if resp.double_clicked() {
-                    if entry.is_dir {
-                        self.selected_action = Some(FileAction::OpenDir(self.current_path.join(&entry.name)));
-                    } else {
-                        let full_path = self.current_path.join(&entry.name);
-                        #[cfg(windows)]
-                        Self::launch_file(&full_path);
-                    }
+                    let full_path = self.current_path.join(&entry.name);
+                    self.activate_path(&full_path, entry.is_dir);
                 }
             }
         }
@@ -1160,28 +1119,8 @@ impl RusplorerApp {
         sections.sort_by_key(|s| s.to_lowercase());
 
         for section in sections {
-            ui.add_space(4.0);
-            let section_response = ui.add(
-                egui::Button::new(Self::name_layout_job(
-                    &format!("{}:", section),
-                    true,
-                    egui::Color32::from_gray(20),
-                    false,
-                    ui.visuals().dark_mode,
-                ))
-                    .fill(egui::Color32::from_rgb(255, 245, 150))
-                    .frame(false)
-                    .sense(egui::Sense::click()),
-            );
-            if section_response.hovered() {
-                self.any_button_hovered = true;
-            }
-            if section_response.double_clicked() {
-                let section_path = self.current_path.join(&section);
-                if section_path.is_dir() {
-                    self.selected_action = Some(FileAction::OpenDir(section_path));
-                }
-            }
+            Self::render_section_header(ui, &format!("{}:", section));
+            let mut activated_item = None;
             if let Some(items) = self.deep_filter_sections.get(&section) {
                 if items.is_empty() {
                     ui.label(egui::RichText::new("(no match)").italics().color(egui::Color32::from_gray(150)));
@@ -1189,9 +1128,6 @@ impl RusplorerApp {
                 }
 
                 for item in items {
-                    let is_in_clipboard = self.clipboard_files.contains(&item.full_path);
-                    let dark_mode = ui.visuals().dark_mode;
-                    let text_color = ui.visuals().text_color();
                     let label = if item.is_dir {
                         format!("📁 {}", item.display_name)
                     } else {
@@ -1199,134 +1135,7 @@ impl RusplorerApp {
                     };
 
                     let is_selected = self.deep_filter_selected.contains(&item.full_path);
-                    let name_color = if is_selected {
-                        egui::Color32::WHITE
-                    } else if item.is_dir {
-                        egui::Color32::from_gray(20)
-                    } else if [".sfk", ".sfap0", ".bak"]
-                        .iter()
-                        .any(|ext| item.display_name.to_ascii_lowercase().ends_with(ext))
-                    {
-                        egui::Color32::from_rgb(0xBF, 0xBF, 0xBF)
-                    } else {
-                        text_color
-                    };
-                    let size_label = item
-                        .size
-                        .map(Self::format_file_size)
-                        .unwrap_or_else(|| "...".to_string());
-                    let mut button = egui::Button::new(Self::name_layout_job(
-                        &label,
-                        item.is_dir,
-                        name_color,
-                        is_in_clipboard,
-                        dark_mode,
-                    ))
-                    .selected(is_selected)
-                    .sense(egui::Sense::click_and_drag());
-                    if item.is_dir && !is_selected {
-                        button = button.fill(egui::Color32::from_rgb(255, 245, 150));
-                    }
-                    let resp = ui
-                        .horizontal(|row_ui| {
-                            let response = row_ui.add_sized(
-                                egui::vec2(filter_name_col_width, 18.0),
-                                button,
-                            );
-                            row_ui.allocate_ui_with_layout(
-                                egui::vec2(FILTER_SIZE_COL_WIDTH, 18.0),
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |size_ui| {
-                                    size_ui.label(egui::RichText::new(&size_label).weak());
-                                },
-                            );
-                            response
-                        })
-                        .inner;
-                    let press_origin_on_entry = ui.input(|i| {
-                        i.pointer
-                            .press_origin()
-                            .map_or(false, |p| resp.rect.contains(p))
-                    });
-                    let cursor_over_entry = press_origin_on_entry || resp.hovered();
-                    if cursor_over_entry {
-                        self.any_button_hovered = true;
-                    }
-
-                    let primary_down = ui.input(|i| i.pointer.primary_down());
-                    let secondary_down =
-                        ui.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
-                    let any_btn_down = primary_down || secondary_down;
-
-                    if cursor_over_entry
-                        && any_btn_down
-                        && !self.dnd_active
-                        && self.dnd_suppress == 0
-                        && !self.is_dragging_selection
-                        && self.dnd_start_pos.is_none()
-                        && !self.ole_drag_in_active.load(Ordering::SeqCst)
-                    {
-                        self.dnd_start_pos = ui.input(|i| i.pointer.hover_pos());
-                        self.dnd_drag_entry = Some(item.full_path.to_string_lossy().to_string());
-                        self.dnd_is_right_click = {
-                            #[cfg(windows)]
-                            {
-                                use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-                                let state = unsafe { GetAsyncKeyState(0x02) };
-                                state & (0x8000u16 as i16) != 0
-                            }
-                            #[cfg(not(windows))]
-                            {
-                                secondary_down
-                            }
-                        };
-                    }
-
-                    if !self.dnd_active && !any_btn_down {
-                        self.dnd_start_pos = None;
-                        self.dnd_drag_entry = None;
-                        self.dnd_is_right_click = false;
-                    }
-
-                    let item_key = item.full_path.to_string_lossy().to_string();
-                    let is_this_entry_drag = any_btn_down
-                        && self.dnd_drag_entry.as_deref() == Some(item_key.as_str());
-                    if is_this_entry_drag && !self.dnd_active && !self.is_dragging_selection {
-                        if let Some(start) = self.dnd_start_pos {
-                            if let Some(current) = ui.input(|i| i.pointer.hover_pos()) {
-                                if start.distance(current) > 5.0 {
-                                    if self.deep_filter_selected.contains(&item.full_path) {
-                                        self.dnd_sources =
-                                            self.deep_filter_selected.iter().cloned().collect();
-                                    } else {
-                                        self.dnd_sources = vec![item.full_path.clone()];
-                                        self.selected_entries.clear();
-                                        self.deep_filter_selected.clear();
-                                        self.deep_filter_selected.insert(item.full_path.clone());
-                                    }
-                                    let count = self.dnd_sources.len();
-                                    self.dnd_label = if count == 1 {
-                                        if item.is_dir {
-                                            format!("📁 {}", &item.display_name)
-                                        } else {
-                                            format!("📄 {}", &item.display_name)
-                                        }
-                                    } else {
-                                        format!("📦 {} items", count)
-                                    };
-                                    if self.dnd_is_right_click {
-                                        self.dnd_label =
-                                            format!(
-                                                "{}  [Move / Copy / Shortcut]",
-                                                self.dnd_label
-                                            );
-                                    }
-                                    self.dnd_active = true;
-                                }
-                            }
-                        }
-                    }
-
+                    let resp = ui.selectable_label(is_selected, label);
                     if resp.clicked_by(egui::PointerButton::Primary) {
                         let is_ctrl = ui.input(|i| i.modifiers.ctrl);
                         self.selected_entries.clear();
@@ -1340,14 +1149,12 @@ impl RusplorerApp {
                         }
                     }
                     if resp.double_clicked() {
-                        if item.is_dir {
-                            self.selected_action = Some(FileAction::OpenDir(item.full_path.clone()));
-                        } else {
-                            #[cfg(windows)]
-                            Self::launch_file(&item.full_path);
-                        }
+                        activated_item = Some((item.full_path.clone(), item.is_dir));
                     }
                 }
+            }
+            if let Some((path, is_dir)) = activated_item {
+                self.activate_path(&path, is_dir);
             }
         }
 
@@ -1412,6 +1219,15 @@ impl RusplorerApp {
         Ok(Self::session_storage_dir().join(filename))
     }
 
+    fn persist_app_state(&mut self) {
+        self.save_active_tab();
+        self.config.tabs = Some(self.tabs.clone());
+        self.config.active_tab = Some(self.active_tab);
+        self.config.window_pos = self.last_window_pos;
+        self.config.window_size = self.last_window_size;
+        self.config.save();
+    }
+
     /// Snapshot the current tabs into a `SessionData` and write it to `path`.
     fn save_session_to_file(&mut self, path: &std::path::Path, ctx: &egui::Context) -> Result<(), String> {
         self.save_active_tab();
@@ -1432,18 +1248,14 @@ impl RusplorerApp {
 }
 
 impl eframe::App for RusplorerApp {
-    fn on_exit(
-        &mut self,
-        #[cfg(feature = "lean")] _gl: Option<&eframe::glow::Context>,
-    ) {
-        // Flush active tab state back into the tabs vec, then persist to config.
-        self.save_active_tab();
-        self.config.tabs = Some(self.tabs.clone());
-        self.config.active_tab = Some(self.active_tab);
-        // Persist window geometry tracked from the last frame.
-        self.config.window_pos  = self.last_window_pos;
-        self.config.window_size = self.last_window_size;
-        self.config.save();
+    #[cfg(feature = "lean")]
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.persist_app_state();
+    }
+
+    #[cfg(not(feature = "lean"))]
+    fn on_exit(&mut self) {
+        self.persist_app_state();
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -1576,11 +1388,24 @@ impl eframe::App for RusplorerApp {
         }
 
         // Check if extraction finished
-        if let Some(ref rx) = self.extract_done_receiver {
-            if rx.try_recv().is_ok() {
-                self.refresh_contents();
-                self.show_extract_dialog = false;
-                self.extract_done_receiver = None;
+        let extract_result = self.extract_done_receiver.as_ref().and_then(|rx| {
+            match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("Archive extraction stopped unexpectedly.".to_string()))
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            }
+        });
+        if let Some(result) = extract_result {
+            self.refresh_contents();
+            self.show_extract_dialog = false;
+            self.extract_done_receiver = None;
+            self.extract_archive_paths.clear();
+            if let Err(error) = result {
+                self.delete_feedback_msg = Some(format!("Extraction failed: {}", error));
+                self.delete_feedback_until = None;
+                self.delete_feedback_is_error = true;
             }
         }
 
@@ -2106,6 +1931,44 @@ impl eframe::App for RusplorerApp {
                         self.last_clicked_entry = Some(name);
                     }
                     self.type_select_scroll = Some(row);
+                }
+            }
+        }
+
+        if self.is_focused
+            && !any_modal_open
+            && !self.show_context_menu
+            && !self.show_bg_context_menu
+            && !self.show_drop_menu
+            && !ctx.wants_keyboard_input()
+            && ctx.input(|i| i.key_pressed(egui::Key::Enter))
+        {
+            if self.deep_filter_selected.len() == 1 {
+                if let Some(path) = self.deep_filter_selected.iter().next().cloned() {
+                    self.activate_path(&path, path.is_dir());
+                }
+            } else if self.deep_filter_selected.is_empty() {
+                let selected_name = self
+                    .last_clicked_entry
+                    .as_ref()
+                    .filter(|name| self.selected_entries.contains(*name))
+                    .cloned()
+                    .or_else(|| {
+                        if self.selected_entries.len() == 1 {
+                            self.selected_entries.iter().next().cloned()
+                        } else {
+                            None
+                        }
+                    });
+
+                if let Some(name) = selected_name {
+                    if name.starts_with("[..]") {
+                        self.selected_action = Some(FileAction::GoToParent);
+                    } else if let Some(entry) = self.contents.iter().find(|entry| entry.name == name)
+                    {
+                        let path = self.current_path.join(&entry.name);
+                        self.activate_path(&path, entry.is_dir);
+                    }
                 }
             }
         }
@@ -2879,50 +2742,6 @@ impl eframe::App for RusplorerApp {
             self.navigate_to(path);
         }
 
-        let selection_paths: Vec<PathBuf> = if !self.deep_filter_selected.is_empty() {
-            self.deep_filter_selected.iter().cloned().collect()
-        } else {
-            self.selected_entries
-                .iter()
-                .map(|name| self.current_path.join(name))
-                .collect()
-        };
-        let selection_count = selection_paths.len();
-        if selection_count > 1 {
-            egui::TopBottomPanel::bottom("selection_summary_panel")
-                .resizable(false)
-                .show(ctx, |ui| {
-                    let total_items = self
-                        .contents
-                        .iter()
-                        .filter(|e| !e.name.starts_with("[..]"))
-                        .count();
-                    let mut selected_size = 0u64;
-                    let mut pending_size_count = 0usize;
-
-                    for path in &selection_paths {
-                        if let Some(sz) = self.file_sizes.get(path) {
-                            selected_size = selected_size.saturating_add(*sz);
-                        } else {
-                            pending_size_count += 1;
-                        }
-                    }
-
-                    ui.horizontal(|ui| {
-                        let mut summary = format!(
-                            "Selected: {}/{} items  |  Total size: {}",
-                            selection_count,
-                            total_items,
-                            Self::format_file_size(selected_size)
-                        );
-                        if pending_size_count > 0 {
-                            summary.push_str(&format!("  (+{} computing)", pending_size_count));
-                        }
-                        ui.label(egui::RichText::new(summary).small().color(egui::Color32::from_gray(190)));
-                    });
-                });
-        }
-
         egui::CentralPanel::default().show(ctx, |ui| {
             // -- Tab bar --------------------------------------------------
             let mut switch_to: Option<usize> = None;
@@ -3662,6 +3481,50 @@ impl eframe::App for RusplorerApp {
                 sort_changed = sc;
             }
 
+            let selection_paths: Vec<PathBuf> = if !self.deep_filter_selected.is_empty() {
+                self.deep_filter_selected.iter().cloned().collect()
+            } else {
+                self.selected_entries
+                    .iter()
+                    .map(|name| self.current_path.join(name))
+                    .collect()
+            };
+            let selection_count = selection_paths.len();
+            if selection_count > 1 {
+                egui::TopBottomPanel::bottom("selection_summary_panel")
+                    .resizable(false)
+                    .show(ctx, |ui| {
+                        let total_items = self
+                            .contents
+                            .iter()
+                            .filter(|e| !e.name.starts_with("[..]"))
+                            .count();
+                        let mut selected_size = 0u64;
+                        let mut pending_size_count = 0usize;
+
+                        for path in &selection_paths {
+                            if let Some(sz) = self.file_sizes.get(path) {
+                                selected_size = selected_size.saturating_add(*sz);
+                            } else {
+                                pending_size_count += 1;
+                            }
+                        }
+
+                        ui.horizontal(|ui| {
+                            let mut summary = format!(
+                                "Selected: {}/{} items  |  Total size: {}",
+                                selection_count,
+                                total_items,
+                                Self::format_file_size(selected_size)
+                            );
+                            if pending_size_count > 0 {
+                                summary.push_str(&format!("  (+{} computing)", pending_size_count));
+                            }
+                            ui.label(egui::RichText::new(summary).small().color(egui::Color32::from_gray(190)));
+                        });
+                    });
+            }
+
             // Background right-click: open menu only when no entry was clicked
             // and no context menu was already opened this frame (e.g. from tree panel)
             if !entry_right_clicked && !self.dnd_active && self.dnd_suppress == 0 && !self.show_context_menu {
@@ -3688,7 +3551,6 @@ impl eframe::App for RusplorerApp {
                     let in_tab_bar = self.tab_bar_rect.contains(pointer_pos);
                     if i.pointer.primary_pressed() && !self.any_button_hovered && !in_tab_bar
                         && !self.filter_edit_rect.contains(pointer_pos)
-                        && self.file_list_inner_rect.contains(pointer_pos)
                         && pointer_pos.x > self.left_panel_width + 2.0  // don't start rubber-band in the tree panel
                     {
                         self.is_dragging_selection = true;
@@ -4071,7 +3933,3 @@ impl eframe::App for RusplorerApp {
         }
     }
 }
-
-
-
-

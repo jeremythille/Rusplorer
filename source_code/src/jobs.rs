@@ -583,7 +583,7 @@ impl RusplorerApp {
         use crate::types::UndoAction;
         match action {
             UndoAction::Rename { old_path, new_path } => {
-                if let Err(e) = crate::fs_ops::force_unlock_and_rename(&new_path, &old_path) {
+                if let Err(e) = std::fs::rename(&new_path, &old_path) {
                     self.delete_feedback_msg = Some(format!("Undo rename failed: {}", e));
                     self.delete_feedback_until = None;
                     self.delete_feedback_is_error = true;

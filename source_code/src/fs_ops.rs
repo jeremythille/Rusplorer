@@ -92,26 +92,9 @@ pub fn force_unlock_and_delete(paths: &[PathBuf]) -> bool {
         return true;
     }
 
-    // Stage 1: surgically close handles other processes hold on the items
-    // (IObit Unlocker style — owning apps keep running).
-    let remaining: Vec<PathBuf> = paths.iter().filter(|p| p.exists()).cloned().collect();
-    if remaining.is_empty() {
-        return true;
-    }
-    for p in &remaining {
-        force_close_handles_for_path(p);
-    }
-    let remaining: Vec<PathBuf> = remaining.into_iter().filter(|p| p.exists()).collect();
-    if remaining.is_empty() {
-        return true;
-    }
-    if delete_to_recycle_bin(&remaining) {
-        return true;
-    }
-
-    // Stage 2: gather locking process IDs for still-existing paths.
+    // Gather locking process IDs for still-existing paths.
     let mut pids = std::collections::HashSet::<u32>::new();
-    for p in remaining.iter() {
+    for p in paths.iter().filter(|p| p.exists()) {
         for (pid, _) in find_locking_processes(p) {
             pids.insert(pid);
         }
@@ -251,10 +234,7 @@ pub fn force_unlock_and_hard_delete(paths: &[PathBuf]) -> bool {
         return true;
     }
 
-    // Surgical first: close handles without killing applications.
-    for p in paths.iter().filter(|p| p.exists()) {
-        force_close_handles_for_path(p);
-    }
+    terminate_locking_processes(paths);
 
     for _ in 0..3 {
         let remaining: Vec<PathBuf> = paths.iter().filter(|p| p.exists()).cloned().collect();
@@ -272,9 +252,6 @@ pub fn force_unlock_and_hard_delete(paths: &[PathBuf]) -> bool {
         }
 
         terminate_locking_processes(&still_remaining);
-        for p in &still_remaining {
-            force_close_handles_for_path(p);
-        }
         std::thread::sleep(std::time::Duration::from_millis(150));
     }
 
@@ -379,542 +356,6 @@ pub fn find_locking_processes(path: &Path) -> Vec<(u32, String)> {
 
 #[cfg(not(windows))]
 pub fn find_locking_processes(_path: &Path) -> Vec<(u32, String)> { Vec::new() }
-
-// ── Surgical handle unlocking (IObit Unlocker style) ─────────────────────
-//
-// When a file is locked by another process (e.g. Chrome holding a freshly
-// downloaded PDF), rename/delete fails with ERROR_SHARING_VIOLATION (32).
-// Instead of killing the owning application, close just the offending handle
-// inside that process via DuplicateHandle(DUPLICATE_CLOSE_SOURCE) — the same
-// technique used by IObit Unlocker / LockHunter / Process Explorer.
-
-#[cfg(windows)]
-mod nt {
-    #![allow(non_snake_case, non_camel_case_types)]
-    use std::ffi::c_void;
-
-    pub type NTSTATUS = i32;
-    pub const SYSTEM_HANDLE_INFORMATION: u32 = 16; // SystemHandleInformation (non-EX, 24-byte entries)
-    pub const SYSTEM_EXTENDED_HANDLE_INFORMATION: u32 = 64; // SystemExtendedHandleInformation (EX, 40-byte entries)
-    pub const OBJECT_NAME_INFORMATION: u32 = 1; // ObjectNameInformation
-    pub const STATUS_INFO_LENGTH_MISMATCH: NTSTATUS = 0xC000_0004u32 as i32;
-
-    /// Entry returned by SystemExtendedHandleInformation (class 64). 40 bytes on x64.
-    #[repr(C)]
-    pub struct SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX {
-        pub object: *mut c_void,
-        pub unique_process_id: usize,
-        pub handle_value: usize,
-        pub granted_access: u32,
-        pub creator_back_trace_index: u16,
-        pub object_type_index: u16,
-        pub handle_attributes: u32,
-        pub reserved: u32,
-    }
-
-    /// Entry returned by SystemHandleInformation (class 16). 24 bytes on x64.
-    #[repr(C)]
-    pub struct SYSTEM_HANDLE_TABLE_ENTRY_INFO {
-        pub unique_process_id: u16,
-        pub creator_back_trace_index: u16,
-        pub object_type_index: u8,
-        pub handle_attributes: u8,
-        pub handle_value: u16,
-        pub object: *mut c_void,
-        pub granted_access: u32,
-        // 4 bytes implicit padding to 8-byte alignment
-    }
-
-    #[repr(C)]
-    pub struct UNICODE_STRING {
-        pub length: u16,
-        pub maximum_length: u16,
-        pub buffer: *mut u16,
-    }
-
-    #[repr(C)]
-    pub struct OBJECT_NAME_INFORMATION {
-        pub name: UNICODE_STRING,
-    }
-
-    #[link(name = "ntdll")]
-    unsafe extern "system" {
-        pub fn NtQuerySystemInformation(
-            info_class: u32,
-            info: *mut c_void,
-            info_len: u32,
-            return_len: *mut u32,
-        ) -> NTSTATUS;
-        pub fn NtQueryObject(
-            handle: *mut c_void,
-            info_class: u32,
-            info: *mut c_void,
-            info_len: u32,
-            return_len: *mut u32,
-        ) -> NTSTATUS;
-    }
-}
-
-/// Best-effort: enable SeDebugPrivilege so handles of elevated/system
-/// processes can be inspected when running as administrator.
-#[cfg(windows)]
-fn enable_debug_privilege() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        use winapi::um::handleapi::CloseHandle;
-        use winapi::um::processthreadsapi::{GetCurrentProcess, OpenProcessToken};
-        use winapi::um::securitybaseapi::AdjustTokenPrivileges;
-        use winapi::um::winbase::LookupPrivilegeValueW;
-        use winapi::um::winnt::{
-            SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
-        };
-        unsafe {
-            let mut token = std::ptr::null_mut();
-            if OpenProcessToken(
-                GetCurrentProcess(),
-                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-                &mut token,
-            ) == 0 {
-                return;
-            }
-            let name: Vec<u16> = "SeDebugPrivilege\0".encode_utf16().collect();
-            let mut luid = std::mem::zeroed();
-            if LookupPrivilegeValueW(std::ptr::null(), name.as_ptr(), &mut luid) != 0 {
-                let mut tp: TOKEN_PRIVILEGES = std::mem::zeroed();
-                tp.PrivilegeCount = 1;
-                tp.Privileges[0].Luid = luid;
-                tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-                AdjustTokenPrivileges(
-                    token,
-                    0,
-                    &mut tp,
-                    0,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                );
-            }
-            CloseHandle(token);
-        }
-    });
-}
-
-/// Map DOS drive letters ("C:") to NT device paths ("\Device\HarddiskVolume3").
-#[cfg(windows)]
-fn dos_to_nt_path_map() -> Vec<(String, String)> {
-    use winapi::um::fileapi::{GetLogicalDriveStringsW, QueryDosDeviceW};
-    let mut out = Vec::new();
-    let mut drives = [0u16; 512];
-    let n = unsafe {
-        GetLogicalDriveStringsW((drives.len() - 1) as u32, drives.as_mut_ptr())
-    } as usize;
-    let mut i = 0usize;
-    while i < n {
-        let start = i;
-        while i < n && drives[i] != 0 {
-            i += 1;
-        }
-        // Each entry is "X:\" — QueryDosDeviceW wants "X:" (no backslash).
-        if i >= start + 2 {
-            let letter = [drives[start], drives[start + 1], 0];
-            let mut dev = [0u16; 512];
-            let m = unsafe {
-                QueryDosDeviceW(letter.as_ptr(), dev.as_mut_ptr(), dev.len() as u32)
-            } as usize;
-            if m > 0 {
-                let dos = String::from_utf16_lossy(&letter[..2]);
-                let full = String::from_utf16_lossy(&dev[..m.min(dev.len())]);
-                if let Some(first) = full.split('\0').next() {
-                    if !first.is_empty() {
-                        out.push((dos, first.to_string()));
-                    }
-                }
-            }
-        }
-        i += 1;
-    }
-    out
-}
-
-/// Convert a DOS path ("C:\dir\file") to its NT form
-/// ("\Device\HarddiskVolume3\dir\file"). Returns None for UNC paths.
-#[cfg(windows)]
-fn to_nt_path(path: &Path, map: &[(String, String)]) -> Option<String> {
-    let raw = path.to_string_lossy().into_owned();
-    let s = raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string();
-    let b = s.as_bytes();
-    if b.len() < 2 || b[1] != b':' {
-        return None;
-    }
-    let letter = &s[..2];
-    for (dos, nt) in map {
-        if dos.eq_ignore_ascii_case(letter) {
-            return Some(format!("{}{}", nt, &s[2..]));
-        }
-    }
-    None
-}
-
-/// Snapshot every open handle on the system as (pid, handle_value) pairs.
-///
-/// Two info classes are supported, with layout sanity checks so an unexpected
-/// structure on a future Windows version yields an empty list instead of
-/// garbage (which could close the wrong handles):
-/// - SystemExtendedHandleInformation (64): 16-byte header + 40-byte EX entries.
-/// - SystemHandleInformation (16): 8-byte header + 24-byte non-EX entries.
-#[cfg(windows)]
-fn enumerate_system_handles() -> Vec<(u32, usize)> {
-    use nt::*;
-
-    // Query the given class into a growable, 8-byte-aligned buffer.
-    let query = |class: u32| -> Option<(Vec<u64>, u32)> {
-        let mut size: usize = 1 << 20;
-        loop {
-            let mut buf = vec![0u64; size / 8 + 2];
-            let mut ret_len: u32 = 0;
-            let status = unsafe {
-                NtQuerySystemInformation(
-                    class,
-                    buf.as_mut_ptr() as *mut std::ffi::c_void,
-                    size as u32,
-                    &mut ret_len,
-                )
-            };
-            if status == STATUS_INFO_LENGTH_MISMATCH {
-                if size >= (1 << 26) {
-                    return None;
-                }
-                size *= 2;
-                continue;
-            }
-            if status != 0 {
-                return None;
-            }
-            return Some((buf, ret_len));
-        }
-    };
-
-    // Pids are always multiples of 4 and small; reject parses that look like garbage.
-    fn pids_sane(entries: &[(u32, usize)]) -> bool {
-        if entries.is_empty() {
-            return false;
-        }
-        let sample = &entries[..entries.len().min(512)];
-        let good = sample
-            .iter()
-            .filter(|(pid, _)| *pid < (1 << 24) && *pid % 4 == 0)
-            .count();
-        good * 100 >= sample.len() * 99
-    }
-
-    unsafe {
-        // Preferred: class 64, EX entries (full-width handle values).
-        if let Some((buf, ret_len)) = query(SYSTEM_EXTENDED_HANDLE_INFORMATION) {
-            let count = *(buf.as_ptr() as *const usize);
-            let entry = std::mem::size_of::<SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX>();
-            if count > 0
-                && count < (1 << 24)
-                && (ret_len as usize).saturating_sub(16) / count == entry
-                && (ret_len as usize - 16) % count == 0
-            {
-                let base = (buf.as_ptr() as *const u8).add(16);
-                let mut out = Vec::with_capacity(count);
-                for i in 0..count {
-                    let e = &*(base.add(i * entry) as *const SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX);
-                    out.push((e.unique_process_id as u32, e.handle_value));
-                }
-                if pids_sane(&out) {
-                    return out;
-                }
-            }
-        }
-
-        // Fallback: class 16, non-EX entries (16-bit handle values).
-        if let Some((buf, ret_len)) = query(SYSTEM_HANDLE_INFORMATION) {
-            let count = *(buf.as_ptr() as *const u32) as usize;
-            let entry = std::mem::size_of::<SYSTEM_HANDLE_TABLE_ENTRY_INFO>();
-            if count > 0
-                && count < (1 << 24)
-                && (ret_len as usize).saturating_sub(8) / count == entry
-                && (ret_len as usize - 8) % count == 0
-            {
-                let base = (buf.as_ptr() as *const u8).add(8);
-                let mut out = Vec::with_capacity(count);
-                for i in 0..count {
-                    let e = &*(base.add(i * entry) as *const SYSTEM_HANDLE_TABLE_ENTRY_INFO);
-                    out.push((e.unique_process_id as u32, e.handle_value as usize));
-                }
-                if pids_sane(&out) {
-                    return out;
-                }
-            }
-        }
-    }
-
-    Vec::new()
-}
-
-/// Close every handle referencing any of `targets` (lowercase NT paths).
-/// When `only_pids` is `Some`, restrict the scan to those processes.
-#[cfg(windows)]
-fn close_handles_impl(targets: &[String], only_pids: Option<&[u32]>) -> usize {
-    use winapi::um::fileapi::GetFileType;
-    use winapi::um::handleapi::{CloseHandle, DuplicateHandle};
-    use winapi::um::processthreadsapi::{GetCurrentProcess, GetCurrentProcessId, OpenProcess};
-    use winapi::um::winbase::FILE_TYPE_DISK;
-    use winapi::um::winnt::{
-        DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, HANDLE, PROCESS_DUP_HANDLE,
-    };
-
-    let self_pid = unsafe { GetCurrentProcessId() };
-    let self_proc = unsafe { GetCurrentProcess() };
-    let debug = std::env::var("RUSPLORER_DEBUG_HANDLES").is_ok();
-    if debug {
-        eprintln!("scan: targets={:?} only_pids={:?}", targets, only_pids);
-    }
-    let mut proc_cache: std::collections::HashMap<u32, HANDLE> =
-        std::collections::HashMap::new();
-    let mut closed = 0usize;
-    // 64 KiB name buffer, 8-byte aligned, reused across queries.
-    let mut name_buf = vec![0u64; 0x2000];
-
-    for (pid, hval) in enumerate_system_handles() {
-        if pid == self_pid {
-            continue;
-        }
-        if let Some(pids) = only_pids {
-            if !pids.contains(&pid) {
-                continue;
-            }
-        }
-        let proc_h = match proc_cache.entry(pid) {
-            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                let h = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, pid) };
-                e.insert(h);
-                h
-            }
-        };
-        if proc_h.is_null() {
-            continue;
-        }
-
-        let mut dup: HANDLE = std::ptr::null_mut();
-        if unsafe {
-            DuplicateHandle(
-                proc_h,
-                hval as HANDLE,
-                self_proc,
-                &mut dup,
-                0,
-                0,
-                DUPLICATE_SAME_ACCESS,
-            )
-        } == 0 {
-            continue;
-        }
-
-        // Only query names of disk-file handles: NtQueryObject can hang on
-        // pipes/sockets, so pre-filter with the non-blocking GetFileType.
-        let is_disk = unsafe { GetFileType(dup) } == FILE_TYPE_DISK;
-        if is_disk {
-            let mut ret: u32 = 0;
-            let status = unsafe {
-                nt::NtQueryObject(
-                    dup as *mut std::ffi::c_void,
-                    nt::OBJECT_NAME_INFORMATION,
-                    name_buf.as_mut_ptr() as *mut std::ffi::c_void,
-                    (name_buf.len() * 8) as u32,
-                    &mut ret,
-                )
-            };
-            if status == 0 {
-                let oni =
-                    unsafe { &*(name_buf.as_ptr() as *const nt::OBJECT_NAME_INFORMATION) };
-                let len = (oni.name.length / 2) as usize;
-                if len > 0 && !oni.name.buffer.is_null() {
-                    let slice = unsafe { std::slice::from_raw_parts(oni.name.buffer, len) };
-                    let name = String::from_utf16_lossy(slice).to_lowercase();
-                    if debug {
-                        eprintln!("  pid {} h {:#x} [{}]", pid, hval, name);
-                    }
-                    // Exact match for the file itself; prefix match covers
-                    // directory handles and handles to children of a dir.
-                    let is_match = targets.iter().any(|t| {
-                        name == *t
-                            || (name.len() > t.len()
-                                && name.starts_with(t.as_str())
-                                && name.as_bytes()[t.len()] == b'\\')
-                    });
-                    if is_match {
-                        let r = unsafe {
-                            DuplicateHandle(
-                                proc_h,
-                                hval as HANDLE,
-                                std::ptr::null_mut(),
-                                std::ptr::null_mut(),
-                                0,
-                                0,
-                                DUPLICATE_CLOSE_SOURCE,
-                            )
-                        };
-                        if r != 0 {
-                            closed += 1;
-                        }
-                    }
-                }
-            }
-        }
-        unsafe { CloseHandle(dup) };
-    }
-
-    for (_, h) in proc_cache {
-        if !h.is_null() {
-            unsafe { CloseHandle(h) };
-        }
-    }
-    closed
-}
-
-/// Expand any 8.3 short-name components (e.g. `ADMINI~1`) to long names.
-/// `std::fs::canonicalize` does NOT do this, but NT object names always use
-/// long names, so this is required before comparing handle names.
-#[cfg(windows)]
-fn expand_long_path(path: &Path) -> PathBuf {
-    use std::os::windows::ffi::OsStrExt;
-    use winapi::um::fileapi::GetLongPathNameW;
-    let wide: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    unsafe {
-        let n = GetLongPathNameW(wide.as_ptr(), std::ptr::null_mut(), 0);
-        if n == 0 {
-            return path.to_path_buf();
-        }
-        let mut buf = vec![0u16; n as usize];
-        let m = GetLongPathNameW(wide.as_ptr(), buf.as_mut_ptr(), n);
-        if m == 0 || m >= n {
-            return path.to_path_buf();
-        }
-        buf.truncate(m as usize);
-        PathBuf::from(String::from_utf16_lossy(&buf))
-    }
-}
-
-/// Force-close every open handle (in any process) that references `path`.
-/// Returns how many handles were closed. The owning applications keep
-/// running — only the offending handle is closed (IObit Unlocker style).
-#[cfg(windows)]
-pub fn force_close_handles_for_path(path: &Path) -> usize {
-    enable_debug_privilege();
-
-    // NT object names preserve the exact path used at open time (including
-    // 8.3 short names and junctions), so build every variant of the path and
-    // match against all of them.
-    let mut variants: Vec<PathBuf> = vec![path.to_path_buf()];
-    let long = expand_long_path(path);
-    if !variants.contains(&long) {
-        variants.push(long);
-    }
-    if let Ok(canon) = std::fs::canonicalize(path) {
-        let canon_str = canon.to_string_lossy().into_owned();
-        let stripped = canon_str
-            .strip_prefix(r"\\?\")
-            .map(str::to_string)
-            .unwrap_or(canon_str);
-        let cp = PathBuf::from(&stripped);
-        if !variants.contains(&cp) {
-            variants.push(cp);
-        }
-        let cl = expand_long_path(Path::new(&stripped));
-        if !variants.contains(&cl) {
-            variants.push(cl);
-        }
-    }
-
-    let map = dos_to_nt_path_map();
-    let mut targets: Vec<String> = Vec::new();
-    for v in &variants {
-        if let Some(nt) = to_nt_path(v, &map) {
-            let nt = nt.to_lowercase();
-            if !targets.contains(&nt) {
-                targets.push(nt);
-            }
-        }
-    }
-    if targets.is_empty() {
-        return 0;
-    }
-
-    // Fast path: Restart Manager tells us exactly who holds the file.
-    let rm_pids: Vec<u32> = find_locking_processes(path)
-        .into_iter()
-        .map(|(pid, _)| pid)
-        .collect();
-    if !rm_pids.is_empty() {
-        let closed = close_handles_impl(&targets, Some(&rm_pids));
-        if closed > 0 {
-            return closed;
-        }
-    }
-    // Fallback: full system handle scan (RM can miss directory/child handles).
-    close_handles_impl(&targets, None)
-}
-
-#[cfg(not(windows))]
-pub fn force_close_handles_for_path(_path: &Path) -> usize {
-    0
-}
-
-/// True for OS errors caused by another process holding the file open.
-fn is_locking_error(err: &std::io::Error) -> bool {
-    // 5 = ACCESS_DENIED (dir renames surface this when children are open),
-    // 32 = SHARING_VIOLATION, 33 = LOCK_VIOLATION
-    matches!(err.raw_os_error(), Some(5) | Some(32) | Some(33))
-}
-
-/// Rename with aggressive unlock retries (IObit Unlocker style):
-/// 1) plain rename,
-/// 2) close handles other processes hold on the file, retry,
-/// 3) last resort: terminate locking processes, retry.
-#[cfg(windows)]
-pub fn force_unlock_and_rename(old_path: &Path, new_path: &Path) -> std::io::Result<()> {
-    match std::fs::rename(old_path, new_path) {
-        Ok(()) => return Ok(()),
-        Err(e) if !is_locking_error(&e) => return Err(e),
-        Err(_) => {}
-    }
-
-    // Stage 1: surgically close handles held by other processes.
-    for attempt in 0..3u32 {
-        force_close_handles_for_path(old_path);
-        match std::fs::rename(old_path, new_path) {
-            Ok(()) => return Ok(()),
-            Err(e) if !is_locking_error(&e) => return Err(e),
-            Err(_) => {}
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100 + 100 * attempt as u64));
-    }
-
-    // Stage 2: last resort — terminate locking processes, then retry.
-    terminate_locking_processes(&[old_path.to_path_buf()]);
-    let mut last_err = std::io::Error::from_raw_os_error(32);
-    for attempt in 0..3u32 {
-        match std::fs::rename(old_path, new_path) {
-            Ok(()) => return Ok(()),
-            Err(e) if !is_locking_error(&e) => return Err(e),
-            Err(e) => last_err = e,
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100 + 100 * attempt as u64));
-    }
-    Err(last_err)
-}
-
-#[cfg(not(windows))]
-pub fn force_unlock_and_rename(old_path: &Path, new_path: &Path) -> std::io::Result<()> {
-    std::fs::rename(old_path, new_path)
-}
 
 /// Recursively calculate directory size, sending progressive updates via `tx`.
 /// Returns `false` if cancelled.
@@ -1065,11 +506,9 @@ pub struct CopyJobState {
     pub conflict_query: Mutex<Option<ConflictInfo>>,
     /// UI writes a choice here after the user clicks a dialog button.
     pub conflict_answer: Mutex<Option<ConflictChoice>>,
-    /// Files skipped because source and destination were identical.
-    pub skipped_identical: Mutex<Vec<String>>,
-    /// Count of identical files skipped (drives the brief UI summary line).
-    pub skipped_identical_count: AtomicU64,
-    /// Wall-clock millis until which the skipped-identical summary stays visible.
+    /// Number of files skipped because source and destination were identical.
+    pub skipped_identical_count: AtomicUsize,
+    /// Unix timestamp (ms) until which the skip summary should remain visible.
     pub skipped_identical_visible_until_ms: AtomicU64,
     /// Set by worker after user chose "Overwrite all".
     pub overwrite_all: AtomicBool,
@@ -1105,8 +544,7 @@ impl CopyJobState {
             clear_clipboard: AtomicBool::new(false),
             conflict_query: Mutex::new(None),
             conflict_answer: Mutex::new(None),
-            skipped_identical: Mutex::new(Vec::new()),
-            skipped_identical_count: AtomicU64::new(0),
+            skipped_identical_count: AtomicUsize::new(0),
             skipped_identical_visible_until_ms: AtomicU64::new(0),
             overwrite_all: AtomicBool::new(false),
             skip_all: AtomicBool::new(false),
@@ -1394,16 +832,14 @@ fn check_file_conflict(src: &Path, dst: &Path, state: &CopyJobState) -> FileActi
     };
     if sizes_match && mtimes_match {
         // Files are identical — skip silently.
-        let fname = src.file_name().unwrap_or_default().to_string_lossy().to_string();
-        state.skipped_identical.lock().unwrap().push(fname);
-        state.skipped_identical_count.fetch_add(1, Ordering::Relaxed);
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+        state.skipped_identical_count.fetch_add(1, Ordering::Relaxed);
         state
             .skipped_identical_visible_until_ms
-            .store(now_ms + 5000, Ordering::Relaxed);
+            .store(now_ms.saturating_add(5_000), Ordering::Relaxed);
         return FileAction::Skip;
     }
 
@@ -1505,7 +941,7 @@ fn copy_dir_chunked(
                 FileAction::Skip => {
                     state
                         .current_file_bytes
-                        .store(state.current_file_total_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+                        .store(file_total, Ordering::Relaxed);
                     state.files_done.fetch_add(1, Ordering::Relaxed);
                 }
                 FileAction::Copy => {
@@ -1695,11 +1131,6 @@ fn run_copy_job(sources: Vec<PathBuf>, dest: PathBuf, state: &CopyJobState) {
                     }
                     Err(e) if is_transient_io_error(&e) && rename_attempt < MAX_RENAME_RETRIES => {
                         rename_attempt += 1;
-                        // Locked by another process: close its handles before retrying.
-                        #[cfg(windows)]
-                        if is_locking_error(&e) {
-                            force_close_handles_for_path(source);
-                        }
                         #[cfg(windows)]
                         crate::ole::log_dnd(&format!(
                             "Transient rename error {} for {} -> {} (attempt {}/{})",
@@ -1813,80 +1244,4 @@ fn run_copy_job(sources: Vec<PathBuf>, dest: PathBuf, state: &CopyJobState) {
     }
 
     state.done.store(true, Ordering::SeqCst);
-}
-
-#[cfg(all(test, windows))]
-mod tests {
-    use super::*;
-    use std::io::Write;
-
-    /// Helper process entry point: holds `RUSPLORER_LOCK_HELPER` open with no
-    /// sharing and sleeps, simulating e.g. Chrome holding a downloaded file.
-    #[test]
-    fn lock_helper() {
-        if let Ok(path) = std::env::var("RUSPLORER_LOCK_HELPER") {
-            use std::os::windows::fs::OpenOptionsExt;
-            let _f = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .share_mode(0)
-                .open(path)
-                .expect("helper must open the file");
-            std::thread::sleep(std::time::Duration::from_secs(120));
-            std::process::exit(0);
-        }
-    }
-
-
-    #[test]
-    fn force_unlock_rename_on_locked_file() {
-        let dir = std::env::temp_dir().join(format!("rusplorer_unlock_test_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let old_path = dir.join("locked.pdf");
-        let new_path = dir.join("renamed.pdf");
-        std::fs::File::create(&old_path).unwrap().write_all(b"pdf").unwrap();
-
-        // Spawn a child process that locks the file with share_mode(0).
-        let exe = std::env::current_exe().unwrap();
-        let mut child = std::process::Command::new(exe)
-            .args(["--exact", "fs_ops::tests::lock_helper", "--nocapture"])
-            .env("RUSPLORER_LOCK_HELPER", &old_path)
-            .spawn()
-            .unwrap();
-
-        // Wait until the file is actually locked (exclusive open fails).
-        use std::os::windows::fs::OpenOptionsExt;
-        let mut locked = false;
-        for _ in 0..100 {
-            if std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .share_mode(0)
-                .open(&old_path)
-                .is_err()
-            {
-                locked = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        assert!(locked, "helper process did not lock the file in time");
-
-        // Plain rename must fail with a sharing violation...
-        let plain = std::fs::rename(&old_path, &new_path);
-        assert!(plain.is_err(), "rename unexpectedly succeeded on locked file");
-
-        // ...but the force-unlock rename must close the handle and succeed.
-        let result = force_unlock_and_rename(&old_path, &new_path);
-
-        let child_alive = child.try_wait().map(|s| s.is_none()).unwrap_or(false);
-        let _ = child.kill();
-        assert!(result.is_ok(), "force unlock rename failed: {:?}", result.err());
-        assert!(child_alive, "locking process was killed — expected surgical unlock");
-        assert!(new_path.exists());
-        assert!(!old_path.exists());
-
-        let _ = std::fs::remove_file(&new_path);
-        let _ = std::fs::remove_dir(&dir);
-    }
 }

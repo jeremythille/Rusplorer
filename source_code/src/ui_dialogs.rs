@@ -1,14 +1,142 @@
 ﻿use super::RusplorerApp;
-use eframe::egui;
+#[cfg(windows)]
+use crate::shortcuts::create_lnk_shortcut;
 use arboard::Clipboard;
-use std::sync::mpsc::channel;
-use std::path::PathBuf;
+use eframe::egui;
+use std::collections::HashSet;
 #[cfg(windows)]
 use std::ffi::OsStr;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
-#[cfg(windows)]
-use crate::shortcuts::create_lnk_shortcut;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::channel;
+
+fn extract_archive_with_7zip(archive_path: &Path, destination: &Path) -> Result<(), String> {
+    let archive = archive_path.to_string_lossy();
+    let destination = destination.to_string_lossy();
+    let output_arg = format!("-o{}", destination);
+    let args = ["x", archive.as_ref(), output_arg.as_str()];
+
+    let mut child = std::process::Command::new("C:\\Program Files\\7-Zip\\7z.exe")
+        .args(args)
+        .spawn()
+        .or_else(|_| std::process::Command::new("7z.exe").args(args).spawn())
+        .map_err(|error| format!("Could not start 7-Zip: {}", error))?;
+    let status = child
+        .wait()
+        .map_err(|error| format!("Could not wait for 7-Zip: {}", error))?;
+    if !status.success() {
+        return Err(format!("7-Zip exited with status {}", status));
+    }
+    Ok(())
+}
+
+fn extract_archives(
+    archive_paths: &[PathBuf],
+    destination_root: &Path,
+    separate_folders: bool,
+) -> Result<(), String> {
+    let mut jobs = Vec::with_capacity(archive_paths.len());
+    let mut failures = Vec::new();
+
+    for archive_path in archive_paths {
+        let destination = if separate_folders {
+            let stem = archive_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy();
+            let destination = destination_root.join(stem.as_ref());
+            if let Err(error) = std::fs::create_dir_all(&destination) {
+                failures.push(format!("{}: {}", archive_path.display(), error));
+                continue;
+            }
+            destination
+        } else {
+            destination_root.to_path_buf()
+        };
+        jobs.push((archive_path.clone(), destination));
+    }
+
+    let destinations_are_unique = {
+        let mut destinations = HashSet::with_capacity(jobs.len());
+        jobs.iter().all(|(_, destination)| {
+            destinations.insert(destination.to_string_lossy().to_lowercase())
+        })
+    };
+
+    // Avoid parallel writes when archives share a destination directory.
+    let parallelism = if separate_folders && destinations_are_unique {
+        std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1)
+            .min(jobs.len())
+    } else {
+        1
+    };
+
+    if parallelism > 1 {
+        let mut results = Vec::with_capacity(jobs.len());
+        std::thread::scope(|scope| {
+            for batch in jobs.chunks(parallelism) {
+                let handles: Vec<_> = batch
+                    .iter()
+                    .map(|(archive_path, destination)| {
+                        scope.spawn(move || {
+                            extract_archive_with_7zip(archive_path, destination)
+                        })
+                    })
+                    .collect();
+                for ((archive_path, _), handle) in batch.iter().zip(handles) {
+                    results.push((archive_path.clone(), handle.join()));
+                }
+            }
+        });
+
+        for (archive_path, result) in results {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    failures.push(format!("{}: {}", archive_path.display(), error));
+                }
+                Err(_) => failures.push(format!(
+                    "{}: extraction worker stopped unexpectedly",
+                    archive_path.display()
+                )),
+            }
+        }
+    } else {
+        for (archive_path, destination) in &jobs {
+            if let Err(error) = extract_archive_with_7zip(archive_path, destination) {
+                failures.push(format!("{}: {}", archive_path.display(), error));
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        let failure_count = failures.len();
+        let failure_summary = failures
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ");
+        let remaining = failure_count.saturating_sub(3);
+        let suffix = if remaining == 0 {
+            String::new()
+        } else {
+            format!("; and {} more", remaining)
+        };
+        Err(format!(
+            "{} of {} archive(s) failed: {}{}",
+            failure_count,
+            archive_paths.len(),
+            failure_summary,
+            suffix
+        ))
+    }
+}
 
 impl RusplorerApp {
     fn strip_one_duplicate_extension(name: &str) -> String {
@@ -190,6 +318,23 @@ impl RusplorerApp {
                     .to_string_lossy()
                     .to_string();
                 let extract_label = format!("Extract to ./{}", archive_stem);
+                let mut selected_archives: Vec<PathBuf> = self
+                    .context_menu_selection
+                    .iter()
+                    .filter(|path| Self::is_archive(path) && path.is_file())
+                    .cloned()
+                    .collect();
+                if selected_archives.is_empty()
+                    && !entry.is_dir
+                    && Self::is_archive(&full_path)
+                    && full_path.is_file()
+                {
+                    selected_archives.push(full_path.clone());
+                }
+                selected_archives.sort();
+                let has_multiple_archives = selected_archives.len() > 1;
+                let extract_each_label = "Extract each archive to a separate folder";
+                let extract_all_label = "Extract all archives here";
                 let mut labels: Vec<&str> = vec![
                     "Add to archive",
                     "📋 Copy full path",
@@ -219,7 +364,10 @@ impl RusplorerApp {
                     labels.push("Open with\u{2026}");
                     labels.push("Unlock\u{2026}");
                 }
-                if Self::is_archive(&full_path) {
+                if has_multiple_archives {
+                    labels.push(extract_each_label);
+                    labels.push(extract_all_label);
+                } else if !entry.is_dir && Self::is_archive(&full_path) {
                     labels.push(extract_label.as_str());
                 }
                 let max_text_w = labels.iter()
@@ -368,11 +516,39 @@ impl RusplorerApp {
                                 self.context_menu_tree_highlight = None;
                             }
 
-                            // Extract to ./<archive name>
-                            if Self::is_archive(&full_path)
+                            if has_multiple_archives {
+                                if ui
+                                    .add_sized(
+                                        [menu_w, 0.0],
+                                        egui::Button::new(extract_each_label),
+                                    )
+                                    .clicked()
+                                {
+                                    self.extract_archive_paths = selected_archives.clone();
+                                    self.extract_to_separate_folders = true;
+                                    self.show_extract_dialog = true;
+                                    self.show_context_menu = false;
+                                    self.context_menu_tree_highlight = None;
+                                }
+                                if ui
+                                    .add_sized(
+                                        [menu_w, 0.0],
+                                        egui::Button::new(extract_all_label),
+                                    )
+                                    .clicked()
+                                {
+                                    self.extract_archive_paths = selected_archives.clone();
+                                    self.extract_to_separate_folders = false;
+                                    self.show_extract_dialog = true;
+                                    self.show_context_menu = false;
+                                    self.context_menu_tree_highlight = None;
+                                }
+                            } else if !entry.is_dir
+                                && Self::is_archive(&full_path)
                                 && ui.add_sized([menu_w, 0.0], egui::Button::new(extract_label.as_str())).clicked()
                             {
-                                self.extract_archive_path = full_path.clone();
+                                self.extract_archive_paths = vec![full_path.clone()];
+                                self.extract_to_separate_folders = true;
                                 self.show_extract_dialog = true;
                                 self.show_context_menu = false;
                                 self.context_menu_tree_highlight = None;
@@ -723,33 +899,17 @@ impl RusplorerApp {
 
         // Start extraction if dialog was shown (one-time trigger)
         if self.show_extract_dialog && self.extract_done_receiver.is_none() {
-            let archive_path = self.extract_archive_path.clone();
-            let stem = archive_path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let dest = self.current_path.join(&stem);
-            let _ = std::fs::create_dir_all(&dest);
+            let archive_paths = self.extract_archive_paths.clone();
+            let separate_folders = self.extract_to_separate_folders;
+            let destination_root = self.current_path.clone();
             let (done_tx, done_rx) = channel();
 
             std::thread::spawn(move || {
-                let dest_str = dest.to_string_lossy().to_string();
-                let archive_str = archive_path.to_string_lossy().to_string();
-
-                let result = std::process::Command::new("C:\\Program Files\\7-Zip\\7z.exe")
-                    .args(&["x", &archive_str, &format!("-o{}", dest_str)])
-                    .spawn()
-                    .or_else(|_| {
-                        std::process::Command::new("7z.exe")
-                            .args(&["x", &archive_str, &format!("-o{}", dest_str)])
-                            .spawn()
-                    });
-
-                if let Ok(mut child) = result {
-                    let _ = child.wait();
-                }
-                let _ = done_tx.send(());
+                let _ = done_tx.send(extract_archives(
+                    &archive_paths,
+                    &destination_root,
+                    separate_folders,
+                ));
             });
 
             self.extract_done_receiver = Some(done_rx);
@@ -963,7 +1123,7 @@ impl RusplorerApp {
                                 .map(|p| p.to_path_buf())
                                 .unwrap_or_else(|| self.current_path.clone());
                             let new_path = parent.join(&final_name);
-                            match crate::fs_ops::force_unlock_and_rename(&old_path, &new_path) {
+                            match std::fs::rename(&old_path, &new_path) {
                                 Ok(()) => {
                                     // Record undo action before cache/UI updates.
                                     self.undo_stack.push(crate::types::UndoAction::Rename {
@@ -986,21 +1146,9 @@ impl RusplorerApp {
                                 Err(e) => {
                                     // Surface the OS error message so the user knows why
                                     // the rename didn't happen (e.g. file open in Excel).
-                                    let locked_by = crate::fs_ops::find_locking_processes(&old_path);
-                                    let msg = if locked_by.is_empty() {
+                                    self.delete_feedback_msg = Some(
                                         format!("Rename failed: {}", e)
-                                    } else {
-                                        let names: Vec<String> = locked_by.iter()
-                                            .take(3)
-                                            .map(|(_, n)| n.clone())
-                                            .collect();
-                                        format!(
-                                            "Rename failed: {} (still in use by {})",
-                                            e,
-                                            names.join(", ")
-                                        )
-                                    };
-                                    self.delete_feedback_msg = Some(msg);
+                                    );
                                     self.delete_feedback_until = None;
                                     self.delete_feedback_is_error = true;
                                     // Keep dialog open so the user can try a different name
@@ -1086,12 +1234,15 @@ impl RusplorerApp {
 
         // Extraction status strip — shown at bottom while running, disappears when done
         if self.show_extract_dialog {
-            let archive_name = self
-                .extract_archive_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
+            let archive_label = if self.extract_archive_paths.len() == 1 {
+                self.extract_archive_paths[0]
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                format!("{} archives", self.extract_archive_paths.len())
+            };
 
             egui::Window::new("##extract_strip")
                 .title_bar(false)
@@ -1106,7 +1257,7 @@ impl RusplorerApp {
                     ui.horizontal(|ui| {
                         ui.spinner();
                         ui.label(egui::RichText::new(
-                            format!("Extracting {}…", archive_name))
+                            format!("Extracting {}…", archive_label))
                             .color(egui::Color32::WHITE).size(12.0));
                     });
                 });
@@ -1130,6 +1281,12 @@ impl RusplorerApp {
                 };
 
                 let toast_w = ctx.screen_rect().width().min(520.0).max(260.0);
+                let mut message_chars = msg.chars();
+                let mut display_msg = message_chars.by_ref().take(180).collect::<String>();
+                if message_chars.next().is_some() {
+                    display_msg.push('…');
+                }
+                let text_width = (toast_w - 110.0).max(100.0);
 
                 egui::Area::new(egui::Id::new("delete_feedback_strip_area"))
                     .order(egui::Order::Foreground)
@@ -1144,19 +1301,16 @@ impl RusplorerApp {
                             .inner_margin(egui::Margin::symmetric(6.0, 4.0))
                             .rounding(egui::Rounding::same(6.0))
                             .show(ui, |ui| {
-                                // Keep everything in one compact row. A nested
-                                // `with_layout` used here previously consumed the
-                                // Area's full available height, painting a huge
-                                // green rectangle over the window.
-                                ui.horizontal_wrapped(|ui| {
+                                ui.horizontal(|ui| {
                                     if in_progress {
                                         ui.spinner();
                                     }
-                                    ui.add(
+                                    ui.add_sized(
+                                        [text_width, 0.0],
                                         egui::Label::new(
-                                            egui::RichText::new(msg)
+                                            egui::RichText::new(display_msg)
                                                 .color(egui::Color32::WHITE)
-                                                .size(12.0)
+                                                .size(12.0),
                                         )
                                         .wrap(true)
                                         .sense(egui::Sense::hover()),
@@ -1265,7 +1419,6 @@ impl RusplorerApp {
 
             let mut close_dialog = false;
             let mut kill_and_unlock = false;
-            let mut close_handles = false;
 
             egui::Window::new("\u{1F513} Unlock file")
                 .collapsible(false)
@@ -1291,9 +1444,6 @@ impl RusplorerApp {
                         }
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
-                            if ui.button("\u{1F513} Close handles").clicked() {
-                                close_handles = true;
-                            }
                             if ui.button(egui::RichText::new("Kill all & Unlock")
                                 .color(egui::Color32::from_rgb(220, 50, 50))).clicked()
                             {
@@ -1308,14 +1458,6 @@ impl RusplorerApp {
                         });
                     }
                 });
-
-            if close_handles {
-                if let Some(path) = self.unlock_dialog_path.clone() {
-                    crate::fs_ops::force_close_handles_for_path(&path);
-                    self.unlock_locking_processes =
-                        crate::fs_ops::find_locking_processes(&path);
-                }
-            }
 
             if kill_and_unlock {
                 #[cfg(windows)]
