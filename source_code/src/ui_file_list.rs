@@ -61,6 +61,7 @@ impl RusplorerApp {
 
         // Clear rect map for this frame
         self.entry_rects.clear();
+        self.deep_filter_entry_rects.clear();
         self.any_button_hovered = false;
 
         let row_height = 18.0;

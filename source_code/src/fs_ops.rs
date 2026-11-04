@@ -367,6 +367,14 @@ pub fn calculate_dir_size_progressive(
     tx: &std::sync::mpsc::Sender<(PathBuf, u64)>,
     accumulated: &mut u64,
 ) -> bool {
+    if path == root_path
+        && std::fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+    {
+        return true;
+    }
+
     let entries = match std::fs::read_dir(path) {
         Ok(entries) => entries,
         Err(_) => {
@@ -386,8 +394,12 @@ pub fn calculate_dir_size_progressive(
             }
         }
 
-        let entry_path = entry.path();
-        if entry_path.is_dir() {
+        let file_type = match entry.file_type() {
+            Ok(file_type) if !file_type.is_symlink() => file_type,
+            _ => continue,
+        };
+        if file_type.is_dir() {
+            let entry_path = entry.path();
             calculate_dir_size_progressive(
                 &entry_path,
                 root_path,
@@ -414,7 +426,11 @@ pub fn read_dir_children(path: &PathBuf) -> Vec<PathBuf> {
         .map(|entries| {
             let mut children: Vec<PathBuf> = entries
                 .filter_map(|e| e.ok())
-                .filter(|e| e.path().is_dir())
+                .filter(|e| {
+                    e.file_type()
+                        .map(|file_type| file_type.is_dir() && !file_type.is_symlink())
+                        .unwrap_or(false)
+                })
                 .map(|e| e.path())
                 .collect();
             children.sort_by(|a, b| {

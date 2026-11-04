@@ -56,6 +56,7 @@ impl RusplorerApp {
                 }
             }
             self.entry_rects.clear();
+            self.deep_filter_entry_rects.clear();
             self.any_button_hovered = false;
 
             let thumb_entries: Vec<&FileEntry> = filtered_entries.iter()

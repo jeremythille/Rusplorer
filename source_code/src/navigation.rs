@@ -10,6 +10,13 @@ use crate::types::{DriveKind, FileEntry, SortColumn, TabState};
 use crate::fs_ops::{calculate_dir_size_progressive, read_dir_children};
 use super::RusplorerApp;
 
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum CachedSortValue {
+    Name(String),
+    Size(u64),
+    Date(Option<std::time::SystemTime>),
+}
+
 impl RusplorerApp {
     /// Collapse the entire tree, then expand only the ancestors of `path`.
     /// This ensures unrelated drives/folders are hidden after every navigation.
@@ -102,6 +109,7 @@ impl RusplorerApp {
         self.cancel_token = Arc::new(AtomicBool::new(false));
 
         self.contents.clear();
+        self.normalized_name_cache.clear();
         self.file_sizes.clear();
         self.max_file_size = 0;
         self.dirs_done.clear();
@@ -123,7 +131,7 @@ impl RusplorerApp {
 
         // List directory contents (fast - no size lookup)
         if let Ok(entries) = std::fs::read_dir(&self.current_path) {
-            let mut items: Vec<_> = entries
+            let items: Vec<_> = entries
                 .filter_map(|e| e.ok())
                 .map(|e| {
                     let path = e.path();
@@ -151,22 +159,31 @@ impl RusplorerApp {
                 })
                 .collect();
 
-            items.sort_by(|a, b| {
-                match (a.is_dir, b.is_dir) {
-                    (true, false) => std::cmp::Ordering::Less,
-                    (false, true) => std::cmp::Ordering::Greater,
-                    _ => {
-                        let ord = match self.sort_column {
-                            SortColumn::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                            SortColumn::Date => a.modified.cmp(&b.modified),
-                            SortColumn::Size => std::cmp::Ordering::Equal,
-                        };
-                        if self.sort_ascending { ord } else { ord.reverse() }
-                    }
+            let sort_column = &self.sort_column;
+            let sort_ascending = self.sort_ascending;
+            let mut keyed_items: Vec<_> = items
+                .into_iter()
+                .map(|entry| {
+                    let key = match sort_column {
+                        SortColumn::Name => CachedSortValue::Name(entry.name.to_lowercase()),
+                        SortColumn::Date => CachedSortValue::Date(entry.modified.clone()),
+                        SortColumn::Size => CachedSortValue::Size(0),
+                    };
+                    (entry, key)
+                })
+                .collect();
+
+            keyed_items.sort_by(|(a, a_key), (b, b_key)| {
+                let directory_order = b.is_dir.cmp(&a.is_dir);
+                if directory_order != std::cmp::Ordering::Equal {
+                    return directory_order;
                 }
+                let order = a_key.cmp(b_key);
+                if sort_ascending { order } else { order.reverse() }
             });
 
-            self.contents.extend(items);
+            self.contents
+                .extend(keyed_items.into_iter().map(|(entry, _)| entry));
         }
 
         // Collect paths for background processing
@@ -246,26 +263,43 @@ impl RusplorerApp {
         let file_sizes    = &self.file_sizes;
         let current_path  = &self.current_path;
 
-        self.contents.sort_by(|a, b| {
-            if a.name.starts_with("[..]") { return std::cmp::Ordering::Less;  }
-            if b.name.starts_with("[..]") { return std::cmp::Ordering::Greater; }
-            match (a.is_dir, b.is_dir) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => {
-                    let ord = match sort_column {
-                        SortColumn::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                        SortColumn::Size => {
-                            let sa = file_sizes.get(&current_path.join(&a.name)).copied().unwrap_or(0);
-                            let sb = file_sizes.get(&current_path.join(&b.name)).copied().unwrap_or(0);
-                            sa.cmp(&sb)
-                        }
-                        SortColumn::Date => a.modified.cmp(&b.modified),
-                    };
-                    if sort_ascending { ord } else { ord.reverse() }
-                }
+        let mut keyed_contents: Vec<_> = self
+            .contents
+            .drain(..)
+            .map(|entry| {
+                let parent_rank = if entry.name.starts_with("[..]") { 0 } else { 1 };
+                let directory_rank = if entry.is_dir { 0 } else { 1 };
+                let key = if parent_rank == 0 {
+                    None
+                } else {
+                    Some(match sort_column {
+                        SortColumn::Name => CachedSortValue::Name(entry.name.to_lowercase()),
+                        SortColumn::Size => CachedSortValue::Size(
+                            file_sizes
+                                .get(&current_path.join(&entry.name))
+                                .copied()
+                                .unwrap_or(0),
+                        ),
+                        SortColumn::Date => CachedSortValue::Date(entry.modified.clone()),
+                    })
+                };
+                (entry, parent_rank, directory_rank, key)
+            })
+            .collect();
+
+        keyed_contents.sort_by(|a, b| {
+            let group_order = (a.1, a.2).cmp(&(b.1, b.2));
+            if group_order != std::cmp::Ordering::Equal {
+                return group_order;
             }
+            let order = a.3.cmp(&b.3);
+            if sort_ascending { order } else { order.reverse() }
         });
+
+        self.contents = keyed_contents
+            .into_iter()
+            .map(|(entry, _, _, _)| entry)
+            .collect();
     }
 
     /// Returns `true` when `path` lives on a drive that may need to spin up
@@ -312,6 +346,7 @@ impl RusplorerApp {
             // blocks the main thread while the disk spins up.  Defer it to the
             // spin-done handler in the update loop.
             self.contents.clear();
+            self.normalized_name_cache.clear();
             self.cancel_token.store(true, Ordering::SeqCst);
             self.loading_path = Some(path.clone());
             self.save_active_tab();

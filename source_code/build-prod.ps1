@@ -47,29 +47,7 @@ foreach ($build in $builds) {
 if (-not $buildFailed) {
     Write-Host "`nBuild successful!"
 
-    # Clean up build artifacts (keep only the exe)
-    Write-Host "Cleaning up build artifacts..."
-    $releaseDir = "target/release"
-    @("deps", "build", "incremental", ".fingerprint", "examples") | ForEach-Object {
-        $path = Join-Path $releaseDir $_
-        if (Test-Path $path) {
-            Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue
-        }
-    }
-    # Remove .d metadata files and other artifacts (keeping only .exe and config)
-    Get-ChildItem $releaseDir -File -Exclude "*.exe", "rusplorer.config.json" | Remove-Item -Force -ErrorAction SilentlyContinue
-    # Explicitly remove .pdb and .d files
-    Remove-Item (Join-Path $releaseDir "*.pdb") -Force -ErrorAction SilentlyContinue
-    Remove-Item (Join-Path $releaseDir "*.d") -Force -ErrorAction SilentlyContinue
-    # Remove .cargo-lock if present
-    Remove-Item ".cargo-lock" -Force -ErrorAction SilentlyContinue
-    Remove-Item ".\target\release\.cargo-lock" -Force -ErrorAction SilentlyContinue
-
-    # Remove the entire target folder since we have the exe
-    Write-Host "Cleaning up target folder..."
-    Remove-Item "target" -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item "$rootPath/target" -Recurse -Force -ErrorAction SilentlyContinue
-
+    # Keep Cargo's target cache so subsequent builds can reuse compiled artifacts.
     Write-Host "`nLaunching normal Rusplorer...`n"
     Start-Process "$rootPath/rusplorer.exe"
     Write-Host "Rusplorer launched in background. Close this window when done."

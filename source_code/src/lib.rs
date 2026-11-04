@@ -238,6 +238,9 @@ struct RusplorerApp {
     max_file_size: u64,
     is_focused: bool,
     filter: String,
+    filter_lower_cache_source: String,
+    filter_lower_cache: String,
+    normalized_name_cache: HashMap<String, String>,
     #[allow(dead_code)]
     file_watcher: Option<notify::RecommendedWatcher>,
     watch_receiver: Option<Receiver<jobs::WatchEvent>>,
@@ -316,8 +319,10 @@ struct RusplorerApp {
     selection_drag_start: Option<egui::Pos2>,
     selection_drag_current: Option<egui::Pos2>,
     entry_rects: HashMap<String, egui::Rect>,
+    deep_filter_entry_rects: HashMap<PathBuf, egui::Rect>,
     is_dragging_selection: bool,
     selection_before_drag: HashSet<String>,
+    selection_before_deep_filter_drag: HashSet<PathBuf>,
     any_button_hovered: bool,
     filter_edit_rect: egui::Rect,    // rect of the filter TextEdit × excluded from rubber-band
     // Internal drag-and-drop
@@ -515,6 +520,9 @@ impl RusplorerApp {
             max_file_size: 0,
             is_focused: true,
             filter: String::new(),
+            filter_lower_cache_source: String::new(),
+            filter_lower_cache: String::new(),
+            normalized_name_cache: HashMap::new(),
             file_watcher: None,
             watch_receiver: None,
             stop_watcher: None,
@@ -562,8 +570,10 @@ impl RusplorerApp {
             selection_drag_start: None,
             selection_drag_current: None,
             entry_rects: HashMap::new(),
+            deep_filter_entry_rects: HashMap::new(),
             is_dragging_selection: false,
             selection_before_drag: HashSet::new(),
+            selection_before_deep_filter_drag: HashSet::new(),
             any_button_hovered: false,
             filter_edit_rect: egui::Rect::NOTHING,
             dnd_active: false,
@@ -933,6 +943,7 @@ impl RusplorerApp {
     fn render_filter_results(&mut self, ui: &mut egui::Ui, this_folder_entries: &[FileEntry]) -> bool {
         let mut entry_right_clicked = false;
         self.entry_rects.clear();
+        self.deep_filter_entry_rects.clear();
         self.any_button_hovered = false;
         egui::ScrollArea::vertical()
             .id_source("filter_results_scroll")
@@ -1136,6 +1147,18 @@ impl RusplorerApp {
 
                     let is_selected = self.deep_filter_selected.contains(&item.full_path);
                     let resp = ui.selectable_label(is_selected, label);
+                    let press_origin_on_item = ui.input(|i| {
+                        i.pointer
+                            .press_origin()
+                            .map_or(false, |pos| resp.rect.contains(pos))
+                    });
+                    if resp.hovered() || press_origin_on_item {
+                        self.any_button_hovered = true;
+                    }
+                    if ui.is_rect_visible(resp.rect) {
+                        self.deep_filter_entry_rects
+                            .insert(item.full_path.clone(), resp.rect);
+                    }
                     if resp.clicked_by(egui::PointerButton::Primary) {
                         let is_ctrl = ui.input(|i| i.modifiers.ctrl);
                         self.selected_entries.clear();
@@ -1147,6 +1170,42 @@ impl RusplorerApp {
                             self.deep_filter_selected.clear();
                             self.deep_filter_selected.insert(item.full_path.clone());
                         }
+                    }
+                    let raw_secondary = !self.dnd_is_right_click
+                        && self.dnd_suppress == 0
+                        && ui.input(|i| i.pointer.secondary_released())
+                        && ui.input(|i| {
+                            i.pointer
+                                .hover_pos()
+                                .map_or(false, |pos| resp.rect.contains(pos))
+                        });
+                    if raw_secondary {
+                        if !self.deep_filter_selected.contains(&item.full_path) {
+                            self.selected_entries.clear();
+                            self.deep_filter_selected.clear();
+                            self.deep_filter_selected.insert(item.full_path.clone());
+                        }
+
+                        let name = item
+                            .full_path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| item.display_name.clone());
+                        self.context_menu_selection =
+                            self.deep_filter_selected.iter().cloned().collect();
+                        self.context_menu_entry = Some(FileEntry {
+                            name,
+                            is_dir: item.is_dir,
+                            size: 0,
+                            modified: None,
+                        });
+                        self.context_menu_tree_path = Some(item.full_path.clone());
+                        self.context_menu_tree_highlight = None;
+                        self.context_menu_position =
+                            ui.input(|i| i.pointer.hover_pos().unwrap_or_default());
+                        self.show_context_menu = true;
+                        self.show_bg_context_menu = false;
+                        entry_right_clicked = true;
                     }
                     if resp.double_clicked() {
                         activated_item = Some((item.full_path.clone(), item.is_dir));
@@ -2207,12 +2266,17 @@ impl eframe::App for RusplorerApp {
         }
 
         // Handle DEL key - send to recycle bin
-        if got_delete && !self.selected_entries.is_empty() {
-            let files_to_delete: Vec<PathBuf> = self
-                .selected_entries
-                .iter()
-                .map(|name| self.current_path.join(name))
-                .collect();
+        if got_delete
+            && (!self.selected_entries.is_empty() || !self.deep_filter_selected.is_empty())
+        {
+            let files_to_delete: Vec<PathBuf> = if !self.deep_filter_selected.is_empty() {
+                self.deep_filter_selected.iter().cloned().collect()
+            } else {
+                self.selected_entries
+                    .iter()
+                    .map(|name| self.current_path.join(name))
+                    .collect()
+            };
             self.start_delete_job(files_to_delete);
         }
 
@@ -2693,6 +2757,7 @@ impl eframe::App for RusplorerApp {
                         }
                         .show(ui, |ui| {
                             ui.set_min_width(btn_w + 24.0);
+                            ui.set_max_width(btn_w + 24.0);
 
                             // Title bar
                             ui.label(egui::RichText::new(&title).strong());
@@ -3452,15 +3517,36 @@ impl eframe::App for RusplorerApp {
 
             // -- Shared pre-computation (list view + thumbnail view) ---------------
             let is_thumb_view = self.thumb_view.get(&self.current_path).copied().unwrap_or(false);
-            let filter_lower = self.filter.to_lowercase();
-            let filtered_entries: Vec<FileEntry> = self
-                .contents
-                .iter()
-                .filter(|entry| {
-                    self.filter.is_empty() || entry.name.to_lowercase().contains(&filter_lower)
-                })
-                .cloned()
-                .collect();
+            let filter_active = !self.filter.is_empty();
+            if filter_active
+                && self.filter.as_str() != self.filter_lower_cache_source.as_str()
+            {
+                self.filter_lower_cache_source.clone_from(&self.filter);
+                self.filter_lower_cache = self.filter.to_lowercase();
+            }
+            let filter_lower = self.filter_lower_cache.as_str();
+            let filtered_entries: Vec<FileEntry> = if filter_active {
+                let normalized_name_cache = &mut self.normalized_name_cache;
+                self.contents
+                    .iter()
+                    .filter(|entry| {
+                        if let Some(normalized_name) =
+                            normalized_name_cache.get(entry.name.as_str())
+                        {
+                            normalized_name.contains(filter_lower)
+                        } else {
+                            let normalized_name = entry.name.to_lowercase();
+                            let matches = normalized_name.contains(filter_lower);
+                            normalized_name_cache
+                                .insert(entry.name.clone(), normalized_name);
+                            matches
+                        }
+                    })
+                    .cloned()
+                    .collect()
+            } else {
+                self.contents.clone()
+            };
             let entry_right_clicked;
             let mut sort_changed = false;
 
@@ -3547,9 +3633,11 @@ impl eframe::App for RusplorerApp {
                 && !self.show_rename_dialog
                 && !self.show_new_item_dialog
             {            ctx.input(|i| {
+                let pointer_in_use = ctx.is_using_pointer();
                 if let Some(pointer_pos) = i.pointer.hover_pos() {
                     let in_tab_bar = self.tab_bar_rect.contains(pointer_pos);
                     if i.pointer.primary_pressed() && !self.any_button_hovered && !in_tab_bar
+                        && !pointer_in_use
                         && !self.filter_edit_rect.contains(pointer_pos)
                         && pointer_pos.x > self.left_panel_width + 2.0  // don't start rubber-band in the tree panel
                     {
@@ -3557,6 +3645,8 @@ impl eframe::App for RusplorerApp {
                         self.selection_drag_start = Some(pointer_pos);
                         self.selection_drag_current = Some(pointer_pos);
                         self.selection_before_drag = self.selected_entries.clone();
+                        self.selection_before_deep_filter_drag =
+                            self.deep_filter_selected.clone();
                         // Cancel any pending DnD start so rubber-band takes priority
                         self.dnd_start_pos = None;
                         self.dnd_drag_entry = None;
@@ -3569,22 +3659,41 @@ impl eframe::App for RusplorerApp {
                             let sel_rect = egui::Rect::from_two_pos(start, end);
                             if i.modifiers.ctrl {
                                 self.selected_entries = self.selection_before_drag.clone();
+                                self.deep_filter_selected =
+                                    self.selection_before_deep_filter_drag.clone();
                             } else {
                                 self.selected_entries.clear();
+                                self.deep_filter_selected.clear();
                             }
-                            for (name, rect) in &self.entry_rects {
-                                if sel_rect.intersects(*rect) && !name.starts_with("[..]") {
-                                    self.selected_entries.insert(name.clone());
+
+                            let deep_hits: Vec<PathBuf> = self
+                                .deep_filter_entry_rects
+                                .iter()
+                                .filter(|(_, rect)| sel_rect.intersects(**rect))
+                                .map(|(path, _)| path.clone())
+                                .collect();
+                            if !deep_hits.is_empty() {
+                                self.selected_entries.clear();
+                                for path in deep_hits {
+                                    self.deep_filter_selected.insert(path);
+                                }
+                            } else {
+                                self.deep_filter_selected.clear();
+                                for (name, rect) in &self.entry_rects {
+                                    if sel_rect.intersects(*rect) && !name.starts_with("[..]") {
+                                        self.selected_entries.insert(name.clone());
+                                    }
                                 }
                             }
                         }
                     }
-                    if self.is_dragging_selection && !i.pointer.primary_down() {
-                        self.is_dragging_selection = false;
-                        self.selection_drag_start = None;
-                        self.selection_drag_current = None;
-                        self.selection_before_drag.clear();
-                    }
+                }
+                if self.is_dragging_selection && !i.pointer.primary_down() {
+                    self.is_dragging_selection = false;
+                    self.selection_drag_start = None;
+                    self.selection_drag_current = None;
+                    self.selection_before_drag.clear();
+                    self.selection_before_deep_filter_drag.clear();
                 }
             });
             } // end if !self.dnd_active && tab_drag_index.is_none()
@@ -3594,6 +3703,8 @@ impl eframe::App for RusplorerApp {
                 self.is_dragging_selection = false;
                 self.selection_drag_start = None;
                 self.selection_drag_current = None;
+                self.selection_before_drag.clear();
+                self.selection_before_deep_filter_drag.clear();
             }
 
             if sort_changed {

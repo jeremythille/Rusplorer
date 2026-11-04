@@ -106,12 +106,12 @@ OPTIONS = [
 ]
 
 
-def subset_font(src_name: str, dst_name: str) -> None:
+def subset_font(src_name: str, dst_name: str) -> bool:
     src = os.path.join(FONTS_DIR, src_name)
     dst = os.path.join(FONTS_DIR, dst_name)
     if not os.path.exists(src):
         print(f"  SKIP  {src_name} (not found)")
-        return
+        return True
 
     before_kb = os.path.getsize(src) / 1024
 
@@ -125,17 +125,23 @@ def subset_font(src_name: str, dst_name: str) -> None:
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"  ERROR  {src_name}:\n{result.stderr}")
-        return
+        return False
 
     after_kb = os.path.getsize(dst) / 1024
     pct = (1 - after_kb / before_kb) * 100
     print(f"  {src_name:35s}  {before_kb:7.1f} KB  →  {after_kb:7.1f} KB  (-{pct:.0f}%)")
+    return True
 
 
 if __name__ == "__main__":
+    failures = []
     print("Subsetting Iosevka fonts …\n")
-    subset_font("IosevkaAile-Regular.orig.ttf", "IosevkaAile-Regular.ttf")
-    subset_font("IosevkaAile-Bold.orig.ttf",    "IosevkaAile-Bold.ttf")
+    for source, destination in (
+        ("IosevkaAile-Regular.orig.ttf", "IosevkaAile-Regular.ttf"),
+        ("IosevkaAile-Bold.orig.ttf", "IosevkaAile-Bold.ttf"),
+    ):
+        if not subset_font(source, destination):
+            failures.append(source)
 
     print("\nSubsetting NotoEmoji (emoji used in the UI only) …\n")
     # Emoji actually used: ⌛⏳🖼💾📋📁📂📅📄📦⭐ — subset to just these glyphs.
@@ -168,6 +174,7 @@ if __name__ == "__main__":
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             print(f"  ERROR: {result.stderr}")
+            failures.append("NotoEmoji-Regular.orig.ttf")
         else:
             after_kb = os.path.getsize(dst) / 1024
             pct = (1 - after_kb / before_kb) * 100
@@ -175,5 +182,9 @@ if __name__ == "__main__":
     else:
         print(f"  SKIP  NotoEmoji-Regular.orig.ttf not found — copy it from:")
         print(f"        %USERPROFILE%\\.cargo\\registry\\src\\...\\epaint-0.27.2\\fonts\\NotoEmoji-Regular.ttf")
+
+    if failures:
+        print("\nFailed to subset: " + ", ".join(failures))
+        sys.exit(1)
 
     print("\nDone.")
