@@ -31,6 +31,7 @@ mod ui_left_panel;
 mod ui_file_list;
 mod ui_thumbnails;
 mod updater;
+mod theme;
 
 #[cfg(windows)]
 use clipboard::{copy_files_to_clipboard, read_clipboard_drop_effect_is_cut, read_files_from_clipboard};
@@ -187,20 +188,43 @@ fn launch(
             cc.egui_ctx.set_fonts(fonts);
 
             let mut style = (*cc.egui_ctx.style()).clone();
-            // Set 11pt font size for all text styles
+            let mut visuals = egui::Visuals::dark();
+            visuals.override_text_color = Some(theme::TEXT);
+            visuals.window_fill = theme::SURFACE;
+            visuals.panel_fill = theme::BACKGROUND;
+            visuals.extreme_bg_color = theme::BACKGROUND;
+            visuals.faint_bg_color = theme::SURFACE_RAISED;
+            visuals.code_bg_color = theme::SURFACE_RAISED;
+            visuals.hyperlink_color = theme::CYAN;
+            visuals.warn_fg_color = theme::AMBER;
+            visuals.error_fg_color = theme::RED;
+            visuals.selection.bg_fill = theme::ACCENT_TINT;
+            visuals.selection.stroke = egui::Stroke::new(1.0, theme::ACCENT);
+            visuals.window_stroke = egui::Stroke::new(1.0, theme::BORDER);
+            visuals.widgets.noninteractive.bg_fill = theme::BACKGROUND;
+            visuals.widgets.inactive.bg_fill = theme::SURFACE;
+            visuals.widgets.inactive.weak_bg_fill = theme::SURFACE;
+            visuals.widgets.hovered.bg_fill = theme::SURFACE_RAISED;
+            visuals.widgets.hovered.weak_bg_fill = theme::SURFACE_RAISED;
+            visuals.widgets.active.bg_fill = theme::ACCENT;
+            visuals.widgets.open.bg_fill = theme::SURFACE_RAISED;
+            visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, theme::BORDER);
+            visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, theme::BORDER_HOVER);
+            visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, theme::ACCENT);
+            visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, theme::BORDER_HOVER);
+            visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+            visuals.widgets.inactive.rounding = egui::Rounding::same(4.0);
+            visuals.widgets.hovered.rounding = egui::Rounding::same(4.0);
+            visuals.widgets.active.rounding = egui::Rounding::same(4.0);
+            visuals.widgets.open.rounding = egui::Rounding::same(4.0);
+            style.visuals = visuals;
+
             for (_, font_id) in &mut style.text_styles {
                 font_id.size = 11.0;
             }
-            style.spacing.button_padding = egui::vec2(2.0, 0.0);
-            style.visuals.widgets.hovered.bg_stroke =
-                egui::Stroke::new(1.0, egui::Color32::DARK_GRAY);
-            style.visuals.widgets.hovered.bg_fill =
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10);
-            style.visuals.widgets.active.bg_stroke =
-                egui::Stroke::new(1.0, egui::Color32::DARK_GRAY);
-            style.visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, egui::Color32::DARK_GRAY);
-            style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-            style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+            style.spacing.button_padding = egui::vec2(6.0, 3.0);
+            style.spacing.item_spacing = egui::vec2(6.0, 4.0);
+            style.spacing.interact_size = egui::vec2(20.0, 18.0);
             cc.egui_ctx.set_style(style);
             Box::new(RusplorerApp::new(session))
         }),
@@ -398,6 +422,7 @@ struct RusplorerApp {
     drive_types: HashMap<String, DriveKind>,
     /// Detailed info cached for the Drives overview page.
     drives_info: Vec<DriveInfo>,
+    drive_info_receiver: Option<Receiver<DriveInfo>>,
     show_drives_page: bool,
     show_updates_page: bool,
     update_log_lines: Vec<String>,
@@ -467,6 +492,28 @@ impl Default for RusplorerApp {
 }
 
 impl RusplorerApp {
+    fn load_drive_info_async(drives: Vec<String>) -> Receiver<DriveInfo> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for drive in drives {
+                let letter = drive.chars().next().unwrap_or('C');
+                let kind = Self::classify_drive(letter);
+                let (free_bytes, total_bytes) = Self::get_drive_space(&drive);
+                let info = DriveInfo {
+                    label: Self::get_volume_label(&drive),
+                    drive,
+                    kind,
+                    free_bytes,
+                    total_bytes,
+                };
+                if sender.send(info).is_err() {
+                    break;
+                }
+            }
+        });
+        receiver
+    }
+
     fn new(session: Option<SessionData>) -> Self {
         let available_drives = Self::list_drives();
         let config = Config::load();
@@ -634,6 +681,7 @@ impl RusplorerApp {
             dnd_tab_hover: None,
             drive_types: HashMap::new(),
             drives_info: Vec::new(),
+            drive_info_receiver: None,
             show_drives_page: false,
             show_updates_page: false,
             update_log_lines: Vec::new(),
@@ -697,14 +745,7 @@ impl RusplorerApp {
         app.refresh_contents();
         app.start_file_watcher();
 
-        // Classify each available drive (best-effort, cached once at startup)
-        for drive in app.available_drives.clone() {
-            let letter = drive.chars().next().unwrap_or('C');
-            let kind = Self::classify_drive(letter);
-            let (free_bytes, total_bytes) = Self::get_drive_space(&drive);
-            app.drive_types.insert(drive.clone(), kind);
-            app.drives_info.push(DriveInfo { drive: drive.clone(), kind, free_bytes, total_bytes, label: Self::get_volume_label(&drive) });
-        }
+        app.drive_info_receiver = Some(Self::load_drive_info_async(app.available_drives.clone()));
 
         app.start_update_check_background();
 
@@ -2361,18 +2402,18 @@ impl eframe::App for RusplorerApp {
                 let drive_path = PathBuf::from(drive);
                 measure_tree(&drive_path, 0, &self.tree_expanded, &self.tree_children_cache, &font_id, ctx, &mut max_w);
             }
-            self.left_panel_width = max_w.min(250.0).max(80.0);
+            self.left_panel_width = max_w.min(228.0).max(208.0);
         }
 
         // Compute the toolbar's required minimum width from its actual contents:
-        //   "Drives?" button + drive mini-buttons + "Filter:" label + 70px input + "?" button
+            //   Drives button + drive buttons + search field + view toggle + updates button
         let right_panel_min: f32 = {
             let font11 = egui::FontId::proportional(11.0);
             let font14 = egui::FontId::proportional(14.0);
             let item_sp = 8.0_f32; // default egui item_spacing.x
 
             // "Drives ▲▼" button: text width + ~10px button padding each side
-            let drives_btn_label = if self.show_drives_page { "Drives ▲" } else { "Drives ▼" };
+            let drives_btn_label = if self.show_drives_page { "▣ Drives ▲" } else { "▣ Drives ▼" };
             let drives_btn_w = ctx.fonts(|f| {
                 f.layout_no_wrap(drives_btn_label.to_string(), font14.clone(), egui::Color32::WHITE).size().x
             }) + 10.0 + item_sp;
@@ -2386,17 +2427,17 @@ impl eframe::App for RusplorerApp {
                 tw + 12.0 + item_sp
             }).sum::<f32>();
 
-            // "Filter:" label
+            // Search icon
             let filter_label_w = ctx.fonts(|f| {
-                f.layout_no_wrap("Filter:".to_string(), font14.clone(), egui::Color32::WHITE).size().x
+                f.layout_no_wrap("⌕".to_string(), font14.clone(), egui::Color32::WHITE).size().x
             }) + item_sp;
 
-            // Filter TextEdit (fixed 70px allocation)
-            let filter_edit_w = 70.0 + item_sp;
+            // Filter TextEdit
+            let filter_edit_w = 124.0 + item_sp;
 
-            // "?" selectable_label
+            // View-mode toggle
             let thumb_w = ctx.fonts(|f| {
-                f.layout_no_wrap("?".to_string(), font14.clone(), egui::Color32::WHITE).size().x
+                f.layout_no_wrap("▦".to_string(), font14.clone(), egui::Color32::WHITE).size().x
             }) + 10.0;
 
             // Updater status button/label width budget.
@@ -2803,6 +2844,25 @@ impl eframe::App for RusplorerApp {
             }
         }
 
+        egui::TopBottomPanel::bottom("status_bar")
+            .exact_height(22.0)
+            .frame(egui::Frame::none().fill(theme::BACKGROUND).stroke(egui::Stroke::new(1.0, theme::BORDER)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let item_count = self.contents.iter().filter(|entry| !entry.name.starts_with("[..]")).count();
+                    ui.label(egui::RichText::new(format!("{item_count} items")).small().color(theme::MUTED));
+                    ui.label(egui::RichText::new("|").small().color(theme::DIM));
+                    ui.label(egui::RichText::new(format!("Path: {}", Self::format_path_display(&self.current_path)))
+                        .small().color(theme::DIM));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new("UTF-8").small().color(theme::DIM));
+                        ui.label(egui::RichText::new("Rust Engine")
+                            .small().color(egui::Color32::from_rgb(165, 180, 252)));
+                    });
+                });
+            });
+
         if let Some(path) = self.render_left_panel(ctx) {
             self.navigate_to(path);
         }
@@ -2820,7 +2880,7 @@ impl eframe::App for RusplorerApp {
 
             let tab_bar_resp = ui.horizontal(|ui| {
                 // Tabs in a scroll area (save button is outside the scroll area)
-                let available_w = ui.available_width() - 28.0; // reserve space for save button
+                let available_w = ui.available_width() - 54.0; // reserve space for new-tab and save buttons
                 let scroll_output = egui::ScrollArea::horizontal()
                     .id_source(tab_bar_id)
                     .auto_shrink([false, false])
@@ -2851,13 +2911,13 @@ impl eframe::App for RusplorerApp {
                             && self.dnd_tab_hover.map(|(idx, _)| idx == i).unwrap_or(false);
 
                         let fill = if is_being_dragged {
-                            egui::Color32::from_rgb(80, 80, 100)
+                            theme::ACCENT_TINT
                         } else if is_dnd_hover {
-                            egui::Color32::from_rgb(50, 110, 50) // green: drop zone active
+                            egui::Color32::from_rgb(24, 72, 58)
                         } else if is_active {
-                            egui::Color32::from_rgb(60, 60, 60)
+                            theme::SURFACE
                         } else {
-                            egui::Color32::from_rgb(40, 40, 40)
+                            theme::BACKGROUND
                         };
 
                         let frame = egui::Frame::none()
@@ -2870,9 +2930,9 @@ impl eframe::App for RusplorerApp {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 4.0;
                                 let text_color = if is_active {
-                                    egui::Color32::WHITE
+                                    theme::TEXT
                                 } else {
-                                    egui::Color32::GRAY
+                                    theme::MUTED
                                 };
                                 ui.add(
                                     egui::Label::new(
@@ -3019,8 +3079,17 @@ impl eframe::App for RusplorerApp {
 
                 // Save button OUTSIDE the scroll area (pinned at end)
                 ui.add_space(4.0);
+                if ui.add(
+                    egui::Button::new(egui::RichText::new("+").color(theme::TEXT))
+                        .fill(theme::SURFACE_RAISED)
+                        .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+                ).on_hover_text("New tab").clicked() {
+                    open_new_tab = true;
+                }
                 if ui
-                    .add(egui::Button::new(egui::RichText::new("💾").small()).frame(false))
+                    .add(egui::Button::new(egui::RichText::new("💾").small())
+                        .fill(theme::SURFACE_RAISED)
+                        .stroke(egui::Stroke::new(1.0, theme::BORDER)))
                     .on_hover_text("Save session")
                     .clicked()
                 {
@@ -3181,19 +3250,14 @@ impl eframe::App for RusplorerApp {
             let mut selected_drive: Option<PathBuf> = None;
             ui.horizontal(|ui| {
                 // "Drives" toggle button
-                let drives_btn_label = if self.show_drives_page { "Drives ▲" } else { "Drives ▼" };
-                if ui.button(drives_btn_label).clicked() {
+                let drives_btn_label = if self.show_drives_page { "▣ Drives ▲" } else { "▣ Drives ▼" };
+                if ui.add(egui::Button::new(egui::RichText::new(drives_btn_label).color(theme::MUTED))
+                    .frame(false)).clicked() {
                     self.show_drives_page = !self.show_drives_page;
                     if self.show_drives_page {
                         self.show_updates_page = false;
-                        // Refresh space info each time the page is opened
                         self.drives_info.clear();
-                        for drive in self.available_drives.clone() {
-                            let letter = drive.chars().next().unwrap_or('C');
-                            let kind = Self::classify_drive(letter);
-                            let (free_bytes, total_bytes) = Self::get_drive_space(&drive);
-                            self.drives_info.push(DriveInfo { drive: drive.clone(), kind, free_bytes, total_bytes, label: Self::get_volume_label(&drive) });
-                        }
+                        self.drive_info_receiver = Some(Self::load_drive_info_async(self.available_drives.clone()));
                     }
                 }
                 // Drive letter mini-buttons
@@ -3212,36 +3276,38 @@ impl eframe::App for RusplorerApp {
                     if ui.is_rect_visible(rect) {
                         let painter = ui.painter();
                         let bg = if is_current {
-                            egui::Color32::from_rgb(60, 120, 220)
+                            theme::ACCENT_TINT
                         } else if resp.hovered() {
-                            egui::Color32::from_white_alpha(30)
+                            theme::SURFACE_RAISED
                         } else {
-                            egui::Color32::TRANSPARENT
+                            theme::SURFACE
                         };
-                        painter.rect_filled(rect, 3.0, bg);
-                        if border_color != egui::Color32::TRANSPARENT {
-                            painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.5, border_color));
+                        painter.rect_filled(rect, 4.0, bg);
+                        let outline = if is_current { theme::ACCENT } else { border_color.gamma_multiply(0.65) };
+                        if outline != egui::Color32::TRANSPARENT {
+                            painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, outline));
                         }
-                        let text_color = if is_current { egui::Color32::WHITE } else { ui.visuals().text_color() };
+                        let text_color = if is_current { egui::Color32::from_rgb(199, 210, 254) } else { theme::TEXT };
                         painter.text(rect.center(), egui::Align2::CENTER_CENTER, &drive_display, font_id, text_color);
                     }
                     if resp.clicked() {
                         selected_drive = Some(PathBuf::from(drive));
                     }
                 }
-                ui.label("Filter:");
-                let filter_alloc = ui.allocate_ui(egui::vec2(70.0, 20.0), |ui| {
-                    // Red text when a filter is active
+                ui.label(egui::RichText::new("⌕").color(theme::MUTED));
+                let filter_alloc = ui.allocate_ui(egui::vec2(132.0, 22.0), |ui| {
                     if !self.filter.is_empty() {
-                        ui.visuals_mut().override_text_color = Some(egui::Color32::from_rgb(255, 80, 80));
+                        ui.visuals_mut().override_text_color = Some(theme::CYAN);
                     }
-                    ui.text_edit_singleline(&mut self.filter)
+                    ui.add(egui::TextEdit::singleline(&mut self.filter)
+                        .hint_text("Filter items...")
+                        .desired_width(124.0))
                 });
                 self.filter_edit_rect = filter_alloc.response.rect;
                 // Little × button to clear the filter
                 if !self.filter.is_empty() {
                     let x_btn = ui.add(egui::Button::new(
-                        egui::RichText::new("×").size(11.0).color(egui::Color32::from_rgb(255, 80, 80))
+                        egui::RichText::new("×").size(11.0).color(theme::RED)
                     ).frame(false));
                     if x_btn.clicked() {
                         self.filter.clear();
@@ -3251,7 +3317,7 @@ impl eframe::App for RusplorerApp {
                 let is_thumb = self.thumb_view.get(&self.current_path).copied().unwrap_or(false);
                 let thumb_btn = ui.add_sized(
                     ui.spacing().interact_size,
-                    egui::Button::new(egui::RichText::new(if is_thumb { "📄" } else { "▦" }).size(16.0))
+                    egui::Button::new(egui::RichText::new(if is_thumb { "▤" } else { "▦" }).size(14.0))
                         .selected(is_thumb)
                 );
                 if thumb_btn.on_hover_text(if is_thumb { "Switch to list view" } else { "Switch to thumbnail view" }).clicked()
@@ -3417,26 +3483,33 @@ impl eframe::App for RusplorerApp {
                     let is_last = i == breadcrumbs.len() - 1;
 
                     if i > 0 {
-                        ui.label("/");
+                        ui.label(egui::RichText::new("/").color(theme::DIM));
                     }
 
                     if is_last {
-                        // Current directory - not clickable, just plain text
-                        ui.label(name);
+                        egui::Frame::none()
+                            .fill(theme::ACCENT_TINT)
+                            .stroke(egui::Stroke::new(1.0, theme::ACCENT))
+                            .rounding(egui::Rounding::same(4.0))
+                            .inner_margin(egui::Margin::symmetric(7.0, 2.0))
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new(name).strong().color(egui::Color32::from_rgb(199, 210, 254)));
+                            });
                     } else {
                         // Parent directories - clickable pills; also valid DnD drop targets
                         let is_bc_drop = self.dnd_active
                             && self.dnd_drop_target_prev.as_ref() == Some(path);
                         let fill = if is_bc_drop {
-                            egui::Color32::from_rgb(80, 200, 80)
+                            egui::Color32::from_rgb(24, 72, 58)
                         } else {
-                            egui::Color32::from_rgb(255, 245, 150)
+                            theme::SURFACE
                         };
-                        let text_color = if is_bc_drop { egui::Color32::WHITE } else { egui::Color32::BLACK };
+                        let text_color = if is_bc_drop { theme::GREEN } else { theme::MUTED };
                         let button = egui::Button::new(
                             egui::RichText::new(name).color(text_color),
                         )
                         .fill(fill)
+                        .stroke(egui::Stroke::new(1.0, if is_bc_drop { theme::GREEN } else { theme::BORDER }))
                         .frame(true);
                         let resp = ui.add(button);
                         // Same-frame DnD detection for breadcrumbs (use raw rect check;
@@ -3454,8 +3527,25 @@ impl eframe::App for RusplorerApp {
                     }
                 }
 
+                // Bookmark current path
+                if ui.add(egui::Button::new(egui::RichText::new("★").color(theme::AMBER))
+                    .fill(theme::SURFACE).stroke(egui::Stroke::new(1.0, theme::BORDER)))
+                    .on_hover_text("Add current folder to favorites").clicked()
+                    && !self.favorites.contains(&self.current_path)
+                {
+                    self.favorites.push(self.current_path.clone());
+                    self.favorites.sort_by_key(|path| path.file_name()
+                        .map(|name| name.to_string_lossy().to_lowercase())
+                        .unwrap_or_else(|| path.to_string_lossy().to_lowercase()));
+                    self.config.favorites = self.favorites.iter()
+                        .map(|path| path.to_string_lossy().to_string())
+                        .collect();
+                    self.config.save();
+                }
+
                 // Copy path button
-                if ui.button("📋").on_hover_text("Copy full path").clicked() {
+                if ui.add(egui::Button::new("⧉").fill(theme::SURFACE).stroke(egui::Stroke::new(1.0, theme::BORDER)))
+                    .on_hover_text("Copy full path").clicked() {
                     if let Ok(mut clipboard) = Clipboard::new() {
                         let path_display = Self::format_path_display(&self.current_path);
                         let _ = clipboard.set_text(path_display);
@@ -3463,7 +3553,8 @@ impl eframe::App for RusplorerApp {
                 }
 
                 // Paste path from clipboard button
-                let paste_btn = ui.button("📂").on_hover_text("Paste path from clipboard");
+                let paste_btn = ui.add(egui::Button::new("↧").fill(theme::SURFACE).stroke(egui::Stroke::new(1.0, theme::BORDER)))
+                    .on_hover_text("Paste path from clipboard");
                 if paste_btn.clicked() {
                     if let Ok(mut clipboard) = Clipboard::new() {
                         if let Ok(text) = clipboard.get_text() {
@@ -3566,7 +3657,6 @@ impl eframe::App for RusplorerApp {
                 entry_right_clicked = erc;
                 sort_changed = sc;
             }
-
             let selection_paths: Vec<PathBuf> = if !self.deep_filter_selected.is_empty() {
                 self.deep_filter_selected.iter().cloned().collect()
             } else {
@@ -3610,7 +3700,6 @@ impl eframe::App for RusplorerApp {
                         });
                     });
             }
-
             // Background right-click: open menu only when no entry was clicked
             // and no context menu was already opened this frame (e.g. from tree panel)
             if !entry_right_clicked && !self.dnd_active && self.dnd_suppress == 0 && !self.show_context_menu {
@@ -3625,15 +3714,15 @@ impl eframe::App for RusplorerApp {
                     }
                 }
             }
-
             // Handle rectangular selection (only when not dragging files or tabs,
             // not hovering the tab bar area at the top of the panel,
             // and no modal dialog is open ï¿½ e.g. rename suppresses rubber-band)
             if !self.dnd_active && self.tab_drag_index.is_none()
                 && !self.show_rename_dialog
                 && !self.show_new_item_dialog
-            {            ctx.input(|i| {
+            {
                 let pointer_in_use = ctx.is_using_pointer();
+                ctx.input(|i| {
                 if let Some(pointer_pos) = i.pointer.hover_pos() {
                     let in_tab_bar = self.tab_bar_rect.contains(pointer_pos);
                     if i.pointer.primary_pressed() && !self.any_button_hovered && !in_tab_bar
@@ -3732,7 +3821,7 @@ impl eframe::App for RusplorerApp {
                 .rect_stroke(
                     sel_rect,
                     0.0,
-                    egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 150, 255)),
+                    egui::Stroke::new(2.0, theme::ACCENT),
                 );
                 ctx.layer_painter(egui::LayerId::new(
                     egui::Order::Foreground,
@@ -3984,7 +4073,7 @@ impl eframe::App for RusplorerApp {
                     painter.rect_stroke(
                         text_rect,
                         4.0,
-                        egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 150, 255)),
+                        egui::Stroke::new(1.0, theme::ACCENT),
                     );
                     painter.galley(
                         text_rect.min + egui::vec2(6.0, 3.0),
@@ -3995,7 +4084,35 @@ impl eframe::App for RusplorerApp {
                 }
             }
         });
+        static CENTRAL_PANEL_DONE: std::sync::Once = std::sync::Once::new();
+        CENTRAL_PANEL_DONE.call_once(|| eprintln!("startup: central panel render complete"));
         self.render_dialogs(ctx);
+
+        let mut drive_info_updates = Vec::new();
+        let mut drive_info_finished = false;
+        if let Some(receiver) = &self.drive_info_receiver {
+            loop {
+                match receiver.try_recv() {
+                    Ok(info) => drive_info_updates.push(info),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        drive_info_finished = true;
+                        break;
+                    }
+                }
+            }
+        }
+        for info in drive_info_updates {
+            self.drive_types.insert(info.drive.clone(), info.kind);
+            if let Some(existing) = self.drives_info.iter_mut().find(|existing| existing.drive == info.drive) {
+                *existing = info;
+            } else {
+                self.drives_info.push(info);
+            }
+        }
+        if drive_info_finished {
+            self.drive_info_receiver = None;
+        }
 
         // Request repaints only while background work is in-flight.
         // Otherwise egui repaints on user input automatically ï¿½ no need
@@ -4006,6 +4123,7 @@ impl eframe::App for RusplorerApp {
             || self.dir_load_receiver.is_some()
             || self.update_check_receiver.is_some()
             || self.update_apply_receiver.is_some()
+            || self.drive_info_receiver.is_some()
             || !self.copy_jobs.is_empty();
         if has_bg_work {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -4020,26 +4138,11 @@ impl eframe::App for RusplorerApp {
             self.last_drive_check = std::time::Instant::now();
             let current = Self::list_drives();
             if current != self.available_drives {
-                // Classify any drives that weren't known before.
-                for d in &current {
-                    if !self.drive_types.contains_key(d) {
-                        let letter = d.chars().next().unwrap_or('C');
-                        let kind = Self::classify_drive(letter);
-                        self.drive_types.insert(d.clone(), kind);
-                    }
-                }
                 // Drop stale entries for removed drives.
                 self.drive_types.retain(|k, _| current.contains(k));
                 self.drives_info.retain(|info| current.contains(&info.drive));
-                for d in &current {
-                    if !self.drives_info.iter().any(|info| &info.drive == d) {
-                        let letter = d.chars().next().unwrap_or('C');
-                        let kind = Self::classify_drive(letter);
-                        let (free_bytes, total_bytes) = Self::get_drive_space(d);
-                        self.drives_info.push(DriveInfo { drive: d.clone(), kind, free_bytes, total_bytes, label: Self::get_volume_label(d) });
-                    }
-                }
                 self.available_drives = current;
+                self.drive_info_receiver = Some(Self::load_drive_info_async(self.available_drives.clone()));
             }
         }
     }

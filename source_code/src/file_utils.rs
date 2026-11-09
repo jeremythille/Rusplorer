@@ -328,41 +328,43 @@ impl RusplorerApp {
         job
     }
 
-    /// Returns a background color for the date column based on how old the file is.
-    /// Violet = timestamp is in the future (invalid/dashcam clock drift).
-    /// Light green (very recent) → darker green → light orange → orange (>1 week).
+    /// Recent dates are green; older dates transition to reddish brown.
     pub(crate) fn age_color(modified: SystemTime, now: SystemTime) -> egui::Color32 {
         // Future timestamp — device clock is wrong (e.g. dashcam with bad RTC).
         if modified > now {
-            return egui::Color32::from_rgb(140, 80, 200);
+            return egui::Color32::from_rgb(43, 35, 65);
         }
         let age = now
             .duration_since(modified)
             .map(|d| d.as_secs_f64())
             .unwrap_or(f64::MAX);
 
-        // (age_threshold_secs, r, g, b)
-        const STOPS: &[(f64, u8, u8, u8)] = &[
-            (0.0,          200, 240, 200),  // light green  — just now
-            (300.0,        150, 218, 150),  // green        — 5 min
-            (3_600.0,       90, 180,  90),  // medium green — 1 hour
-            (86_400.0,     180, 210, 130),  // yellow-green — 1 day
-            (604_800.0,    255, 200, 140),  // light orange — 1 week
+        // (age_threshold_secs, cell color)
+        const STOPS: &[(f64, egui::Color32)] = &[
+            (0.0, egui::Color32::from_rgb(32, 145, 72)),
+            (300.0, egui::Color32::from_rgb(42, 128, 70)),
+            (3_600.0, egui::Color32::from_rgb(75, 106, 57)),
+            (86_400.0, egui::Color32::from_rgb(114, 80, 48)),
+            (604_800.0, egui::Color32::from_rgb(143, 62, 49)),
         ];
-        const ORANGE: egui::Color32 = egui::Color32::from_rgb(255, 175, 100);
+        const OLD: egui::Color32 = egui::Color32::from_rgb(143, 62, 49);
 
         if age >= 604_800.0 {
-            return ORANGE;
+            return OLD;
         }
         for w in STOPS.windows(2) {
-            let (t0, r0, g0, b0) = w[0];
-            let (t1, r1, g1, b1) = w[1];
+            let (t0, color0) = w[0];
+            let (t1, color1) = w[1];
             if age <= t1 {
                 let t = ((age - t0) / (t1 - t0)) as f32;
                 let lerp = |a: u8, b: u8| (a as f32 + t * (b as f32 - a as f32)).round() as u8;
-                return egui::Color32::from_rgb(lerp(r0, r1), lerp(g0, g1), lerp(b0, b1));
+                return egui::Color32::from_rgb(
+                    lerp(color0.r(), color1.r()),
+                    lerp(color0.g(), color1.g()),
+                    lerp(color0.b(), color1.b()),
+                );
             }
         }
-        ORANGE
+        OLD
     }
 }

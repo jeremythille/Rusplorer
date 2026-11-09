@@ -390,8 +390,8 @@ impl RusplorerApp {
                     .interactable(true)
                     .show(ctx, |ui| {
                         egui::Frame {
-                            fill: egui::Color32::from_rgb(200, 220, 255),
-                            stroke: egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
+                            fill: crate::theme::SURFACE_RAISED,
+                            stroke: egui::Stroke::new(1.0, crate::theme::BORDER_HOVER),
                             inner_margin: egui::Margin::same(4.0),
                             rounding: egui::Rounding::same(4.0),
                             ..Default::default()
@@ -721,8 +721,8 @@ impl RusplorerApp {
                 .interactable(true)
                 .show(ctx, |ui| {
                     egui::Frame {
-                        fill: egui::Color32::from_rgb(200, 220, 255),
-                        stroke: egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
+                        fill: crate::theme::SURFACE_RAISED,
+                        stroke: egui::Stroke::new(1.0, crate::theme::BORDER_HOVER),
                         inner_margin: egui::Margin::same(4.0),
                         rounding: egui::Rounding::same(4.0),
                         ..Default::default()

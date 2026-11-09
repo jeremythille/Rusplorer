@@ -12,6 +12,7 @@ use std::sync::mpsc::channel;
 use std::time::Duration;
 
 use crate::RusplorerApp;
+use crate::theme;
 
 const GITHUB_LATEST_RELEASE_URL: &str = "https://api.github.com/repos/jeremythille/Rusplorer/releases/latest";
 const GITHUB_REPO_API_URL: &str = "https://api.github.com/repos/jeremythille/Rusplorer";
@@ -260,7 +261,7 @@ impl RusplorerApp {
             UpdateUiState::UpToDate { .. } | UpdateUiState::Idle => "Check updates",
         };
 
-        if ui.button(label).clicked() {
+        if ui.add(egui::Button::new(label).fill(theme::ACCENT).stroke(egui::Stroke::NONE)).clicked() {
             self.open_updates_page();
             if matches!(
                 self.update_state,

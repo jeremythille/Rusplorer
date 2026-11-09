@@ -1,4 +1,4 @@
-﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+﻿#![cfg_attr(windows, windows_subsystem = "windows")]
 
 // Thin wrapper: all app logic is in lib.rs for fast incremental builds.
 // This file only contains panic hooks and the main() entry point.

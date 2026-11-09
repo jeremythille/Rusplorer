@@ -6,15 +6,6 @@ A lightweight, robust, blazingly-fast file explorer written in Rust / egui for W
 
 ![Rusplorer logo](./source_code/logo/rusplorer_logo_128.png)
 
-</div>
-
-## Disclaimer
-
-**Rusplorer is not intended to be pretty, but fast as hell, minimalist, and practical.** Everything must be pretty first these days, but I couldn't care less about Rusplorer being pretty. It must WORK and be PRACTICAL, ROBUST and QUICK.
-
-
-
-<div align="center">
 
 <br>
 
@@ -25,7 +16,7 @@ A lightweight, robust, blazingly-fast file explorer written in Rust / egui for W
 ## ⚡ Key Advantages
 
 ### Speed & Performance
-- **Super lightweight** - the normal Windows 11 executable stays lean (6.4 MB); a separate compatibility executable (10.2 MB) includes the renderer needed by older Windows 10 machines without hardware graphics acceleration
+- **Super lightweight** - the normal Windows 11 executable stays lean (6.3 MB); a separate compatibility executable (10 MB) includes the renderer needed by older Windows 10 machines without hardware graphics acceleration
 - **All folders and file sizes** - Computed lazily and multithreaded, 0 impact on speed and reactivity. Plus, pauses folder size calculation on focus loss
 - **Instant directory listing** - Displays folder contents immediately without waiting for file size calculations
 - **Background threading** - No UI blocking, ever smooth interaction

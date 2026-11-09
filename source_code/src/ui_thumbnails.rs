@@ -1,6 +1,7 @@
 ﻿use eframe::egui;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+use crate::theme;
 use crate::types::FileEntry;
 use super::RusplorerApp;
 
@@ -86,9 +87,9 @@ impl RusplorerApp {
                                 if ui.is_rect_visible(cell_rect) {
                                     let p = ui.painter();
                                     let bg = if is_drop_target {
-                                        egui::Color32::from_rgb(80, 200, 80)
+                                        egui::Color32::from_rgb(24, 72, 58)
                                     } else if is_selected {
-                                        egui::Color32::from_rgb(80, 130, 220)
+                                        theme::SELECTED_ROW
                                     } else if resp.hovered() {
                                         egui::Color32::from_white_alpha(18)
                                     } else {
@@ -143,7 +144,7 @@ impl RusplorerApp {
                                         p.text(
                                             thumb_rect.center(), egui::Align2::CENTER_CENTER,
                                             "📁", egui::FontId::proportional(36.0),
-                                            egui::Color32::from_rgb(255, 245, 150),
+                                            theme::AMBER,
                                         );
                                     } else {
                                         p.text(
@@ -159,7 +160,7 @@ impl RusplorerApp {
                                     let label_color = if is_selected {
                                         egui::Color32::WHITE
                                     } else if dark_mode {
-                                        egui::Color32::from_gray(210)
+                                        theme::TEXT
                                     } else {
                                         egui::Color32::from_gray(70)
                                     };

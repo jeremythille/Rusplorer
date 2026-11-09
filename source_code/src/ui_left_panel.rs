@@ -1,5 +1,6 @@
 ﻿use eframe::egui;
 use std::path::PathBuf;
+use crate::theme;
 use crate::tree::render_tree_node;
 use crate::types::FileEntry;
 use super::RusplorerApp;
@@ -10,13 +11,15 @@ impl RusplorerApp {
         egui::SidePanel::left("left_panel")
             .exact_width(self.left_panel_width)
             .resizable(false)
+            .frame(egui::Frame::none().fill(theme::SURFACE).stroke(egui::Stroke::new(1.0, theme::BORDER)))
             .show(ctx, |ui| {
                 // ── Favorites ────────────────────────────────────────────
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("⭐ Favorites"));
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("★ FAVORITES").small().strong().color(theme::MUTED));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .add(egui::Button::new("+").small().frame(false))
+                            .add(egui::Button::new(egui::RichText::new("+").color(theme::MUTED)).small().frame(false))
                             .on_hover_text("Add current folder to favorites")
                             .clicked()
                         {
@@ -47,14 +50,11 @@ impl RusplorerApp {
                     ui.horizontal(|ui| {
                         ui.add_space(8.0);
                         let is_cur = *fav == self.current_path;
-                        let label = egui::RichText::new(&name)
+                        let label = egui::RichText::new(format!("📁 {name}"))
                             .small()
-                            .color(if is_cur { egui::Color32::WHITE } else { egui::Color32::BLACK });
-                        let btn = if is_cur {
-                            egui::Button::new(label).fill(egui::Color32::from_rgb(100, 150, 255)).frame(false)
-                        } else {
-                            egui::Button::new(label).fill(egui::Color32::from_rgb(255, 245, 150)).frame(false)
-                        };
+                            .color(if is_cur { egui::Color32::from_rgb(199, 210, 254) } else { theme::TEXT });
+                        let fill = if is_cur { theme::ACCENT_TINT } else { egui::Color32::TRANSPARENT };
+                        let btn = egui::Button::new(label).fill(fill).frame(false);
                         if ui
                             .add(btn)
                             .on_hover_text(Self::format_path_display(fav))
@@ -63,7 +63,7 @@ impl RusplorerApp {
                             nav_from_panel = Some(fav.clone());
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add(egui::Button::new("×").small().frame(false)).clicked() {
+                            if ui.add(egui::Button::new(egui::RichText::new("×").small().color(theme::DIM)).frame(false)).clicked() {
                                 remove_fav = Some(i);
                             }
                         });
@@ -80,10 +80,10 @@ impl RusplorerApp {
                 }
 
                 // Visual separator between favorites and folder tree
-                ui.add_space(8.0);
+                ui.add_space(6.0);
                 let (separator_rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
-                ui.painter().rect_filled(separator_rect, 0.0, egui::Color32::from_gray(128));
-                ui.add_space(8.0);
+                ui.painter().rect_filled(separator_rect, 0.0, theme::BORDER);
+                ui.add_space(6.0);
 
                 // ── Folder tree ──────────────────────────────────────────
                 let dnd_active = self.dnd_active;
@@ -108,6 +108,8 @@ impl RusplorerApp {
                         ui.set_min_width(ui.available_width());
                         ui.set_max_width(ui.available_width());
                         ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.label(egui::RichText::new("DIRECTORY TREE").small().strong().color(theme::MUTED));
+                        ui.add_space(3.0);
                         let drives: Vec<PathBuf> = self
                             .available_drives
                             .iter()

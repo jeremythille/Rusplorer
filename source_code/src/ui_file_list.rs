@@ -2,6 +2,7 @@
 use egui_extras::{Column, TableBuilder};
 use std::sync::atomic::Ordering;
 use std::time::SystemTime;
+use crate::theme;
 use crate::types::{FileEntry, SortColumn, FileAction};
 use super::RusplorerApp;
 
@@ -169,7 +170,7 @@ impl RusplorerApp {
                     } else {
                         ""
                     };
-                    let text = format!("Name{}", arrow);
+                    let text = format!("NAME{}", arrow);
                     if ui
                         .add_sized(
                             ui.available_size(),
@@ -194,7 +195,7 @@ impl RusplorerApp {
                     } else {
                         ""
                     };
-                    let text = format!("Size{}", arrow);
+                    let text = format!("SIZE{}", arrow);
                     if ui
                         .add_sized(
                             ui.available_size(),
@@ -234,7 +235,7 @@ impl RusplorerApp {
                             } else {
                                 ""
                             };
-                            let text = format!("Date{}", arrow);
+                            let text = format!("DATE{}", arrow);
                             if ui
                                 .add_sized(
                                     egui::vec2(ui.available_width(), ui.available_height()),
@@ -293,7 +294,6 @@ impl RusplorerApp {
                             }
                         }
                     };
-
                     // Determine if this folder is a drop target
                     let entry_abs = if entry.name.starts_with("[..]") {
                         self.current_path.parent().map(|p| p.to_path_buf())
@@ -319,25 +319,25 @@ impl RusplorerApp {
                                 egui::Button::new(
                                     Self::name_layout_job(&display_name, entry.is_dir, egui::Color32::WHITE, false, dark_mode)
                                 )
-                                .fill(egui::Color32::from_rgb(80, 200, 80))
+                                .fill(egui::Color32::from_rgb(24, 72, 58))
                                 .frame(false)
                             } else if is_selected && is_in_clipboard {
                                 egui::Button::new(
                                     Self::name_layout_job(&display_name, entry.is_dir, egui::Color32::WHITE, true, dark_mode)
                                 )
-                                .fill(egui::Color32::from_rgb(100, 150, 255))
+                                .fill(theme::SELECTED_ROW)
                                 .frame(false)
                             } else if is_selected {
                                 egui::Button::new(
                                     Self::name_layout_job(&display_name, entry.is_dir, egui::Color32::WHITE, false, dark_mode)
                                 )
-                                .fill(egui::Color32::from_rgb(100, 150, 255))
+                                .fill(theme::SELECTED_ROW)
                                 .frame(false)
                             } else if is_in_clipboard && entry.is_dir {
                                 egui::Button::new(
-                                    Self::name_layout_job(&display_name, true, egui::Color32::from_gray(20), true, dark_mode)
+                                    Self::name_layout_job(&display_name, true, theme::TEXT, true, dark_mode)
                                 )
-                                .fill(egui::Color32::from_rgb(255, 245, 150))
+                                .fill(egui::Color32::from_rgb(62, 48, 20))
                                 .frame(false)
                             } else if is_in_clipboard {
                                 egui::Button::new(
@@ -345,14 +345,14 @@ impl RusplorerApp {
                                 )
                                 .frame(false)
                             } else if entry.name.starts_with("[..]") {
-                                egui::Button::new(&display_name)
+                                egui::Button::new(egui::RichText::new(&display_name).color(theme::MUTED))
                                     .fill(egui::Color32::TRANSPARENT)
                                     .frame(false)
                             } else if entry.is_dir {
                                 egui::Button::new(
-                                    Self::name_layout_job(&display_name, true, egui::Color32::from_gray(20), false, dark_mode)
+                                    Self::name_layout_job(&display_name, true, theme::AMBER, false, dark_mode)
                                 )
-                                .fill(egui::Color32::from_rgb(255, 245, 150))
+                                .fill(egui::Color32::TRANSPARENT)
                                 .frame(false)
                             } else if [".sfk", ".sfap0", ".bak"].iter().any(|ext| entry.name.to_ascii_lowercase().ends_with(ext)) {
                                 egui::Button::new(
@@ -613,7 +613,7 @@ impl RusplorerApp {
                                     ui.painter().rect_filled(
                                         bar_rect,
                                         0.0,
-                                        egui::Color32::from_rgb(100, 150, 255),
+                                        theme::ACCENT,
                                     );
                                 }
                             }
@@ -670,11 +670,7 @@ impl RusplorerApp {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
-                                            let text_color = if is_future {
-                                                egui::Color32::WHITE
-                                            } else {
-                                                egui::Color32::from_rgb(60, 60, 60)
-                                            };
+                                            let text_color = if is_future { theme::VIOLET } else { theme::TEXT };
                                             let label = if is_in_clipboard {
                                                 egui::RichText::new(&date_text).color(text_color).italics()
                                             } else {

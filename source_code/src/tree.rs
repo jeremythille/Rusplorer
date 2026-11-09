@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::fs_ops::read_dir_children;
+use crate::theme;
 
 /// Recursively renders one node (folder) in the left-panel directory tree.
 ///
@@ -55,7 +56,7 @@ pub fn render_tree_node(
     } else {
         egui::FontId::new(11.0, egui::FontFamily::Proportional)
     };
-    let btn_width = max_w - indent - 4.0; // padding
+    let btn_width = max_w - indent - 38.0; // room for disclosure and folder icons
     let truncated_name = {
         let fonts = ui.fonts(|f| f.clone());
         let full_w = fonts
@@ -92,22 +93,17 @@ pub fn render_tree_node(
         |ui| {
             ui.set_max_width(max_w);
             ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
+            ui.spacing_mut().button_padding = egui::vec2(3.0, 0.0);
             if indent > 0.0 {
                 ui.add_space(indent);
             }
-            let text_color = if is_current || is_tree_drop_target {
-                egui::Color32::WHITE
-            } else if is_ancestor {
-                // Yellow/orange ancestor background — force dark text regardless of theme
-                egui::Color32::from_gray(20)
-            } else if is_tree_highlighted {
-                // Light blue highlight — force dark text regardless of theme
-                egui::Color32::from_gray(20)
-            } else {
-                // Yellow background — force dark text regardless of dark mode
-                egui::Color32::from_gray(20)
-            };
-            let base_text = egui::RichText::new(&truncated_name).color(text_color);
+            let folder_icon = if is_expanded { "📂" } else { "📁" };
+            let disclosure = if is_expanded { "▾" } else { "▸" };
+            let text_color = if is_current { egui::Color32::from_rgb(199, 210, 254) }
+                else if is_ancestor || is_tree_highlighted { theme::TEXT }
+                else { theme::MUTED };
+            let text = format!("{disclosure} {folder_icon} {truncated_name}");
+            let base_text = egui::RichText::new(text).color(text_color);
             let label_text = if is_ancestor || is_current || is_tree_highlighted {
                 base_text.font(font_id.clone())
             } else {
@@ -115,23 +111,19 @@ pub fn render_tree_node(
             };
             let button = if is_tree_drop_target {
                 egui::Button::new(label_text)
-                    .fill(egui::Color32::from_rgb(80, 200, 80))
+                    .fill(egui::Color32::from_rgb(24, 72, 58))
                     .frame(false)
             } else if is_tree_highlighted {
                 egui::Button::new(label_text)
-                    .fill(egui::Color32::from_rgb(180, 200, 255))
+                    .fill(theme::SURFACE_RAISED)
                     .frame(false)
             } else if is_current {
                 egui::Button::new(label_text)
-                    .fill(egui::Color32::from_rgb(100, 150, 255))
-                    .frame(false)
-            } else if is_ancestor {
-                egui::Button::new(label_text)
-                    .fill(egui::Color32::from_rgb(255, 200, 60))
+                    .fill(theme::ACCENT_TINT)
                     .frame(false)
             } else {
                 egui::Button::new(label_text)
-                    .fill(egui::Color32::from_rgb(255, 245, 150))
+                    .fill(egui::Color32::TRANSPARENT)
                     .frame(false)
             };
             ui.add(button)

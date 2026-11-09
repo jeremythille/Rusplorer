@@ -1,6 +1,7 @@
 //! Drive enumeration, classification (SSD / HDD / USB / …), and space queries.
 //! All functions are static (no `&self`).
 
+#[cfg(not(windows))]
 use std::path::PathBuf;
 
 use crate::types::DriveKind;
@@ -8,15 +9,22 @@ use super::RusplorerApp;
 
 impl RusplorerApp {
     pub(crate) fn list_drives() -> Vec<String> {
-        let mut drives = Vec::new();
-        // Check drives A through Z
-        for letter in b'A'..=b'Z' {
-            let drive = format!("{}:\\", letter as char);
-            if PathBuf::from(&drive).exists() {
-                drives.push(drive);
-            }
+        #[cfg(windows)]
+        {
+            use winapi::um::fileapi::GetLogicalDrives;
+            let mask = unsafe { GetLogicalDrives() };
+            return (0..26u32)
+                .filter(|index| mask & (1u32 << index) != 0)
+                .map(|index| format!("{}:\\", (b'A' + index as u8) as char))
+                .collect();
         }
-        drives
+        #[cfg(not(windows))]
+        {
+            (b'A'..=b'Z')
+                .map(|letter| format!("{}:\\", letter as char))
+                .filter(|drive| PathBuf::from(drive).exists())
+                .collect()
+        }
     }
 
     /// Returns `Some(true)` = SSD, `Some(false)` = HDD, `None` = unknown.
