@@ -303,6 +303,11 @@ impl RusplorerApp {
                     let is_drop_target = self.dnd_active
                         && entry.is_dir
                         && entry_abs.as_ref() == self.dnd_drop_target_prev.as_ref();
+                    let has_folder_background = entry.is_dir
+                        && !entry.name.starts_with("[..]")
+                        && !is_drop_target
+                        && !is_selected
+                        && !is_in_clipboard;
 
                     // Name column
                         row.col(|ui| {
@@ -350,10 +355,11 @@ impl RusplorerApp {
                                     .frame(false)
                             } else if entry.is_dir {
                                 egui::Button::new(
-                                    Self::name_layout_job(&display_name, true, theme::AMBER, false, dark_mode)
+                                    Self::name_layout_job(&display_name, true, theme::FOLDER_TEXT, false, dark_mode)
                                 )
-                                .fill(egui::Color32::TRANSPARENT)
-                                .frame(false)
+                                .fill(theme::FOLDER_BACKGROUND)
+                                .stroke(egui::Stroke::NONE)
+                                .rounding(egui::Rounding::same(3.0))
                             } else if [".sfk", ".sfap0", ".bak"].iter().any(|ext| entry.name.to_ascii_lowercase().ends_with(ext)) {
                                 egui::Button::new(
                                     Self::name_layout_job(&display_name, false, egui::Color32::from_rgb(0xBF, 0xBF, 0xBF), false, dark_mode)
@@ -367,7 +373,12 @@ impl RusplorerApp {
                             };
 
                             let button = button.sense(egui::Sense::click_and_drag());
-                            let response = ui.horizontal(|ui| ui.add(button)).inner;
+                            let response = ui.horizontal(|ui| {
+                                if has_folder_background {
+                                    ui.spacing_mut().button_padding = egui::vec2(2.0, 0.0);
+                                }
+                                ui.add(button)
+                            }).inner;
 
                             // Sh when the name was truncated.
                             if display_name != entry.name && response.hovered() {
@@ -510,7 +521,11 @@ impl RusplorerApp {
                             if response.clicked_by(egui::PointerButton::Primary) && !self.is_dragging_selection {
                                 let is_ctrl = ui.input(|i| i.modifiers.ctrl);
                                 let is_shift = ui.input(|i| i.modifiers.shift);
-                                if is_shift {
+                                if entry.name.starts_with("[..]") {
+                                    self.selected_action = Some(FileAction::GoToParent);
+                                } else if entry.is_dir && !is_ctrl && !is_shift {
+                                    self.activate_path(&full_path, true);
+                                } else if is_shift {
                                     // Range select: from last_clicked_entry to this entry
                                     if let Some(ref anchor) = self.last_clicked_entry {
                                         let anchor_idx = filtered_entries.iter().position(|e| e.name == *anchor);
@@ -586,13 +601,11 @@ impl RusplorerApp {
                                 entry_right_clicked = true;
                             }
 
-                            if response.double_clicked() {
-                                if entry.name.starts_with("[..]") {
-                                    self.selected_action = Some(FileAction::GoToParent);
-                                } else {
-                                    let full_path = self.current_path.join(&entry.name);
-                                    self.activate_path(&full_path, entry.is_dir);
-                                }
+                            if response.double_clicked()
+                                && !entry.is_dir
+                                && !entry.name.starts_with("[..]")
+                            {
+                                self.activate_path(&full_path, false);
                             }
 
                             // Draw size bar at bottom of cell

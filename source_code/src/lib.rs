@@ -47,6 +47,14 @@ type RendererConfigOverride = Option<egui_wgpu::WgpuConfiguration>;
 #[cfg(not(feature = "compatibility"))]
 type RendererConfigOverride = ();
 
+fn read_clipboard_image() -> Option<image::RgbaImage> {
+    let mut clipboard = Clipboard::new().ok()?;
+    let clipboard_image = clipboard.get_image().ok()?;
+    let width = u32::try_from(clipboard_image.width).ok()?;
+    let height = u32::try_from(clipboard_image.height).ok()?;
+    image::RgbaImage::from_raw(width, height, clipboard_image.bytes.into_owned())
+}
+
 pub fn run_app() -> Result<(), eframe::Error> {
     // Initialise OLE on the main thread so DoDragDrop works
     #[cfg(windows)]
@@ -243,6 +251,72 @@ enum DeepFilterEvent {
     Done,
 }
 
+#[derive(Clone, Copy)]
+enum BreadcrumbIcon {
+    Copy,
+    Paste,
+}
+
+fn breadcrumb_icon_button(
+    ui: &mut egui::Ui,
+    icon: BreadcrumbIcon,
+    tooltip: &str,
+) -> egui::Response {
+    let response = ui
+        .add_sized([24.0, 24.0], egui::Button::new(""))
+        .on_hover_text(tooltip);
+    let stroke = ui.style().interact(&response).fg_stroke;
+    let center = response.rect.center();
+    let painter = ui.painter();
+
+    match icon {
+        BreadcrumbIcon::Copy => {
+            let back = egui::Rect::from_min_size(
+                center + egui::vec2(-2.0, -6.0),
+                egui::vec2(9.0, 11.0),
+            );
+            let front = egui::Rect::from_min_size(
+                center + egui::vec2(-6.0, -1.0),
+                egui::vec2(9.0, 11.0),
+            );
+            painter.rect_stroke(back, 1.0, stroke);
+            painter.rect_stroke(front, 1.0, stroke);
+            for y in [3.0, 6.0] {
+                painter.line_segment(
+                    [
+                        egui::pos2(front.left() + 2.0, front.top() + y),
+                        egui::pos2(front.right() - 2.0, front.top() + y),
+                    ],
+                    stroke,
+                );
+            }
+        }
+        BreadcrumbIcon::Paste => {
+            let board = egui::Rect::from_min_size(
+                center + egui::vec2(-6.0, -4.0),
+                egui::vec2(12.0, 15.0),
+            );
+            let clip = egui::Rect::from_min_size(
+                center + egui::vec2(-3.0, -8.0),
+                egui::vec2(6.0, 5.0),
+            );
+            painter.rect_stroke(board, 2.0, stroke);
+            painter.rect_stroke(clip, 1.5, stroke);
+            for y in [5.0, 8.0] {
+                painter.line_segment(
+                    [
+                        egui::pos2(board.left() + 3.0, board.top() + y),
+                        egui::pos2(board.right() - 3.0, board.top() + y),
+                    ],
+                    stroke,
+                );
+            }
+        }
+    }
+
+    response
+}
+
 struct RusplorerApp {
     current_path: PathBuf,
     contents: Vec<FileEntry>,
@@ -302,6 +376,7 @@ struct RusplorerApp {
     show_new_item_dialog: bool,
     new_item_is_dir: bool,
     new_item_name_buffer: String,
+    pending_clipboard_image: Option<image::RgbaImage>,
     /// One-shot autofocus when new-item dialog is opened.
     new_item_focus_pending: bool,
     show_bg_context_menu: bool,
@@ -473,6 +548,8 @@ struct RusplorerApp {
     deep_filter_seen: HashSet<PathBuf>,
     /// Selected items from deep recursive filter sections (absolute paths).
     deep_filter_selected: HashSet<PathBuf>,
+    /// Anchor path for shift-click range selection in deep filter results.
+    deep_filter_last_clicked: Option<PathBuf>,
     /// Receiver for deep recursive search events.
     deep_filter_rx: Option<Receiver<DeepFilterEvent>>,
     /// Cancellation token for the currently running deep recursive search worker.
@@ -592,6 +669,7 @@ impl RusplorerApp {
             show_new_item_dialog: false,
             new_item_is_dir: false,
             new_item_name_buffer: String::new(),
+            pending_clipboard_image: None,
             new_item_focus_pending: false,
             show_bg_context_menu: false,
             bg_context_position: egui::Pos2::ZERO,
@@ -710,6 +788,7 @@ impl RusplorerApp {
             deep_filter_sections: HashMap::new(),
             deep_filter_seen: HashSet::new(),
             deep_filter_selected: HashSet::new(),
+            deep_filter_last_clicked: None,
             deep_filter_rx: None,
             deep_filter_cancel: Arc::new(AtomicBool::new(false)),
             deep_filter_running: false,
@@ -826,6 +905,7 @@ impl RusplorerApp {
         self.deep_filter_sections.clear();
         self.deep_filter_seen.clear();
         self.deep_filter_selected.clear();
+        self.deep_filter_last_clicked = None;
 
         if query.is_empty() {
             self.deep_filter_last_query.clear();
@@ -927,6 +1007,7 @@ impl RusplorerApp {
                 self.deep_filter_sections.clear();
                 self.deep_filter_seen.clear();
                 self.deep_filter_selected.clear();
+                self.deep_filter_last_clicked = None;
                 self.deep_filter_last_query.clear();
                 self.deep_filter_last_root = self.current_path.clone();
             }
@@ -1096,7 +1177,11 @@ impl RusplorerApp {
                     let is_ctrl = ui.input(|i| i.modifiers.ctrl);
                     let is_shift = ui.input(|i| i.modifiers.shift);
                     self.deep_filter_selected.clear();
-                    if is_shift {
+                    self.deep_filter_last_clicked = None;
+                    if entry.is_dir && !is_ctrl && !is_shift {
+                        self.selected_entries.clear();
+                        self.activate_path(&self.current_path.join(&entry.name), true);
+                    } else if is_shift {
                         if let Some(ref anchor) = self.last_clicked_entry {
                             let anchor_idx =
                                 this_folder_entries.iter().position(|e| e.name == *anchor);
@@ -1160,9 +1245,9 @@ impl RusplorerApp {
                     entry_right_clicked = true;
                 }
 
-                if resp.double_clicked() {
+                if resp.double_clicked() && !entry.is_dir {
                     let full_path = self.current_path.join(&entry.name);
-                    self.activate_path(&full_path, entry.is_dir);
+                    self.activate_path(&full_path, false);
                 }
             }
         }
@@ -1170,10 +1255,10 @@ impl RusplorerApp {
         let mut sections: Vec<String> = self.deep_filter_sections.keys().cloned().collect();
         sections.sort_by_key(|s| s.to_lowercase());
 
-        for section in sections {
+        for section in &sections {
             Self::render_section_header(ui, &format!("{}:", section));
             let mut activated_item = None;
-            if let Some(items) = self.deep_filter_sections.get(&section) {
+            if let Some(items) = self.deep_filter_sections.get(section) {
                 if items.is_empty() {
                     ui.label(egui::RichText::new("(no match)").italics().color(egui::Color32::from_gray(150)));
                     continue;
@@ -1200,16 +1285,48 @@ impl RusplorerApp {
                         self.deep_filter_entry_rects
                             .insert(item.full_path.clone(), resp.rect);
                     }
-                    if resp.clicked_by(egui::PointerButton::Primary) {
+                    if resp.clicked_by(egui::PointerButton::Primary)
+                        && !self.is_dragging_selection
+                    {
                         let is_ctrl = ui.input(|i| i.modifiers.ctrl);
+                        let is_shift = ui.input(|i| i.modifiers.shift);
                         self.selected_entries.clear();
-                        if is_ctrl {
+                        if item.is_dir && !is_ctrl && !is_shift {
+                            self.deep_filter_selected.clear();
+                            activated_item = Some((item.full_path.clone(), true));
+                        } else if is_shift {
+                            let ordered_paths: Vec<PathBuf> = sections
+                                .iter()
+                                .filter_map(|section| self.deep_filter_sections.get(section))
+                                .flat_map(|items| items.iter().map(|item| item.full_path.clone()))
+                                .collect();
+                            let anchor_index = self.deep_filter_last_clicked.as_ref().and_then(
+                                |anchor| ordered_paths.iter().position(|path| path == anchor),
+                            );
+                            let clicked_index = ordered_paths
+                                .iter()
+                                .position(|path| path == &item.full_path);
+                            if let (Some(anchor), Some(clicked)) = (anchor_index, clicked_index) {
+                                if !is_ctrl {
+                                    self.deep_filter_selected.clear();
+                                }
+                                for path in &ordered_paths[anchor.min(clicked)..=anchor.max(clicked)] {
+                                    self.deep_filter_selected.insert(path.clone());
+                                }
+                            } else {
+                                self.deep_filter_selected.clear();
+                                self.deep_filter_selected.insert(item.full_path.clone());
+                                self.deep_filter_last_clicked = Some(item.full_path.clone());
+                            }
+                        } else if is_ctrl {
                             if !self.deep_filter_selected.remove(&item.full_path) {
                                 self.deep_filter_selected.insert(item.full_path.clone());
                             }
+                            self.deep_filter_last_clicked = Some(item.full_path.clone());
                         } else {
                             self.deep_filter_selected.clear();
                             self.deep_filter_selected.insert(item.full_path.clone());
+                            self.deep_filter_last_clicked = Some(item.full_path.clone());
                         }
                     }
                     let raw_secondary = !self.dnd_is_right_click
@@ -1221,6 +1338,7 @@ impl RusplorerApp {
                                 .map_or(false, |pos| resp.rect.contains(pos))
                         });
                     if raw_secondary {
+                        self.deep_filter_last_clicked = Some(item.full_path.clone());
                         if !self.deep_filter_selected.contains(&item.full_path) {
                             self.selected_entries.clear();
                             self.deep_filter_selected.clear();
@@ -1248,7 +1366,7 @@ impl RusplorerApp {
                         self.show_bg_context_menu = false;
                         entry_right_clicked = true;
                     }
-                    if resp.double_clicked() {
+                    if resp.double_clicked() && !item.is_dir {
                         activated_item = Some((item.full_path.clone(), item.is_dir));
                     }
                 }
@@ -2217,6 +2335,15 @@ impl eframe::App for RusplorerApp {
         }
 
         if got_paste {
+            if let Some(image) = read_clipboard_image() {
+                self.pending_clipboard_image = Some(image);
+                self.new_item_is_dir = false;
+                self.new_item_name_buffer = chrono::Local::now()
+                    .format("%Y-%m-%d_%H%M%S.png")
+                    .to_string();
+                self.new_item_focus_pending = true;
+                self.show_new_item_dialog = true;
+            } else {
             #[cfg(windows)]
             {
                 let dest = self.current_path.clone();
@@ -2303,6 +2430,7 @@ impl eframe::App for RusplorerApp {
                         }
                     }
                 }
+            }
             }
         }
 
@@ -2843,25 +2971,6 @@ impl eframe::App for RusplorerApp {
                 ctx.request_repaint_after(std::time::Duration::from_millis(50));
             }
         }
-
-        egui::TopBottomPanel::bottom("status_bar")
-            .exact_height(22.0)
-            .frame(egui::Frame::none().fill(theme::BACKGROUND).stroke(egui::Stroke::new(1.0, theme::BORDER)))
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    let item_count = self.contents.iter().filter(|entry| !entry.name.starts_with("[..]")).count();
-                    ui.label(egui::RichText::new(format!("{item_count} items")).small().color(theme::MUTED));
-                    ui.label(egui::RichText::new("|").small().color(theme::DIM));
-                    ui.label(egui::RichText::new(format!("Path: {}", Self::format_path_display(&self.current_path)))
-                        .small().color(theme::DIM));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(egui::RichText::new("UTF-8").small().color(theme::DIM));
-                        ui.label(egui::RichText::new("Rust Engine")
-                            .small().color(egui::Color32::from_rgb(165, 180, 252)));
-                    });
-                });
-            });
 
         if let Some(path) = self.render_left_panel(ctx) {
             self.navigate_to(path);
@@ -3493,7 +3602,11 @@ impl eframe::App for RusplorerApp {
                             .rounding(egui::Rounding::same(4.0))
                             .inner_margin(egui::Margin::symmetric(7.0, 2.0))
                             .show(ui, |ui| {
-                                ui.label(egui::RichText::new(name).strong().color(egui::Color32::from_rgb(199, 210, 254)));
+                                ui.add(egui::Label::new(
+                                    egui::RichText::new(name)
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(199, 210, 254)),
+                                ).wrap(false));
                             });
                     } else {
                         // Parent directories - clickable pills; also valid DnD drop targets
@@ -3510,6 +3623,7 @@ impl eframe::App for RusplorerApp {
                         )
                         .fill(fill)
                         .stroke(egui::Stroke::new(1.0, if is_bc_drop { theme::GREEN } else { theme::BORDER }))
+                        .wrap(false)
                         .frame(true);
                         let resp = ui.add(button);
                         // Same-frame DnD detection for breadcrumbs (use raw rect check;
@@ -3544,8 +3658,7 @@ impl eframe::App for RusplorerApp {
                 }
 
                 // Copy path button
-                if ui.add(egui::Button::new("⧉").fill(theme::SURFACE).stroke(egui::Stroke::new(1.0, theme::BORDER)))
-                    .on_hover_text("Copy full path").clicked() {
+                if breadcrumb_icon_button(ui, BreadcrumbIcon::Copy, "Copy full path").clicked() {
                     if let Ok(mut clipboard) = Clipboard::new() {
                         let path_display = Self::format_path_display(&self.current_path);
                         let _ = clipboard.set_text(path_display);
@@ -3553,8 +3666,11 @@ impl eframe::App for RusplorerApp {
                 }
 
                 // Paste path from clipboard button
-                let paste_btn = ui.add(egui::Button::new("↧").fill(theme::SURFACE).stroke(egui::Stroke::new(1.0, theme::BORDER)))
-                    .on_hover_text("Paste path from clipboard");
+                let paste_btn = breadcrumb_icon_button(
+                    ui,
+                    BreadcrumbIcon::Paste,
+                    "Paste path from clipboard",
+                );
                 if paste_btn.clicked() {
                     if let Ok(mut clipboard) = Clipboard::new() {
                         if let Ok(text) = clipboard.get_text() {
@@ -3725,12 +3841,19 @@ impl eframe::App for RusplorerApp {
                 ctx.input(|i| {
                 if let Some(pointer_pos) = i.pointer.hover_pos() {
                     let in_tab_bar = self.tab_bar_rect.contains(pointer_pos);
-                    if i.pointer.primary_pressed() && !self.any_button_hovered && !in_tab_bar
-                        && !pointer_in_use
+                    let press_on_deep_filter_result = !self.filter.is_empty()
+                        && self
+                            .deep_filter_entry_rects
+                            .values()
+                            .any(|rect| rect.contains(pointer_pos));
+                    if i.pointer.primary_pressed()
+                        && (!self.any_button_hovered || press_on_deep_filter_result)
+                        && !in_tab_bar
+                        && (!pointer_in_use || press_on_deep_filter_result)
                         && !self.filter_edit_rect.contains(pointer_pos)
                         && pointer_pos.x > self.left_panel_width + 2.0  // don't start rubber-band in the tree panel
                     {
-                        self.is_dragging_selection = true;
+                        self.is_dragging_selection = !press_on_deep_filter_result;
                         self.selection_drag_start = Some(pointer_pos);
                         self.selection_drag_current = Some(pointer_pos);
                         self.selection_before_drag = self.selected_entries.clone();
@@ -3739,6 +3862,15 @@ impl eframe::App for RusplorerApp {
                         // Cancel any pending DnD start so rubber-band takes priority
                         self.dnd_start_pos = None;
                         self.dnd_drag_entry = None;
+                    }
+                    if !self.is_dragging_selection
+                        && self.selection_drag_start.is_some()
+                        && i.pointer.primary_down()
+                        && self
+                            .selection_drag_start
+                            .is_some_and(|start| start.distance(pointer_pos) > 5.0)
+                    {
+                        self.is_dragging_selection = true;
                     }
                     if self.is_dragging_selection && i.pointer.primary_down() {
                         self.selection_drag_current = Some(pointer_pos);
@@ -3777,7 +3909,9 @@ impl eframe::App for RusplorerApp {
                         }
                     }
                 }
-                if self.is_dragging_selection && !i.pointer.primary_down() {
+                if !i.pointer.primary_down()
+                    && (self.is_dragging_selection || self.selection_drag_start.is_some())
+                {
                     self.is_dragging_selection = false;
                     self.selection_drag_start = None;
                     self.selection_drag_current = None;
@@ -3810,28 +3944,30 @@ impl eframe::App for RusplorerApp {
             } // end else !show_drives_page
 
             // Draw selection rectangle if dragging
-            if let (Some(start), Some(current)) =
+            if self.is_dragging_selection {
+                if let (Some(start), Some(current)) =
                 (self.selection_drag_start, self.selection_drag_current)
-            {
-                let sel_rect = egui::Rect::from_two_pos(start, current);
-                ctx.layer_painter(egui::LayerId::new(
-                    egui::Order::Foreground,
-                    egui::Id::new("selection_rect"),
-                ))
-                .rect_stroke(
-                    sel_rect,
-                    0.0,
-                    egui::Stroke::new(2.0, theme::ACCENT),
-                );
-                ctx.layer_painter(egui::LayerId::new(
-                    egui::Order::Foreground,
-                    egui::Id::new("selection_rect"),
-                ))
-                .rect_filled(
-                    sel_rect,
-                    0.0,
-                    egui::Color32::from_rgba_unmultiplied(100, 150, 255, 30),
-                );
+                {
+                    let sel_rect = egui::Rect::from_two_pos(start, current);
+                    ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Foreground,
+                        egui::Id::new("selection_rect"),
+                    ))
+                    .rect_stroke(
+                        sel_rect,
+                        0.0,
+                        egui::Stroke::new(2.0, theme::ACCENT),
+                    );
+                    ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Foreground,
+                        egui::Id::new("selection_rect"),
+                    ))
+                    .rect_filled(
+                        sel_rect,
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(100, 150, 255, 30),
+                    );
+                }
             }
 
             // Handle drag-and-drop: detect release and perform action

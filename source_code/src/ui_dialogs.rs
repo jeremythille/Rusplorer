@@ -935,14 +935,21 @@ impl RusplorerApp {
 
         // ── New folder / New file dialog ──────────────────────────────────
         if self.show_new_item_dialog {
-            let title = if self.new_item_is_dir { "New folder" } else { "New text file" };
+            let is_clipboard_image = self.pending_clipboard_image.is_some();
+            let title = if is_clipboard_image {
+                "Save clipboard image"
+            } else if self.new_item_is_dir {
+                "New folder"
+            } else {
+                "New text file"
+            };
             let mut close_dialog = false;
             egui::Window::new(title)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
-                    ui.label("Name:");
+                    ui.label(if is_clipboard_image { "File name:" } else { "Name:" });
                     let resp = ui.text_edit_singleline(&mut self.new_item_name_buffer);
 
                     // Auto-focus only once when the dialog opens.
@@ -970,6 +977,18 @@ impl RusplorerApp {
                                         Err(e) => {
                                             self.delete_feedback_msg = Some(format!(
                                                 "Create folder failed: {}",
+                                                e
+                                            ));
+                                            self.delete_feedback_until = None;
+                                            self.delete_feedback_is_error = true;
+                                        }
+                                    }
+                                } else if let Some(image) = self.pending_clipboard_image.as_ref() {
+                                    match image.save(&target) {
+                                        Ok(()) => created = true,
+                                        Err(e) => {
+                                            self.delete_feedback_msg = Some(format!(
+                                                "Save clipboard image failed: {}",
                                                 e
                                             ));
                                             self.delete_feedback_until = None;
@@ -1007,6 +1026,7 @@ impl RusplorerApp {
                 });
             if close_dialog {
                 self.show_new_item_dialog = false;
+                self.pending_clipboard_image = None;
             }
         }
 

@@ -177,7 +177,10 @@ impl RusplorerApp {
                                 if resp.clicked_by(egui::PointerButton::Primary) {
                                     let is_ctrl  = ctx.input(|i| i.modifiers.ctrl);
                                     let is_shift = ctx.input(|i| i.modifiers.shift);
-                                    if is_ctrl {
+                                    if entry.is_dir && !is_ctrl && !is_shift {
+                                        self.selected_entries.clear();
+                                        self.activate_path(&full_path, true);
+                                    } else if is_ctrl {
                                         if !self.selected_entries.remove(&entry.name) {
                                             self.selected_entries.insert(entry.name.clone());
                                         }
@@ -203,8 +206,8 @@ impl RusplorerApp {
                                     }
                                 }
 
-                                if resp.double_clicked() {
-                                    self.activate_path(&full_path, entry.is_dir);
+                                if resp.double_clicked() && !entry.is_dir {
+                                    self.activate_path(&full_path, false);
                                 }
 
                                 // Right-click context menu (skip when right-drag DnD active)

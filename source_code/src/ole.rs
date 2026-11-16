@@ -1,6 +1,6 @@
 /// Windows OLE drag-and-drop, drop-target registration, and virtual-desktop helpers.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Write a diagnostic line to `%TEMP%\rusplorer_dnd_<pid>.log`.
 /// Each call appends one line with a timestamp.
@@ -16,6 +16,32 @@ pub fn log_dnd(msg: &str) {
                 .unwrap_or_default()
                 .as_secs_f64() % 100000.0);
     }
+}
+
+#[cfg(windows)]
+fn stage_drop_item(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(src)?;
+    if metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "symbolic links in temporary drops are not supported",
+        ));
+    }
+
+    if metadata.is_dir() {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            stage_drop_item(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+    } else {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(src, dst)?;
+    }
+
+    Ok(())
 }
 
 // ── Virtual desktop helpers ──────────────────────────────────────────────────
@@ -887,23 +913,36 @@ pub fn register_ole_drop_target(
                     // Fix: synchronously copy any temp-resident files into our own
                     // stable temp dir RIGHT NOW, before returning from Drop().
                     let temp_dir = std::env::temp_dir();
-                    let staging = temp_dir.join("rusplorer_drop");
-                    let files: Vec<PathBuf> = files.into_iter().map(|src| {
+                    let drop_id = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos();
+                    let staging = temp_dir
+                        .join("rusplorer_drop")
+                        .join(format!("{}-{drop_id}", std::process::id()));
+                    let files: Vec<PathBuf> = files.into_iter().enumerate().filter_map(|(index, src)| {
                         let in_temp = src.starts_with(&temp_dir);
                         if in_temp {
-                            let _ = std::fs::create_dir_all(&staging);
                             if let Some(name) = src.file_name() {
-                                let dst = staging.join(name);
-                                match std::fs::copy(&src, &dst) {
-                                    Ok(_) => {
+                                let dst = staging.join(index.to_string()).join(name);
+                                match stage_drop_item(&src, &dst) {
+                                    Ok(()) => {
                                         log_dnd(&format!("  staged: {} -> {}", src.display(), dst.display()));
-                                        return dst;
+                                        return Some(dst);
                                     }
-                                    Err(e) => log_dnd(&format!("  stage FAIL {}: {e}", src.display())),
+                                    Err(e) => {
+                                        log_dnd(&format!("  stage FAIL {}: {e}", src.display()));
+                                        let _ = std::fs::remove_dir_all(&dst);
+                                        let _ = std::fs::remove_file(&dst);
+                                        return None;
+                                    }
                                 }
                             }
+                            log_dnd(&format!("  stage FAIL {}: missing file name", src.display()));
+                            None
+                        } else {
+                            Some(src)
                         }
-                        src
                     }).collect();
 
                     // Determine right-drag via multiple methods:
@@ -923,12 +962,14 @@ pub fn register_ole_drop_target(
                     let is_right = self.is_right_drag.get() || right_via_format;
                     log_dnd(&format!("Drop: {} file(s), latched={} fmt={right_via_format} => is_right={is_right}", files.len(), self.is_right_drag.get()));
                     for f in &files { log_dnd(&format!("  path: {}", f.display())); }
-                    if is_right {
-                        let _ = self.right_click_sender.send(files);
-                    } else {
-                        let _ = self.sender.send(files);
+                    if !files.is_empty() {
+                        if is_right {
+                            let _ = self.right_click_sender.send(files);
+                        } else {
+                            let _ = self.sender.send(files);
+                        }
+                        *pdweffect = DROPEFFECT_COPY;
                     }
-                    *pdweffect = DROPEFFECT_COPY;
                 }
             }
             Ok(())
