@@ -454,9 +454,18 @@ impl RusplorerApp {
                                 && ui.add_sized([menu_w, 0.0], egui::Button::new("Open with VS Code")).clicked()
                             {
                                 #[cfg(windows)]
-                                let _ = std::process::Command::new("cmd")
-                                    .args(["/C", "code", full_path.to_string_lossy().as_ref()])
-                                    .spawn();
+                                {
+                                    use std::os::windows::process::CommandExt;
+                                    use std::process::Stdio;
+
+                                    let _ = std::process::Command::new("cmd")
+                                        .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
+                                        .args(["/C", "code", full_path.to_string_lossy().as_ref()])
+                                        .stdin(Stdio::null())
+                                        .stdout(Stdio::null())
+                                        .stderr(Stdio::null())
+                                        .spawn();
+                                }
                                 #[cfg(not(windows))]
                                 let _ = std::process::Command::new("code").arg(&full_path).spawn();
                                 self.show_context_menu = false;
